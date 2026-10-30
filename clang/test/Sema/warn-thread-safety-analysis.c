@@ -1143,6 +1143,39 @@ int c_trylock_ptr_err_unchecked_bad(void) // expected-note{{mutex acquired here}
   return c_ptr_err(obj); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
 
+// Redeclared try_acquire attributes on a reentrant capability must not expect
+// reentrancy depth 2 when both prototype and definition carry the attribute.
+struct __attribute__((capability("mutex"), reentrant_capability)) CReentrantLock {
+  int unused;
+};
+struct CReentrantLock crmu;
+void c_reentrant_read_lock(struct CReentrantLock *m)
+    __attribute__((acquire_shared_capability(*m)));
+void c_reentrant_read_unlock(struct CReentrantLock *m)
+    __attribute__((release_shared_capability(*m)));
+
+int c_redecl_reentrant_trylock(int ok)
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu)));
+int c_redecl_reentrant_trylock(int ok)
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu))) {
+  if (!ok)
+    return -11;
+  c_reentrant_read_lock(&crmu);
+  return 0;
+}
+
+int c_redecl_reentrant_delegate(int ok)
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu))) {
+  return c_redecl_reentrant_trylock(ok);
+}
+
+int c_redecl_reentrant_trylock_bad(void)
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu)));
+int c_redecl_reentrant_trylock_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu))) {
+  return 0; // expected-warning{{expecting mutex 'crmu' to be held at the end of function}}
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

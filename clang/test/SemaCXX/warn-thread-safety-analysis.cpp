@@ -9699,4 +9699,31 @@ class BodyCheckSuite {
   }
 };
 
+// Redeclared try_acquire attributes on a reentrant capability.
+struct RedeclReentrantHolder {
+  Reentrancy::ReentrantMutex rmu;
+  bool tryLockOnce(bool cond) SHARED_TRYLOCK_FUNCTION(true, rmu);
+  int tryLockRangeOnce(bool cond) TRY_ACQUIRE_SHARED_RANGE(0, 0, rmu);
+
+  int delegateRedeclRange(bool cond) TRY_ACQUIRE_SHARED_RANGE(0, 0, rmu) {
+    return tryLockRangeOnce(cond);
+  }
+};
+
+bool RedeclReentrantHolder::tryLockOnce(bool cond)
+    SHARED_TRYLOCK_FUNCTION(true, rmu) {
+  if (!cond)
+    return false;
+  rmu.ReaderLock();
+  return true;
+}
+
+int RedeclReentrantHolder::tryLockRangeOnce(bool cond)
+    TRY_ACQUIRE_SHARED_RANGE(0, 0, rmu) {
+  if (!cond)
+    return -16;
+  rmu.ReaderLock();
+  return 0;
+}
+
 } // namespace TryAcquireBodyVerificationTest

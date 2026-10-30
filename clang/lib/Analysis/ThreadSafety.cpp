@@ -5968,35 +5968,34 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     InitO.PendingAcquires.assign(InPending.begin(), InPending.end());
     CallOutcomes.push_back(std::move(InitO));
 
-    auto SplitOutcomes = [&](const IntRangeSet &SuccSet, const CapExprSet &Caps,
-                             LockKind LK) {
-      if (Caps.empty())
-        return;
-      IntRangeSet FailSet = SuccSet.complement(TargetDom);
-      SmallVector<ReturnEvalOutcome, 2> Next;
-      for (auto &CO : CallOutcomes) {
-        IntRangeSet In = CO.Values.intersect(SuccSet);
-        IntRangeSet OutSet = CO.Values.intersect(FailSet);
-        if (!In.empty()) {
-          ReturnEvalOutcome WithLocks = CO;
-          WithLocks.Values = std::move(In);
-          for (const auto &Cap : Caps)
-            WithLocks.PendingAcquires.push_back(
-                {Cap, LK, CallExp->getExprLoc()});
-          Next.push_back(std::move(WithLocks));
+    SmallVector<TrylockExitSpec, 2> CallSpecs;
+    SmallVector<std::pair<CapabilityExpr, LockKind>, 2> AlreadyAcquiredCaps;
+    auto RecordCallSpec = [&](const Attr *At, const IntRangeSet &SuccSet,
+                              const CapExprSet &Caps, LockKind LK) {
+      bool AlreadyMaterialized =
+          State.AcquiredTrylockAttrs.contains({CallExp, At});
+      for (const auto &Cap : Caps) {
+        if (Cap.shouldIgnore())
+          continue;
+        if (AlreadyMaterialized) {
+          AlreadyAcquiredCaps.push_back({Cap, LK});
+          continue;
         }
-        if (!OutSet.empty()) {
-          CO.Values = std::move(OutSet);
-          Next.push_back(std::move(CO));
+        bool Merged = false;
+        for (TrylockExitSpec &Existing : CallSpecs) {
+          if (Existing.Cap.equals(Cap) && Existing.LK == LK) {
+            Existing.SuccessSet = Existing.SuccessSet.unionWith(SuccSet);
+            Merged = true;
+            break;
+          }
         }
+        if (!Merged)
+          CallSpecs.push_back({Cap, LK, SuccSet, CallExp->getExprLoc()});
       }
-      CallOutcomes = std::move(Next);
     };
 
     for (const auto *Attr :
          Callee->specific_attrs<TryAcquireCapabilityAttr>()) {
-      if (State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
-        continue;
       bool SuccBool = false;
       if (!evalTrylockSuccessBool(Attr->getSuccessValue(), *ASTCtx, SuccBool)) {
         EmitDefault();
@@ -6009,15 +6008,13 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         SuccSet = SuccSet.complement(TargetDom);
       CapExprSet Caps;
       getMutexIDs(Caps, Attr, CallExp, Callee);
-      SplitOutcomes(SuccSet, Caps,
-                    Attr->isShared() ? LK_Shared : LK_Exclusive);
+      RecordCallSpec(Attr, SuccSet, Caps,
+                     Attr->isShared() ? LK_Shared : LK_Exclusive);
     }
 
     if (CallExp->getType()->isIntegralOrEnumerationType()) {
       for (const auto *Attr :
            Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
-        if (State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
-          continue;
         if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue()) {
           EmitDefault();
           ApplyExprConstraint();
@@ -6036,9 +6033,34 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
             IntRangeSet::closedRange(TargetDom, *First, *Last);
         CapExprSet Caps;
         getMutexIDs(Caps, Attr, CallExp, Callee);
-        SplitOutcomes(SuccSet, Caps,
-                      Attr->isShared() ? LK_Shared : LK_Exclusive);
+        RecordCallSpec(Attr, SuccSet, Caps,
+                       Attr->isShared() ? LK_Shared : LK_Exclusive);
       }
+    }
+
+    for (const TrylockExitSpec &Spec : CallSpecs) {
+      bool AlreadyAcq = llvm::any_of(AlreadyAcquiredCaps, [&](const auto &P) {
+        return P.first.equals(Spec.Cap) && P.second == Spec.LK;
+      });
+      if (AlreadyAcq)
+        continue;
+      IntRangeSet FailSet = Spec.SuccessSet.complement(TargetDom);
+      SmallVector<ReturnEvalOutcome, 2> Next;
+      for (auto &CO : CallOutcomes) {
+        IntRangeSet In = CO.Values.intersect(Spec.SuccessSet);
+        IntRangeSet OutSet = CO.Values.intersect(FailSet);
+        if (!In.empty()) {
+          ReturnEvalOutcome WithLocks = CO;
+          WithLocks.Values = std::move(In);
+          WithLocks.PendingAcquires.push_back({Spec.Cap, Spec.LK, Spec.Loc});
+          Next.push_back(std::move(WithLocks));
+        }
+        if (!OutSet.empty()) {
+          CO.Values = std::move(OutSet);
+          Next.push_back(std::move(CO));
+        }
+      }
+      CallOutcomes = std::move(Next);
     }
 
     for (auto &CO : CallOutcomes)
@@ -7493,12 +7515,10 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
                                 SourceLocation AttrLoc) {
     if (Cap.shouldIgnore())
       return;
-    if (!Cap.reentrant()) {
-      for (TrylockExitSpec &Existing : CurrentTrylockExitSpecs) {
-        if (Existing.Cap.equals(Cap) && Existing.LK == LK) {
-          Existing.SuccessSet = Existing.SuccessSet.unionWith(SuccSet);
-          return;
-        }
+    for (TrylockExitSpec &Existing : CurrentTrylockExitSpecs) {
+      if (Existing.Cap.equals(Cap) && Existing.LK == LK) {
+        Existing.SuccessSet = Existing.SuccessSet.unionWith(SuccSet);
+        return;
       }
     }
     CurrentTrylockExitSpecs.push_back({Cap, LK, SuccSet, AttrLoc});
