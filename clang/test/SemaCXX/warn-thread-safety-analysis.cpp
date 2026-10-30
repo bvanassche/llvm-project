@@ -9776,6 +9776,36 @@ struct LoopExitAndDerefTryAcquireHolder {
     outer_mu.Unlock();
     return res;
   }
+
+  static LoopExitAndDerefTryAcquireHolder *
+  validDerefMemberCallAndField(LoopExitAndDerefTryAcquireHolder *dev)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, dev->mu) {
+    dev->mu.Lock();
+    if (dev->state > 1 || !dev->ready()) {
+      dev->mu.Unlock();
+      return nullptr;
+    }
+    return dev;
+  }
+
+  static LoopExitAndDerefTryAcquireHolder *
+  badShortCircuitDeref(LoopExitAndDerefTryAcquireHolder *dev, bool check)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, dev->mu) {
+    dev->mu.Lock(); // expected-note {{mutex acquired here}}
+    bool ok = check && dev->ready();
+    (void)ok;
+    return dev; // expected-warning {{mutex 'dev->mu' is still held at the end of function}}
+  }
+
+  // The operands of noexcept and sizeof are not evaluated.
+  static LoopExitAndDerefTryAcquireHolder *
+  badUnevaluatedDeref(LoopExitAndDerefTryAcquireHolder *dev)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, dev->mu) {
+    dev->mu.Lock(); // expected-note {{mutex acquired here}}
+    (void)noexcept(dev->ready());
+    (void)sizeof(dev->state);
+    return dev; // expected-warning {{mutex 'dev->mu' is still held at the end of function}}
+  }
 };
 
 } // namespace TryAcquireBodyVerificationTest

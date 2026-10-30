@@ -1276,6 +1276,70 @@ int *c_exit_unlock_unrelated_missing_on_path_bad(int ok)
   return res;
 }
 
+// Inferring pointer non-nullness from unconditional memory dereferences.
+struct CNetDev {
+  struct Mutex lock;
+  int reg_state;
+  int moving_ns;
+};
+
+struct CNetDev *c_deref_nonnull_valid(struct CNetDev *dev)
+    __attribute__((try_acquire_capability(1, dev->lock))) {
+  mutex_exclusive_lock(&dev->lock);
+  if (dev->reg_state > 1 || dev->moving_ns) {
+    mutex_unlock(&dev->lock);
+    return (void *)0;
+  }
+  do_some_work();
+  return dev;
+}
+
+// Arguments of __builtin_constant_p() are not evaluated.
+struct CNetDev *c_builtin_constant_p_not_deref_bad(struct CNetDev *dev)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  (void)__builtin_constant_p(dev->reg_state);
+  return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+// A null check after a dereference must not be treated as dead code.
+struct CNetDev *c_deref_then_null_check_bad(struct CNetDev *dev)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  int v = dev->reg_state;
+  (void)v;
+  if (!dev)
+    return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+  return dev;
+}
+
+struct CNetDev *c_addr_of_member_not_deref_bad(struct CNetDev *dev)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  int *p = &dev->reg_state;
+  (void)p;
+  (void)sizeof(*dev);
+  return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+struct CNetDev *c_short_circuit_deref_not_unconditional_bad(struct CNetDev *dev,
+                                                            int cond)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  int ok = cond && dev->reg_state;
+  (void)ok;
+  return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+struct CNetDev *c_deref_then_reassign_in_stmtexpr_bad(struct CNetDev *dev,
+                                                      struct CNetDev *other)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  int v = ((void)dev->reg_state, ({ dev = other; 0; }));
+  (void)v;
+  return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

@@ -39,6 +39,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ImmutableMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetOperations.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -50,6 +51,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/TrailingObjects.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <functional>
@@ -1371,6 +1373,10 @@ public:
     llvm::SmallDenseSet<AcquiredTrylockKey, 4> ConsumedTrylockAttrs;
     // Trylock calls whose result has been discarded.
     llvm::SmallSetVector<const CallExpr *, 2> DiscardedTrylockCalls;
+    // Pointer variables that have been dereferenced unconditionally since
+    // their last modification. These are assumed to be non-null when
+    // evaluating their value, unless a branch condition contradicts that.
+    llvm::SmallPtrSet<const ValueDecl *, 4> DerefNonNullVars;
     llvm::SmallDenseMap<const ValueDecl *,
                         std::pair<const Expr *, LocalVarContext>, 2>
         UnmaterializedVarDefs;
@@ -1488,6 +1494,9 @@ public:
       const CFGBlock *CurrBlock,
       const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
   void materializeNarrowedTrylocks(FactSet &Lockset, TrylockValueState &State);
+  void constrainDereferencedPointersInStmt(
+      TrylockValueState &State, const Stmt *S,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
   void updateValueStateForStmt(
       TrylockValueState &State, const Stmt *S, LocalVarContext StmtCtx,
       const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars);
@@ -1511,6 +1520,10 @@ public:
       SmallVectorImpl<ReturnEvalOutcome> &Out);
   // Trylock calls in the function being verified whose result is discarded.
   llvm::SmallPtrSet<const CallExpr *, 4> DiscardedCalls;
+  // Statements in the arguments of builtins that do not evaluate their
+  // arguments, e.g. __builtin_constant_p(). These are CFG elements but are
+  // not executed.
+  llvm::SmallPtrSet<const Stmt *, 8> UnevaluatedStmts;
   void applyScopeExitCleanups(FactSet &StateSet, const CFGBlock *B,
                               bool OnlyAfterReturn = false);
 
@@ -1525,6 +1538,10 @@ public:
   mutable unsigned InlineDepth = 0;
   // The number of inline expansions performed for the current function.
   mutable unsigned InlineExpansionCount = 0;
+  // Whether evaluatePureExprRange() may assume that dereferenced pointers
+  // are not null. Only set while evaluating return values such that null
+  // checks after a dereference remain feasible.
+  mutable bool AssumeDerefNonNull = false;
   std::optional<TrivialInlineBody>
   getCachedTrivialInlineBody(const CallExpr *CallExp) const;
   void checkTrylockExitOutcome(const FactSet &BaseExpectedExitSet,
@@ -3984,11 +4001,23 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
 
   if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
     const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
-    if (VD) {
-      if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
-        return reprojectRangeSet(It->second, Dom);
+    if (!VD)
+      return std::nullopt;
+    std::optional<IntRangeSet> R;
+    if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
+      R = reprojectRangeSet(It->second, Dom);
+    if (AssumeDerefNonNull && State.DerefNonNullVars.contains(VD)) {
+      // The pointer has been dereferenced, so assume that it is not null
+      // unless that contradicts what is known about its value. Branch
+      // conditions do not use this assumption because code built with
+      // -fno-delete-null-pointer-checks may check a pointer for null after
+      // having dereferenced it.
+      IntRangeSet NonNull = R ? R->intersect(nonZeroRangeSet(Dom))
+                              : nonZeroRangeSet(Dom);
+      if (!NonNull.empty())
+        return NonNull;
     }
-    return std::nullopt;
+    return R;
   }
 
   if (const auto *CE = dyn_cast<CastExpr>(E)) {
@@ -4438,6 +4467,7 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
     Dst.ConsumedTrylockAttrs.insert(Key);
   for (const CallExpr *CE : Src.DiscardedTrylockCalls)
     Dst.DiscardedTrylockCalls.insert(CE);
+  llvm::set_intersect(Dst.DerefNonNullVars, Src.DerefNonNullVars);
 
   SmallVector<const ValueDecl *, 2> DefsToErase;
   for (const auto &[VD, DefPair] : Dst.UnmaterializedVarDefs) {
@@ -5137,10 +5167,132 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
   }
 }
 
+void ThreadSafetyAnalyzer::constrainDereferencedPointersInStmt(
+    TrylockValueState &State, const Stmt *S,
+    const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const {
+  if (State.Infeasible || !S)
+    return;
+
+  auto ConstrainPtrExpr = [&](const Expr *PtrE) {
+    while (PtrE) {
+      PtrE = stripNoOpExprWrappers(PtrE);
+      if (const auto *CE = dyn_cast<CastExpr>(PtrE)) {
+        QualType SubTy = CE->getSubExpr()->getType();
+        QualType DstTy = CE->getType();
+        if (CE->getCastKind() == CK_LValueToRValue) {
+          PtrE = CE->getSubExpr();
+          continue;
+        }
+        if ((CE->getCastKind() == CK_BitCast ||
+             CE->getCastKind() == CK_DerivedToBase ||
+             CE->getCastKind() == CK_UncheckedDerivedToBase) &&
+            DstTy->isAnyPointerType() && SubTy->isAnyPointerType()) {
+          PtrE = CE->getSubExpr();
+          continue;
+        }
+        return;
+      }
+      if (const auto *CallExp = dyn_cast<CallExpr>(PtrE)) {
+        unsigned BuiltinID = CallExp->getBuiltinCallee();
+        if (BuiltinID == Builtin::BI__builtin_expect ||
+            BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+          PtrE = CallExp->getArg(0);
+          continue;
+        }
+        return;
+      }
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(PtrE)) {
+        const auto *VD =
+            dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+        if (!VD || !VD->getType()->isAnyPointerType() ||
+            !isTrackableLocalVar(VD, EscapedVars))
+          return;
+        // Record the dereference separately instead of narrowing the range
+        // of VD such that a later null check is not treated as infeasible.
+        // Code built with -fno-delete-null-pointer-checks may dereference a
+        // pointer before checking it.
+        State.DerefNonNullVars.insert(VD);
+        return;
+      }
+      return;
+    }
+  };
+
+  auto RecordAccessedLValue = [&](const Expr *LV) {
+    while (LV) {
+      LV = LV->IgnoreParens();
+      if (const auto *CE = dyn_cast<CastExpr>(LV)) {
+        if (CE->getCastKind() == CK_NoOp) {
+          LV = CE->getSubExpr();
+          continue;
+        }
+      }
+      if (const auto *ME = dyn_cast<MemberExpr>(LV)) {
+        if (!isa<FieldDecl, IndirectFieldDecl>(ME->getMemberDecl()))
+          return;
+        if (ME->isArrow()) {
+          ConstrainPtrExpr(ME->getBase());
+          return;
+        }
+        LV = ME->getBase();
+        continue;
+      }
+      if (const auto *UO = dyn_cast<UnaryOperator>(LV)) {
+        if (UO->getOpcode() == UO_Deref && !UO->getType()->isFunctionType())
+          ConstrainPtrExpr(UO->getSubExpr());
+        return;
+      }
+      if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(LV)) {
+        const Expr *Base = ASE->getBase()->IgnoreParens();
+        if (const auto *CE = dyn_cast<CastExpr>(Base);
+            CE && CE->getCastKind() == CK_ArrayToPointerDecay) {
+          LV = CE->getSubExpr();
+          continue;
+        }
+        ConstrainPtrExpr(Base);
+        return;
+      }
+      return;
+    }
+  };
+
+  // The thread safety analysis builds its CFG with all statements added as
+  // separate CFG elements (setAllAlwaysAdd()), and this function is called
+  // for each element in execution order. Hence, only examine S itself and not
+  // its subexpressions. This evaluates each dereference against the pointer
+  // value at the time of the dereference and visits each AST node only once.
+  // Most statements in unevaluated contexts are not CFG elements. The
+  // arguments of builtins like __builtin_constant_p() are CFG elements but
+  // updateValueStateForStmt() skips these.
+  if (const auto *CE = dyn_cast<CallExpr>(S)) {
+    if (CE->isUnevaluatedBuiltinCall(*ASTCtx))
+      return;
+    if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(CE)) {
+      if (const CXXMethodDecl *MD = MCE->getMethodDecl();
+          MD && !MD->isStatic()) {
+        if (const auto *ME =
+                dyn_cast<MemberExpr>(MCE->getCallee()->IgnoreParens());
+            ME && ME->isArrow())
+          ConstrainPtrExpr(ME->getBase());
+      }
+    }
+  } else if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
+    if (BO->isAssignmentOp())
+      RecordAccessedLValue(BO->getLHS());
+  } else if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
+    if (UO->isIncrementDecrementOp())
+      RecordAccessedLValue(UO->getSubExpr());
+  } else if (const auto *CastE = dyn_cast<CastExpr>(S)) {
+    if (CastE->getCastKind() == CK_LValueToRValue)
+      RecordAccessedLValue(CastE->getSubExpr());
+  }
+}
+
+
 void ThreadSafetyAnalyzer::updateValueStateForStmt(
     TrylockValueState &State, const Stmt *S, LocalVarContext StmtCtx,
     const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) {
-  if (State.Infeasible || !S)
+  if (State.Infeasible || !S || UnevaluatedStmts.contains(S))
     return;
 
   if (const auto *E = dyn_cast<Expr>(S)) {
@@ -5174,8 +5326,11 @@ void ThreadSafetyAnalyzer::updateValueStateForStmt(
     }
   }
 
+  constrainDereferencedPointersInStmt(State, S, EscapedVars);
+
   auto UpdateVarFromExpr = [&](const ValueDecl *VD, const Expr *RHS) {
     VD = cast<ValueDecl>(VD->getCanonicalDecl());
+    State.DerefNonNullVars.erase(VD);
     if (!isTrackableLocalVar(VD, EscapedVars)) {
       State.VarRanges.erase(VD);
       State.UnmaterializedVarDefs.erase(VD);
@@ -5237,6 +5392,7 @@ void ThreadSafetyAnalyzer::updateValueStateForStmt(
         State.ExprRanges[stripNoOpExprWrappers(BO)] = It->second;
     } else {
       State.UnmaterializedVarDefs.erase(VD);
+      State.DerefNonNullVars.erase(VD);
       // Arithmetic on a bool converts the result back to bool instead of
       // wrapping it. Do not model that.
       if (isTrackableLocalVar(VD, EscapedVars) &&
@@ -5277,6 +5433,7 @@ void ThreadSafetyAnalyzer::updateValueStateForStmt(
     if (!VD)
       return;
     State.UnmaterializedVarDefs.erase(VD);
+    State.DerefNonNullVars.erase(VD);
     if (isTrackableLocalVar(VD, EscapedVars) &&
         VD->getType()->isIntegralOrEnumerationType() &&
         !VD->getType()->isBooleanType()) {
@@ -5594,7 +5751,12 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
   if (!exprHasUnmaterializedTrylock(E, Ctx, State, UseVarRanges)) {
     TrylockValueState EmptyState;
     const TrylockValueState &EvalState = UseVarRanges ? State : EmptyState;
-    if (auto R = evaluatePureExprRange(E, EvalState)) {
+    std::optional<IntRangeSet> R;
+    {
+      llvm::SaveAndRestore AssumeNonNull(AssumeDerefNonNull, true);
+      R = evaluatePureExprRange(E, EvalState);
+    }
+    if (R) {
       IntRangeSet Mapped = reprojectRangeSet(*R, TargetDom);
       if (!Mapped.empty()) {
         ReturnEvalOutcome O;
@@ -7880,6 +8042,43 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     };
     CollectDiscarded(CollectDiscarded, AC.getBody());
 
+    UnevaluatedStmts.clear();
+    auto AddSubtree = [&](auto &Self, const Stmt *S) -> void {
+      if (!S || !UnevaluatedStmts.insert(S).second)
+        return;
+      for (const Stmt *Child : S->children())
+        Self(Self, Child);
+    };
+    auto CollectUnevaluated = [&](auto &Self, const Stmt *S) -> void {
+      if (!S)
+        return;
+      if (const auto *CE = dyn_cast<CallExpr>(S);
+          CE && CE->isUnevaluatedBuiltinCall(*ASTCtx)) {
+        for (const Expr *Arg : CE->arguments())
+          AddSubtree(AddSubtree, Arg);
+        return;
+      }
+      // The operands of these expressions are not evaluated either. Neither
+      // assignments nor dereferences in these operands have any effect.
+      if (const auto *NE = dyn_cast<CXXNoexceptExpr>(S)) {
+        AddSubtree(AddSubtree, NE->getOperand());
+        return;
+      }
+      if (const auto *TE = dyn_cast<UnaryExprOrTypeTraitExpr>(S);
+          TE && !TE->isArgumentType() &&
+          !TE->getArgumentExpr()->getType()->isVariablyModifiedType()) {
+        AddSubtree(AddSubtree, TE->getArgumentExpr());
+        return;
+      }
+      if (const auto *TE = dyn_cast<CXXTypeidExpr>(S);
+          TE && !TE->isTypeOperand() && !TE->isPotentiallyEvaluated()) {
+        AddSubtree(AddSubtree, TE->getExprOperand());
+        return;
+      }
+      for (const Stmt *Child : S->children())
+        Self(Self, Child);
+    };
+    CollectUnevaluated(CollectUnevaluated, AC.getBody());
     // The result of the last statement of a statement expression is used.
     auto UnmarkStmtExprResults = [&](auto &Self, const Stmt *S) -> void {
       if (!S)
@@ -7996,6 +8195,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
               Candidate.ValState.ConsumedTrylockAttrs &&
           Existing.ValState.DiscardedTrylockCalls ==
               Candidate.ValState.DiscardedTrylockCalls &&
+          Existing.ValState.DerefNonNullVars ==
+              Candidate.ValState.DerefNonNullVars &&
           SameUnmaterializedDefs(Existing.ValState, Candidate.ValState)) {
         unionIntoValueState(Existing.ValState, Candidate.ValState, *ASTCtx);
         return;
@@ -8215,6 +8416,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         auto EraseModifiedVar = [&](const ValueDecl *VD) {
           CurrValState.VarRanges.erase(VD);
           CurrValState.UnmaterializedVarDefs.erase(VD);
+          CurrValState.DerefNonNullVars.erase(VD);
         };
         if (IrreducibleLoop) {
           for (const ValueDecl *VD : LoopModifiedVars)
@@ -8339,6 +8541,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 
           for (const ValueDecl *VD : LoopModVars) {
             CurrValState.UnmaterializedVarDefs.erase(VD);
+            CurrValState.DerefNonNullVars.erase(VD);
             if (!CandidateVars.contains(VD))
               CurrValState.VarRanges.erase(VD);
           }
