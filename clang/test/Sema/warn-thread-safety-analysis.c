@@ -1047,7 +1047,7 @@ int c_stmtexpr_comma_init_bad(void) // expected-note{{mutex acquired here}}
 }
 
 // Trivial inline helpers (restart_syscall, IS_ERR, PTR_ERR, PTR_ERR_OR_ZERO)
-// and multi-statement GNU statement expressions in trylock implementations.
+// and do { ... } while (0) macros in trylock implementations.
 void trace_branch_hit(int val);
 #define TEST_UNLIKELY_STMTEXPR(x)                                              \
   ({                                                                           \
@@ -1055,6 +1055,10 @@ void trace_branch_hit(int val);
     trace_branch_hit((int)__r);                                                \
     __r;                                                                       \
   })
+#define TEST_UNLOCK_DOWHILE0(m)                                                \
+  do {                                                                         \
+    mutex_unlock(m);                                                           \
+  } while (0)
 
 static inline int c_restart_syscall_helper(void) {
   do_some_work();
@@ -1123,7 +1127,7 @@ int c_trylock_is_err_ptr_err_valid(int retry_busy)
   return 0;
 
 fail_unlock:
-  mutex_unlock(&mu1);
+  TEST_UNLOCK_DOWHILE0(&mu1);
   return ret;
 }
 

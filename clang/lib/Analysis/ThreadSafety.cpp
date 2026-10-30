@@ -7760,7 +7760,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     };
     UnmarkStmtExprResults(UnmarkStmtExprResults, AC.getBody());
 
-    RPOIdx.assign(NumBlocks, 0);
+    RPOIdx.assign(NumBlocks, UINT_MAX);
     unsigned CurRPO = 0;
     for (const CFGBlock *B : *SortedGraph)
       RPOIdx[B->getBlockID()] = CurRPO++;
@@ -7774,7 +7774,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 
       bool HasNonForwardPred = false;
       for (auto PI = B->pred_begin(), PE = B->pred_end(); PI != PE; ++PI) {
-        if (!*PI)
+        if (!*PI || RPOIdx[(*PI)->getBlockID()] == UINT_MAX)
           continue;
         if (RPOIdx[(*PI)->getBlockID()] >= RPOIdx[B->getBlockID()] ||
             isa_and_nonnull<ContinueStmt>((*PI)->getTerminatorStmt())) {
@@ -7786,15 +7786,19 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         continue;
 
       bool AllSuccsPureToExit = true;
+      bool HasReachableSucc = false;
       for (auto SI = B->succ_begin(), SE = B->succ_end(); SI != SE; ++SI) {
         const CFGBlock *Succ = *SI;
-        if (!Succ || RPOIdx[Succ->getBlockID()] <= RPOIdx[B->getBlockID()] ||
+        if (!Succ || RPOIdx[Succ->getBlockID()] == UINT_MAX)
+          continue;
+        HasReachableSucc = true;
+        if (RPOIdx[Succ->getBlockID()] <= RPOIdx[B->getBlockID()] ||
             (Succ != ExitBlock && !PureExitPathBlocks[Succ->getBlockID()])) {
           AllSuccsPureToExit = false;
           break;
         }
       }
-      if (!AllSuccsPureToExit)
+      if (!HasReachableSucc || !AllSuccsPureToExit)
         continue;
 
       CapExprSet TCaps;
@@ -7907,7 +7911,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       for (CFGBlock::const_pred_iterator PI = CurrBlock->pred_begin(),
                                          PE = CurrBlock->pred_end();
            PI != PE; ++PI) {
-        if (*PI == nullptr || !VisitedBlocks.alreadySet(*PI))
+        if (*PI == nullptr || RPOIdx[(*PI)->getBlockID()] == UINT_MAX ||
+            !VisitedBlocks.alreadySet(*PI))
           continue;
         if (!neverReturns(*PI) && BlockInfo[(*PI)->getBlockID()].Reachable) {
           CurrBlockInfo->Reachable = true;
@@ -7944,7 +7949,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     bool TerminatorTrylockCapsComputed = false;
     for (CFGBlock::const_pred_iterator PI = CurrBlock->pred_begin(),
          PE  = CurrBlock->pred_end(); PI != PE; ++PI) {
-      if (*PI == nullptr)
+      if (*PI == nullptr ||
+          (CheckingTrylockBody && RPOIdx[(*PI)->getBlockID()] == UINT_MAX))
         continue;
       // if *PI -> CurrBlock is a back edge
       if (!VisitedBlocks.alreadySet(*PI)) {

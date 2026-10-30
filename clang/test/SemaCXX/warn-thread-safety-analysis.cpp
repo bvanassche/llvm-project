@@ -9481,7 +9481,7 @@ class BodyCheckSuite {
   }
   void *lookupMaybeErrPtr();
 
-  int validInlineHelperErrPtr(bool retry) TRY_ACQUIRE_RANGE(0, 0, mu) {
+  int validInlineHelperAndDoWhile0(bool retry) TRY_ACQUIRE_RANGE(0, 0, mu) {
     int ret;
     mu.Lock();
     void *p = lookupMaybeErrPtr();
@@ -9496,7 +9496,9 @@ class BodyCheckSuite {
     return 0;
 
   fail_unlock:
-    mu.Unlock();
+    do {
+      mu.Unlock();
+    } while (0);
     return ret;
   }
 
