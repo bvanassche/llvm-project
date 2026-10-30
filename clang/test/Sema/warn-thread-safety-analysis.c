@@ -705,6 +705,7 @@ void late_param_other(void (*release)(struct Mutex *) UNLOCK_FUNCTION(mu),
 
 // Test unusual trylock patterns
 void do_some_work(void);
+int do_some_work_cond(void);
 int work_data GUARDED_BY(mu1);
 
 void test_trylock_conditional(void) {
@@ -1178,6 +1179,40 @@ int c_redecl_reentrant_trylock_bad(void)
 int c_redecl_reentrant_trylock_bad(void) // expected-note{{mutex acquired here}}
     __attribute__((try_acquire_shared_capability_range(0, 0, crmu))) {
   return 0; // expected-warning{{expecting mutex 'crmu' to be held at the end of function}}
+}
+
+// A block of an irreducible cycle may be entered through another block of the
+// cycle even if all its forward predecessor edges are infeasible.
+int c_irreducible_infeasible_entry(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret = 0;
+  int k = 1;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  if (k != 0)
+    goto y;
+x:
+  if (do_some_work_cond())
+    ret = -16;
+y:
+  do_some_work();
+  if (do_some_work_cond())
+    goto x;
+  return ret; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+// Preserving ranges of variables not modified inside a natural loop, even when
+// modified later in the same function.
+int c_loop_unmodified_var_valid(int fail)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret = 0;
+  mutex_exclusive_lock(&mu1);
+  for (int i = 0; i < 2; ++i)
+    do_some_work();
+  if (fail) {
+    mutex_unlock(&mu1);
+    ret = -16;
+  }
+  return ret;
 }
 
 // We had a problem where we'd skip all attributes that follow a late-parsed

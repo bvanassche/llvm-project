@@ -3207,6 +3207,39 @@ scanTrylockVars(const Stmt *Root,
   VisitNode(VisitNode, Root, /*InNestedClosure=*/false);
 }
 
+static void
+scanBlockModifiedVars(const CFGBlock *B,
+                      llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars) {
+  if (!B)
+    return;
+
+  // The thread safety analysis builds its CFG with all statements added as
+  // separate CFG elements (setAllAlwaysAdd()). Hence, examining each element
+  // without its subexpressions finds every modification while visiting each
+  // AST node only once.
+  for (const CFGElement &BI : *B) {
+    std::optional<CFGStmt> CS = BI.getAs<CFGStmt>();
+    if (!CS)
+      continue;
+    const Stmt *S = CS->getStmt();
+    if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D); VD && VD->hasLocalStorage())
+          ModifiedVars.insert(cast<ValueDecl>(VD->getCanonicalDecl()));
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
+      if (BO->isAssignmentOp())
+        if (const auto *DRE = unwrapDirectLValueDRE(BO->getLHS()))
+          ModifiedVars.insert(
+              cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+    } else if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
+      if (UO->isIncrementDecrementOp())
+        if (const auto *DRE = unwrapDirectLValueDRE(UO->getSubExpr()))
+          ModifiedVars.insert(
+              cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+    }
+  }
+}
+
 static bool hasThreadSafetyCallEffects(const NamedDecl *Callee,
                                        const Expr *CallOrCtor) {
   if (CallOrCtor) {
@@ -7694,6 +7727,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
   llvm::SmallPtrSet<const ValueDecl *, 8> LoopModifiedVars;
   std::vector<unsigned> RPOIdx;
+  std::vector<llvm::SmallPtrSet<const ValueDecl *, 4>> BlockModifiedVars;
   std::vector<bool> PureExitPathBlocks;
   std::vector<TrylockValueState> BlockExitValState;
   std::vector<SmallVector<TrylockEdgeBundle, 2>> PureBlockBundles;
@@ -7761,9 +7795,12 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     UnmarkStmtExprResults(UnmarkStmtExprResults, AC.getBody());
 
     RPOIdx.assign(NumBlocks, UINT_MAX);
+    BlockModifiedVars.resize(NumBlocks);
     unsigned CurRPO = 0;
-    for (const CFGBlock *B : *SortedGraph)
+    for (const CFGBlock *B : *SortedGraph) {
       RPOIdx[B->getBlockID()] = CurRPO++;
+      scanBlockModifiedVars(B, BlockModifiedVars[B->getBlockID()]);
+    }
 
     PureExitPathBlocks.assign(NumBlocks, false);
     for (const CFGBlock *B : llvm::reverse(*SortedGraph)) {
@@ -7927,7 +7964,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     TrylockValueState CurrValState;
     if (CheckingTrylockBody && CurrBlock != &CFGraph->getEntry())
       CurrValState.Infeasible = true;
-    bool HasUnvisitedBackEdge = false;
+    SmallVector<const CFGBlock *, 2> UnvisitedBackPreds;
 
     // Iterate through the predecessor blocks and warn if the lockset for all
     // predecessors is not the same. We take the entry lockset of the current
@@ -7954,7 +7991,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         continue;
       // if *PI -> CurrBlock is a back edge
       if (!VisitedBlocks.alreadySet(*PI)) {
-        HasUnvisitedBackEdge = true;
+        if (CheckingTrylockBody)
+          UnvisitedBackPreds.push_back(*PI);
         continue;
       }
 
@@ -8041,10 +8079,52 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       continue;
 
     if (CheckingTrylockBody) {
-      if (HasUnvisitedBackEdge && !CurrValState.Infeasible) {
-        for (const ValueDecl *VD : LoopModifiedVars) {
+      if (!UnvisitedBackPreds.empty()) {
+        const CFGBlock *EntryBlock = &CFGraph->getEntry();
+        llvm::SmallPtrSet<const CFGBlock *, 16> LoopBlocks;
+        SmallVector<const CFGBlock *, 16> Worklist;
+        LoopBlocks.insert(CurrBlock);
+        for (const CFGBlock *BP : UnvisitedBackPreds)
+          if (LoopBlocks.insert(BP).second)
+            Worklist.push_back(BP);
+
+        bool IrreducibleLoop = false;
+        while (!Worklist.empty()) {
+          const CFGBlock *LB = Worklist.pop_back_val();
+          if (LB == EntryBlock) {
+            IrreducibleLoop = true;
+            break;
+          }
+          for (auto LPI = LB->pred_begin(), LPE = LB->pred_end(); LPI != LPE;
+               ++LPI) {
+            const CFGBlock *Pred = *LPI;
+            if (!Pred || RPOIdx[Pred->getBlockID()] == UINT_MAX)
+              continue;
+            if (LoopBlocks.insert(Pred).second)
+              Worklist.push_back(Pred);
+          }
+        }
+
+        // A block of an irreducible cycle may be entered from outside the
+        // cycle through another block of the cycle. Hence, it is reachable
+        // even if all its forward predecessor edges are infeasible. Since
+        // its state is not known, start from an empty state.
+        if (CurrValState.Infeasible && IrreducibleLoop)
+          CurrValState = TrylockValueState();
+        auto EraseModifiedVar = [&](const ValueDecl *VD) {
           CurrValState.VarRanges.erase(VD);
           CurrValState.UnmaterializedVarDefs.erase(VD);
+        };
+        if (IrreducibleLoop) {
+          for (const ValueDecl *VD : LoopModifiedVars)
+            EraseModifiedVar(VD);
+          for (const CFGBlock *B : *SortedGraph)
+            for (const ValueDecl *VD : BlockModifiedVars[B->getBlockID()])
+              EraseModifiedVar(VD);
+        } else {
+          for (const CFGBlock *LB : LoopBlocks)
+            for (const ValueDecl *VD : BlockModifiedVars[LB->getBlockID()])
+              EraseModifiedVar(VD);
         }
         CurrValState.ExprRanges.clear();
         CurrValState.ShortCircuitedOps.clear();

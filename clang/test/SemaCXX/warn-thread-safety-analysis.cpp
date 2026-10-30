@@ -9728,4 +9728,24 @@ int RedeclReentrantHolder::tryLockRangeOnce(bool cond)
   return 0;
 }
 
+struct LoopExitAndDerefTryAcquireHolder {
+  Mutex mu;
+  Mutex outer_mu;
+  int state;
+  bool ready();
+  void waitStep();
+
+  int validLoopUnmodifiedVar(bool fail) TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int ret = 0;
+    mu.Lock();
+    for (int i = 0; i < 2; ++i)
+      waitStep();
+    if (fail) {
+      mu.Unlock();
+      ret = -16;
+    }
+    return ret;
+  }
+};
+
 } // namespace TryAcquireBodyVerificationTest
