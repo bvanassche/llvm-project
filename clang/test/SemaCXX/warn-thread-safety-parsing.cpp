@@ -835,6 +835,19 @@ int etf_function_bad_2() EXCLUSIVE_TRYLOCK_FUNCTION("mu"); // \
 int etf_function_bad_3() EXCLUSIVE_TRYLOCK_FUNCTION(muDoublePointer); // \
   // expected-error {{'exclusive_trylock_function' attribute requires parameter 1 to be int or bool}}
 
+bool etf_nonconst;
+int etf_function_bad_nonconst() EXCLUSIVE_TRYLOCK_FUNCTION(etf_nonconst, mu1); // \
+  // expected-warning {{'exclusive_trylock_function' attribute success value is not a constant expression; ignoring the attribute}}
+
+// Evaluating the success value must neither instantiate nor odr-use functions
+// that are not constexpr.
+template <typename T> bool etf_nonconstexpr_template() { return T::nonexistent; }
+int etf_function_nonconstexpr_template() EXCLUSIVE_TRYLOCK_FUNCTION(etf_nonconstexpr_template<int>(), mu1); // \
+  // expected-warning {{'exclusive_trylock_function' attribute success value is not a constant expression; ignoring the attribute}}
+static bool etf_undefined_helper();
+int etf_function_undefined_helper() EXCLUSIVE_TRYLOCK_FUNCTION(etf_undefined_helper(), mu1); // \
+  // expected-warning {{'exclusive_trylock_function' attribute success value is not a constant expression; ignoring the attribute}}
+
 int etf_function_bad_4() EXCLUSIVE_TRYLOCK_FUNCTION(1, "mu"); // \
   // expected-warning {{ignoring 'exclusive_trylock_function' attribute because its argument is invalid}}
 int etf_function_bad_5() EXCLUSIVE_TRYLOCK_FUNCTION(1, muDoublePointer); // \

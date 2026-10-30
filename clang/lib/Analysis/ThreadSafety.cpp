@@ -1238,7 +1238,8 @@ class ThreadSafetyAnalyzer {
   threadSafety::SExprBuilder SxBuilder;
 
   ThreadSafetyHandler &Handler;
-  const FunctionDecl *CurrentFunction;
+  ASTContext *ASTCtx = nullptr;
+  const FunctionDecl *CurrentFunction = nullptr;
   LocalVariableMap LocalVarMap;
   // Maps constructed objects to `this` placeholder prior to initialization.
   llvm::SmallDenseMap<const Expr *, til::LiteralPtr *> ConstructedObjects;
@@ -1571,6 +1572,27 @@ void ThreadSafetyAnalyzer::getMutexIDs(CapExprSet &Mtxs, AttrType *Attr,
   }
 }
 
+static bool evalTrylockSuccessBool(const Expr *BrE, const ASTContext &Ctx,
+                                   bool &Out) {
+  if (!BrE || BrE->isValueDependent() || BrE->isTypeDependent())
+    return false;
+  if (auto ICE = BrE->getIntegerConstantExpr(Ctx)) {
+    Out = ICE->getBoolValue();
+    return true;
+  }
+  if (BrE->EvaluateAsBooleanCondition(Out, Ctx))
+    return true;
+  if (const auto *BLE = dyn_cast<CXXBoolLiteralExpr>(BrE->IgnoreParenCasts())) {
+    Out = BLE->getValue();
+    return true;
+  }
+  if (const auto *ILE = dyn_cast<IntegerLiteral>(BrE->IgnoreParenCasts())) {
+    Out = ILE->getValue().getBoolValue();
+    return true;
+  }
+  return false;
+}
+
 /// Extract the list of mutexIDs from a trylock attribute.  If the
 /// trylock applies to the given edge, then push them onto Mtxs, discarding
 /// any duplicates.
@@ -1580,12 +1602,11 @@ void ThreadSafetyAnalyzer::getMutexIDs(CapExprSet &Mtxs, AttrType *Attr,
                                        const CFGBlock *PredBlock,
                                        const CFGBlock *CurrBlock,
                                        Expr *BrE, bool Neg) {
-  // Find out which branch has the lock
+  // Find out which branch has the lock. Ignore the attribute if its success
+  // value cannot be evaluated. Sema warns about such attributes.
   bool branch = false;
-  if (const auto *BLE = dyn_cast_or_null<CXXBoolLiteralExpr>(BrE))
-    branch = BLE->getValue();
-  else if (const auto *ILE = dyn_cast_or_null<IntegerLiteral>(BrE))
-    branch = ILE->getValue().getBoolValue();
+  if (!evalTrylockSuccessBool(BrE, *ASTCtx, branch))
+    return;
 
   int branchnum = branch ? 0 : 1;
   if (Neg)
@@ -2857,6 +2878,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 
   CFG *CFGraph = walker.getGraph();
   const NamedDecl *D = walker.getDecl();
+  ASTCtx = &AC.getASTContext();
   CurrentFunction = dyn_cast<FunctionDecl>(D);
 
   if (D->hasAttr<NoThreadSafetyAnalysisAttr>())

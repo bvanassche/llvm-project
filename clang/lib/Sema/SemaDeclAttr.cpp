@@ -37,6 +37,7 @@
 #include "clang/Sema/Attr.h"
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/DelayedDiagnostic.h"
+#include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/ParsedAttr.h"
@@ -170,6 +171,78 @@ bool Sema::checkStringLiteralArgumentAttr(const ParsedAttr &AL, unsigned ArgNum,
 static bool isIntOrBool(Expr *Exp) {
   QualType QT = Exp->getType();
   return QT->isBooleanType() || QT->isIntegerType();
+}
+
+/// Call \p Fn for every function that \p E calls or references.
+static void forEachReferencedFunction(
+    const Stmt *E,
+    llvm::function_ref<void(const FunctionDecl *, SourceLocation)> Fn) {
+  if (!E)
+    return;
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    if (const auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl()))
+      Fn(FD, DRE->getLocation());
+  } else if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+    if (const auto *FD = dyn_cast<FunctionDecl>(ME->getMemberDecl()))
+      Fn(FD, ME->getMemberLoc());
+  } else if (const auto *CE = dyn_cast<CXXConstructExpr>(E)) {
+    Fn(CE->getConstructor(), CE->getLocation());
+  }
+  for (const Stmt *Child : E->children())
+    forEachReferencedFunction(Child, Fn);
+}
+
+/// Attribute arguments are parsed in an unevaluated context. Hence, constexpr
+/// functions referenced by a thread safety attribute argument that must be a
+/// constant have not been instantiated. Mark the constexpr functions
+/// referenced by such an argument in a constant-evaluated context such that
+/// the argument can be evaluated. Other functions are left alone: these
+/// cannot occur in a constant expression and marking them would instantiate
+/// and odr-use them.
+static void markThreadSafetyConstantArgReferenced(Sema &S, const Expr *Arg) {
+  if (!Arg || Arg->isTypeDependent() || Arg->isValueDependent())
+    return;
+  EnterExpressionEvaluationContext ConstantEvaluated(
+      S, Sema::ExpressionEvaluationContext::ConstantEvaluated);
+  forEachReferencedFunction(
+      Arg, [&](const FunctionDecl *FD, SourceLocation Loc) {
+        if (FD->isConstexpr())
+          S.MarkFunctionReferenced(Loc, const_cast<FunctionDecl *>(FD));
+      });
+}
+
+/// Returns whether \p Arg calls a constexpr function that has not been defined
+/// yet. That happens for constexpr member functions that are referenced by an
+/// attribute of a member of the same class: such attributes are parsed before
+/// the member function bodies. The analysis evaluates \p Arg once the bodies
+/// are available, so do not diagnose \p Arg as not being a constant.
+static bool callsUndefinedConstexprFunction(const Expr *Arg) {
+  bool Result = false;
+  forEachReferencedFunction(Arg, [&](const FunctionDecl *FD, SourceLocation) {
+    // Not isDefined(): that also returns true for member functions whose
+    // body will be parsed later.
+    if (FD->isConstexpr() && !FD->hasBody())
+      Result = true;
+  });
+  return Result;
+}
+
+/// Check that the success value of a try_acquire_capability or
+/// try_acquire_shared_capability attribute is a constant. The analysis
+/// ignores attributes with a success value that cannot be evaluated.
+static void checkTryAcquireCapabilitySuccessValue(Sema &S,
+                                                  const AttributeCommonInfo &AL,
+                                                  const Expr *Arg) {
+  if (!Arg || Arg->isTypeDependent() || Arg->isValueDependent())
+    return;
+  markThreadSafetyConstantArgReferenced(S, Arg);
+  bool Result;
+  if (Arg->isIntegerConstantExpr(S.Context) ||
+      Arg->EvaluateAsBooleanCondition(Result, S.Context) ||
+      callsUndefinedConstexprFunction(Arg))
+    return;
+  S.Diag(AL.getLoc(), diag::warn_thread_attribute_success_value_not_constant)
+      << AL << Arg->getSourceRange();
 }
 
 
@@ -496,6 +569,9 @@ bool Sema::checkInstantiatedThreadSafetyAttrs(const Decl *D, const Attr *A) {
            RequiresCapabilityAttr, LocksExcludedAttr, LockReturnedAttr>(A))
     return true;
 
+  if (const auto *TAC = dyn_cast<TryAcquireCapabilityAttr>(A))
+    checkTryAcquireCapabilitySuccessValue(*this, *TAC, TAC->getSuccessValue());
+
   const auto *VD = dyn_cast<ValueDecl>(D);
   if (!VD)
     return true;
@@ -678,6 +754,8 @@ static bool checkTryLockFunAttrCommon(Sema &S, Decl *D, const ParsedAttr &AL,
         << AL << 1 << AANT_ArgumentIntOrBool;
     return false;
   }
+
+  checkTryAcquireCapabilitySuccessValue(S, AL, AL.getArgAsExpr(0));
 
   // check that all arguments are lockable objects
   checkAttrArgsAreCapabilityObjs(S, D, AL, Args, 1);
