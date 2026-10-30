@@ -500,7 +500,8 @@ public:
 
   /// Return the next context after processing S.  This function is used by
   /// clients of the class to get the appropriate context when traversing the
-  /// CFG.  It must be called for every assignment or DeclStmt.
+  /// CFG.  It must be called for every assignment, increment/decrement,
+  /// CallExpr, or DeclStmt.
   const Context &getNextContext(unsigned &CtxIndex, const Stmt *S,
                                 const Context &C) {
     if (SavedContexts[CtxIndex + 1].first == S) {
@@ -651,6 +652,7 @@ public:
 
   void VisitDeclStmt(const DeclStmt *S);
   void VisitBinaryOperator(const BinaryOperator *BO);
+  void VisitUnaryOperator(const UnaryOperator *UO);
   void VisitCallExpr(const CallExpr *CE);
 };
 
@@ -693,6 +695,21 @@ void VarMapBuilder::VisitBinaryOperator(const BinaryOperator *BO) {
         // FIXME -- handle compound assignment operators
         Ctx = VMap->clearDefinition(VDec, Ctx);
       VMap->saveContext(BO, Ctx);
+    }
+  }
+}
+
+// Invalidate the definitions of local variables that are incremented or
+// decremented.
+void VarMapBuilder::VisitUnaryOperator(const UnaryOperator *UO) {
+  if (!UO->isIncrementDecrementOp())
+    return;
+  if (const auto *DRE =
+          dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParenCasts())) {
+    const ValueDecl *VDec = DRE->getDecl();
+    if (Ctx.lookup(VDec)) {
+      Ctx = VMap->clearDefinition(VDec, Ctx);
+      VMap->saveContext(UO, Ctx);
     }
   }
 }
@@ -1269,8 +1286,97 @@ public:
                    const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
                    Expr *BrE, bool Neg);
 
+  struct IntDomain {
+    unsigned BitWidth = 0;
+    llvm::APSInt Lo;
+    llvm::APSInt Hi;
+
+    IntDomain() = default;
+    IntDomain(unsigned BitWidth, llvm::APSInt Lo, llvm::APSInt Hi)
+        : BitWidth(BitWidth), Lo(std::move(Lo)), Hi(std::move(Hi)) {}
+
+    static IntDomain forType(QualType Ty, const ASTContext &Ctx);
+    llvm::APSInt toDomainInt(const llvm::APSInt &V) const;
+  };
+
+  class IntRangeSet {
+    SmallVector<std::pair<llvm::APSInt, llvm::APSInt>, 2> Intervals;
+
+  public:
+    IntRangeSet() = default;
+
+    bool empty() const { return Intervals.empty(); }
+
+    static IntRangeSet full(const IntDomain &Dom);
+    static IntRangeSet closedRange(const IntDomain &Dom,
+                                   const llvm::APSInt &First,
+                                   const llvm::APSInt &Last);
+    static IntRangeSet single(const IntDomain &Dom, const llvm::APSInt &Val);
+    static IntRangeSet forComparison(const IntDomain &Dom,
+                                     BinaryOperator::Opcode Opc,
+                                     const llvm::APSInt &K);
+
+    /// Union of all \p Sets in O(N log N) time, where N is the total number
+    /// of intervals. All sets must belong to the same domain.
+    static IntRangeSet unionAll(ArrayRef<IntRangeSet> Sets);
+
+    IntRangeSet complement(const IntDomain &Dom) const;
+    IntRangeSet intersect(const IntRangeSet &Other) const;
+    IntRangeSet unionWith(const IntRangeSet &Other) const;
+
+    bool subsetOf(const llvm::APSInt &First, const llvm::APSInt &Last) const;
+    bool intersects(const llvm::APSInt &First, const llvm::APSInt &Last) const;
+  };
+
+  /// The values that select each case label of a switch statement and the
+  /// values that select the default label (or skip the switch body).
+  struct SwitchCaseTable {
+    bool Valid = false;
+    llvm::SmallDenseMap<const SwitchCase *, IntRangeSet, 8> CaseSets;
+    IntRangeSet DefaultSet;
+  };
+  // Switch case tables per switch statement and integer domain. Computing
+  // these once per switch statement keeps the cost of handling all edges of
+  // a switch statement O(N log N) instead of O(N^3).
+  mutable llvm::DenseMap<const SwitchStmt *,
+                         SmallVector<std::pair<IntDomain, SwitchCaseTable>, 1>>
+      SwitchTables;
+  /// Return the case table for \p SS in domain \p Dom. The returned
+  /// reference is invalidated by the next call of this function.
+  const SwitchCaseTable &getSwitchCaseTable(const SwitchStmt *SS,
+                                            const IntDomain &Dom) const;
+
+  struct TrylockRangeCondResult {
+    const CallExpr *Call = nullptr;
+    const NamedDecl *Callee = nullptr;
+    IntDomain Dom;
+    IntRangeSet TrueSet;
+    IntRangeSet FalseSet;
+
+    TrylockRangeCondResult() = default;
+    TrylockRangeCondResult(const CallExpr *Call, const NamedDecl *Callee,
+                           IntDomain Dom, IntRangeSet TrueSet,
+                           IntRangeSet FalseSet)
+        : Call(Call), Callee(Callee), Dom(std::move(Dom)),
+          TrueSet(std::move(TrueSet)), FalseSet(std::move(FalseSet)) {}
+  };
+
   const CallExpr *getTrylockCallExpr(const Stmt *Cond, LocalVarContext C,
                                      bool &Negate);
+  const CallExpr *unwrapTrylockValueExpr(const Expr *E, LocalVarContext C);
+  bool isGuaranteedZeroOrOneExpr(const Expr *E, LocalVarContext C);
+  TrylockRangeCondResult evaluateTrylockRangeCond(const Stmt *Cond,
+                                                  LocalVarContext C);
+  TrylockRangeCondResult evaluateTrylockRangeCondImpl(const Stmt *Cond,
+                                                      LocalVarContext C);
+  // Results of evaluateTrylockRangeCond(), keyed by the condition and the
+  // root of the local variable context. Memoization keeps the evaluation of
+  // chains of logical operators on variables linear instead of exponential.
+  llvm::DenseMap<std::pair<const Stmt *, const void *>, TrylockRangeCondResult>
+      RangeCondCache;
+  void applyRangeTrylockEdge(FactSet &Result, const CFGBlock *PredBlock,
+                             const CFGBlock *CurrBlock);
+  void getRangeTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
 
   using TerminatorTrylockCall =
       std::tuple<const CallExpr *, const NamedDecl *,
@@ -1764,28 +1870,789 @@ void ThreadSafetyAnalyzer::getEdgeLockset(FactSet &Result,
                                           const CFGBlock *CurrBlock) {
   Result = ExitSet;
 
-  bool Negate = false;
-  auto [Exp, FunDecl, Cleanup] = getTerminatorTrylockCall(PredBlock, Negate);
-  if (!Exp)
+  {
+    bool Negate = false;
+    auto [Exp, FunDecl, Cleanup] = getTerminatorTrylockCall(PredBlock, Negate);
+    if (Exp) {
+      CapExprSet ExclusiveLocksToAdd;
+      CapExprSet SharedLocksToAdd;
+
+      // If the condition is a call to a Trylock function, then grab the
+      // attributes
+      for (const auto *Attr :
+           FunDecl->specific_attrs<TryAcquireCapabilityAttr>()) {
+        CapExprSet AttrLocks;
+        getMutexIDs(AttrLocks, Attr, Exp, FunDecl, PredBlock, CurrBlock,
+                    Attr->getSuccessValue(), Negate);
+        if (!AttrLocks.empty()) {
+          CapExprSet &Dest =
+              Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd;
+          for (const auto &Cap : AttrLocks)
+            Dest.push_back_nodup(Cap);
+        }
+      }
+
+      // Add and remove locks.
+      SourceLocation Loc = Exp->getExprLoc();
+      for (const auto &ExclusiveLockToAdd : ExclusiveLocksToAdd)
+        addLock(Result, FactMan.createFact<LockableFactEntry>(
+                            ExclusiveLockToAdd, LK_Exclusive, Loc));
+      for (const auto &SharedLockToAdd : SharedLocksToAdd)
+        addLock(Result, FactMan.createFact<LockableFactEntry>(SharedLockToAdd,
+                                                              LK_Shared, Loc));
+    }
+  }
+
+  applyRangeTrylockEdge(Result, PredBlock, CurrBlock);
+}
+
+static const NamedDecl *getRangeTrylockCallee(const CallExpr *CallExp) {
+  if (!CallExp || !CallExp->getType()->isIntegralOrEnumerationType())
+    return nullptr;
+  const auto *FunDecl = dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl());
+  if (!FunDecl || !FunDecl->hasAttr<TryAcquireCapabilityRangeAttr>())
+    return nullptr;
+  return FunDecl;
+}
+
+static bool isValuePreservingIntegralCast(QualType SrcTy, QualType DstTy,
+                                          const ASTContext &Ctx) {
+  if (!SrcTy->isIntegralOrEnumerationType() ||
+      !DstTy->isIntegralOrEnumerationType() || DstTy->isBooleanType())
+    return false;
+  // Integral promotion of an enumeration type preserves all values of that
+  // enumeration, even if the promoted type is signed while the underlying type
+  // is unsigned.
+  if (const auto *ET = SrcTy->getAs<EnumType>())
+    if (const EnumDecl *ED = ET->getDecl()->getDefinition();
+        ED && Ctx.hasSameType(ED->getPromotionType(), DstTy))
+      return true;
+  unsigned SrcBits = Ctx.getIntWidth(SrcTy);
+  unsigned DstBits = Ctx.getIntWidth(DstTy);
+  if (DstBits < SrcBits)
+    return false;
+  bool SrcUnsigned = SrcTy->isUnsignedIntegerOrEnumerationType();
+  bool DstUnsigned = DstTy->isUnsignedIntegerOrEnumerationType();
+  return SrcUnsigned == DstUnsigned || (SrcUnsigned && DstBits > SrcBits);
+}
+
+ThreadSafetyAnalyzer::IntDomain
+ThreadSafetyAnalyzer::IntDomain::forType(QualType Ty, const ASTContext &Ctx) {
+  assert(Ty->isIntegralOrEnumerationType());
+  unsigned Bits = Ctx.getIntWidth(Ty);
+  bool IsUnsigned = Ty->isUnsignedIntegerOrEnumerationType();
+  unsigned W = std::max(Bits + 2, 66u);
+  llvm::APSInt Min = llvm::APSInt::getMinValue(Bits, IsUnsigned).extend(W);
+  llvm::APSInt Max = llvm::APSInt::getMaxValue(Bits, IsUnsigned).extend(W);
+  Min.setIsSigned(true);
+  Max.setIsSigned(true);
+  return {W, std::move(Min), std::move(Max)};
+}
+
+llvm::APSInt
+ThreadSafetyAnalyzer::IntDomain::toDomainInt(const llvm::APSInt &V) const {
+  unsigned TempW = std::max(V.getBitWidth() + 2, BitWidth);
+  llvm::APSInt Ext = V.extend(TempW);
+  Ext.setIsSigned(true);
+  llvm::APSInt Res = Ext.extOrTrunc(BitWidth);
+  Res.setIsSigned(true);
+  return Res;
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+ThreadSafetyAnalyzer::IntRangeSet::full(const IntDomain &Dom) {
+  IntRangeSet S;
+  S.Intervals.emplace_back(Dom.Lo, Dom.Hi);
+  return S;
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+ThreadSafetyAnalyzer::IntRangeSet::closedRange(const IntDomain &Dom,
+                                               const llvm::APSInt &First,
+                                               const llvm::APSInt &Last) {
+  if (llvm::APSInt::compareValues(First, Last) > 0 ||
+      llvm::APSInt::compareValues(Last, Dom.Lo) < 0 ||
+      llvm::APSInt::compareValues(First, Dom.Hi) > 0)
+    return {};
+  llvm::APSInt ClampedLo = llvm::APSInt::compareValues(First, Dom.Lo) <= 0
+                               ? Dom.Lo
+                               : Dom.toDomainInt(First);
+  llvm::APSInt ClampedHi = llvm::APSInt::compareValues(Last, Dom.Hi) >= 0
+                               ? Dom.Hi
+                               : Dom.toDomainInt(Last);
+  IntRangeSet S;
+  S.Intervals.emplace_back(std::move(ClampedLo), std::move(ClampedHi));
+  return S;
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+ThreadSafetyAnalyzer::IntRangeSet::single(const IntDomain &Dom,
+                                          const llvm::APSInt &Val) {
+  return closedRange(Dom, Val, Val);
+}
+
+static llvm::APSInt incAPSInt(llvm::APSInt V) {
+  ++V;
+  return V;
+}
+
+static llvm::APSInt decAPSInt(llvm::APSInt V) {
+  --V;
+  return V;
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+ThreadSafetyAnalyzer::IntRangeSet::forComparison(const IntDomain &Dom,
+                                                 BinaryOperator::Opcode Opc,
+                                                 const llvm::APSInt &K) {
+  switch (Opc) {
+  case BO_EQ:
+    return single(Dom, K);
+  case BO_NE:
+    return single(Dom, K).complement(Dom);
+  case BO_LT:
+    if (llvm::APSInt::compareValues(K, Dom.Lo) <= 0)
+      return {};
+    if (llvm::APSInt::compareValues(K, Dom.Hi) > 0)
+      return full(Dom);
+    {
+      IntRangeSet S;
+      S.Intervals.emplace_back(Dom.Lo, decAPSInt(Dom.toDomainInt(K)));
+      return S;
+    }
+  case BO_LE:
+    return closedRange(Dom, Dom.Lo, K);
+  case BO_GT:
+    if (llvm::APSInt::compareValues(K, Dom.Hi) >= 0)
+      return {};
+    if (llvm::APSInt::compareValues(K, Dom.Lo) < 0)
+      return full(Dom);
+    {
+      IntRangeSet S;
+      S.Intervals.emplace_back(incAPSInt(Dom.toDomainInt(K)), Dom.Hi);
+      return S;
+    }
+  case BO_GE:
+    return closedRange(Dom, K, Dom.Hi);
+  default:
+    llvm_unreachable("Unexpected comparison opcode");
+  }
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+ThreadSafetyAnalyzer::IntRangeSet::complement(const IntDomain &Dom) const {
+  if (Intervals.empty())
+    return full(Dom);
+  IntRangeSet Res;
+  llvm::APSInt Cursor = Dom.Lo;
+  for (const auto &[Lo, Hi] : Intervals) {
+    if (Cursor < Lo)
+      Res.Intervals.emplace_back(Cursor, decAPSInt(Lo));
+    Cursor = incAPSInt(Hi);
+  }
+  if (Cursor <= Dom.Hi)
+    Res.Intervals.emplace_back(Cursor, Dom.Hi);
+  return Res;
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+ThreadSafetyAnalyzer::IntRangeSet::intersect(const IntRangeSet &Other) const {
+  IntRangeSet Res;
+  size_t I = 0, J = 0;
+  while (I < Intervals.size() && J < Other.Intervals.size()) {
+    const llvm::APSInt &Lo =
+        std::max(Intervals[I].first, Other.Intervals[J].first);
+    const llvm::APSInt &Hi =
+        std::min(Intervals[I].second, Other.Intervals[J].second);
+    if (Lo <= Hi)
+      Res.Intervals.emplace_back(Lo, Hi);
+    if (Intervals[I].second < Other.Intervals[J].second)
+      ++I;
+    else
+      ++J;
+  }
+  return Res;
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+ThreadSafetyAnalyzer::IntRangeSet::unionWith(const IntRangeSet &Other) const {
+  IntRangeSet Res;
+  auto Append = [&Res](const std::pair<llvm::APSInt, llvm::APSInt> &Iv) {
+    if (Res.Intervals.empty() ||
+        incAPSInt(Res.Intervals.back().second) < Iv.first)
+      Res.Intervals.push_back(Iv);
+    else if (Res.Intervals.back().second < Iv.second)
+      Res.Intervals.back().second = Iv.second;
+  };
+  size_t I = 0, J = 0;
+  while (I < Intervals.size() && J < Other.Intervals.size()) {
+    if (Intervals[I].first <= Other.Intervals[J].first)
+      Append(Intervals[I++]);
+    else
+      Append(Other.Intervals[J++]);
+  }
+  while (I < Intervals.size())
+    Append(Intervals[I++]);
+  while (J < Other.Intervals.size())
+    Append(Other.Intervals[J++]);
+  return Res;
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+ThreadSafetyAnalyzer::IntRangeSet::unionAll(ArrayRef<IntRangeSet> Sets) {
+  SmallVector<std::pair<llvm::APSInt, llvm::APSInt>, 8> All;
+  for (const IntRangeSet &S : Sets)
+    llvm::append_range(All, S.Intervals);
+  llvm::sort(All, [](const auto &A, const auto &B) {
+    return llvm::APSInt::compareValues(A.first, B.first) < 0;
+  });
+  IntRangeSet Res;
+  for (const auto &Iv : All) {
+    if (Res.Intervals.empty() ||
+        incAPSInt(Res.Intervals.back().second) < Iv.first)
+      Res.Intervals.push_back(Iv);
+    else if (Res.Intervals.back().second < Iv.second)
+      Res.Intervals.back().second = Iv.second;
+  }
+  return Res;
+}
+
+const ThreadSafetyAnalyzer::SwitchCaseTable &
+ThreadSafetyAnalyzer::getSwitchCaseTable(const SwitchStmt *SS,
+                                         const IntDomain &Dom) const {
+  auto &Entries = SwitchTables[SS];
+  for (auto &[EDom, Table] : Entries)
+    if (EDom.BitWidth == Dom.BitWidth &&
+        llvm::APSInt::compareValues(EDom.Lo, Dom.Lo) == 0 &&
+        llvm::APSInt::compareValues(EDom.Hi, Dom.Hi) == 0)
+      return Table;
+
+  SwitchCaseTable Table;
+  Table.Valid = true;
+  SmallVector<IntRangeSet, 8> AllCases;
+  for (const SwitchCase *SC = SS->getSwitchCaseList(); SC;
+       SC = SC->getNextSwitchCase()) {
+    const auto *CS = dyn_cast<CaseStmt>(SC);
+    if (!CS)
+      continue;
+    auto Lo = CS->getLHS()->getIntegerConstantExpr(*ASTCtx);
+    auto Hi = CS->getRHS() ? CS->getRHS()->getIntegerConstantExpr(*ASTCtx) : Lo;
+    if (!Lo || !Hi) {
+      Table.Valid = false;
+      break;
+    }
+    IntRangeSet CaseSet = IntRangeSet::closedRange(Dom, *Lo, *Hi);
+    AllCases.push_back(CaseSet);
+    Table.CaseSets.try_emplace(CS, std::move(CaseSet));
+  }
+  if (Table.Valid)
+    Table.DefaultSet = IntRangeSet::unionAll(AllCases).complement(Dom);
+  else
+    Table.CaseSets.clear();
+  Entries.emplace_back(Dom, std::move(Table));
+  return Entries.back().second;
+}
+
+bool ThreadSafetyAnalyzer::IntRangeSet::subsetOf(
+    const llvm::APSInt &First, const llvm::APSInt &Last) const {
+  return !Intervals.empty() &&
+         llvm::APSInt::compareValues(Intervals.front().first, First) >= 0 &&
+         llvm::APSInt::compareValues(Intervals.back().second, Last) <= 0;
+}
+
+bool ThreadSafetyAnalyzer::IntRangeSet::intersects(
+    const llvm::APSInt &First, const llvm::APSInt &Last) const {
+  return llvm::any_of(Intervals, [&](const auto &Iv) {
+    return llvm::APSInt::compareValues(Iv.second, First) >= 0 &&
+           llvm::APSInt::compareValues(Iv.first, Last) <= 0;
+  });
+}
+
+const CallExpr *
+ThreadSafetyAnalyzer::unwrapTrylockValueExpr(const Expr *E, LocalVarContext C) {
+  while (E) {
+    if (const auto *PE = dyn_cast<ParenExpr>(E)) {
+      E = PE->getSubExpr();
+      continue;
+    }
+    if (const auto *FE = dyn_cast<FullExpr>(E)) {
+      E = FE->getSubExpr();
+      continue;
+    }
+    if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      switch (CE->getCastKind()) {
+      case CK_LValueToRValue:
+      case CK_NoOp:
+        E = CE->getSubExpr();
+        continue;
+      case CK_IntegralCast:
+        if (isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
+                                          CE->getType(), *ASTCtx)) {
+          E = CE->getSubExpr();
+          continue;
+        }
+        return nullptr;
+      default:
+        return nullptr;
+      }
+    }
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      E = LocalVarMap.lookupExpr(DRE->getDecl(), C);
+      continue;
+    }
+    if (const auto *BOP = dyn_cast<BinaryOperator>(E)) {
+      if (BOP->getOpcode() == BO_Assign && !BOP->getLHS()->refersToBitField()) {
+        E = BOP->getRHS();
+        continue;
+      }
+      return nullptr;
+    }
+    if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+      if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
+        E = dyn_cast<Expr>(CS->body_back());
+        continue;
+      }
+      return nullptr;
+    }
+    if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+      unsigned BuiltinID = CallExp->getBuiltinCallee();
+      if (BuiltinID == Builtin::BI__builtin_expect ||
+          BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+        E = CallExp->getArg(0);
+        continue;
+      }
+      return getRangeTrylockCallee(CallExp) ? CallExp : nullptr;
+    }
+    return nullptr;
+  }
+  return nullptr;
+}
+
+bool ThreadSafetyAnalyzer::isGuaranteedZeroOrOneExpr(const Expr *E,
+                                                     LocalVarContext C) {
+  while (E) {
+    if (E->getType()->isBooleanType())
+      return true;
+    if (const auto *PE = dyn_cast<ParenExpr>(E)) {
+      E = PE->getSubExpr();
+      continue;
+    }
+    if (const auto *FE = dyn_cast<FullExpr>(E)) {
+      E = FE->getSubExpr();
+      continue;
+    }
+    if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      if (CE->getCastKind() == CK_LValueToRValue ||
+          CE->getCastKind() == CK_NoOp ||
+          (CE->getCastKind() == CK_IntegralCast &&
+           isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
+                                         CE->getType(), *ASTCtx))) {
+        E = CE->getSubExpr();
+        continue;
+      }
+      return false;
+    }
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      E = LocalVarMap.lookupExpr(DRE->getDecl(), C);
+      continue;
+    }
+    if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+      if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
+        E = dyn_cast<Expr>(CS->body_back());
+        continue;
+      }
+      return false;
+    }
+    if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+      unsigned BuiltinID = CallExp->getBuiltinCallee();
+      if (BuiltinID == Builtin::BI__builtin_expect ||
+          BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+        E = CallExp->getArg(0);
+        continue;
+      }
+      return false;
+    }
+    if (const auto *UOP = dyn_cast<UnaryOperator>(E))
+      return UOP->getOpcode() == UO_LNot;
+    if (const auto *BOP = dyn_cast<BinaryOperator>(E)) {
+      if (BOP->getOpcode() == BO_Assign && !BOP->getLHS()->refersToBitField()) {
+        E = BOP->getRHS();
+        continue;
+      }
+      return BOP->isComparisonOp() || BOP->isLogicalOp();
+    }
+    return false;
+  }
+  return false;
+}
+
+ThreadSafetyAnalyzer::TrylockRangeCondResult
+ThreadSafetyAnalyzer::evaluateTrylockRangeCond(const Stmt *Cond,
+                                               LocalVarContext C) {
+  if (!Cond)
+    return {};
+  std::pair<const Stmt *, const void *> Key(Cond, C.getRootWithoutRetain());
+  if (auto It = RangeCondCache.find(Key); It != RangeCondCache.end())
+    return It->second;
+  TrylockRangeCondResult Res = evaluateTrylockRangeCondImpl(Cond, C);
+  RangeCondCache.try_emplace(Key, Res);
+  return Res;
+}
+
+ThreadSafetyAnalyzer::TrylockRangeCondResult
+ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
+                                                   LocalVarContext C) {
+  if (!Cond)
+    return {};
+
+  if (const auto *PE = dyn_cast<ParenExpr>(Cond))
+    return evaluateTrylockRangeCond(PE->getSubExpr(), C);
+  if (const auto *FE = dyn_cast<FullExpr>(Cond))
+    return evaluateTrylockRangeCond(FE->getSubExpr(), C);
+
+  if (const auto *CE = dyn_cast<CastExpr>(Cond)) {
+    switch (CE->getCastKind()) {
+    case CK_LValueToRValue:
+    case CK_NoOp:
+    case CK_IntegralToBoolean:
+      return evaluateTrylockRangeCond(CE->getSubExpr(), C);
+    case CK_IntegralCast:
+      if (isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
+                                        CE->getType(), *ASTCtx))
+        return evaluateTrylockRangeCond(CE->getSubExpr(), C);
+      return {};
+    default:
+      return {};
+    }
+  }
+
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(Cond)) {
+    const Expr *E = LocalVarMap.lookupExpr(DRE->getDecl(), C);
+    return evaluateTrylockRangeCond(E, C);
+  }
+
+  if (const auto *SE = dyn_cast<StmtExpr>(Cond)) {
+    if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty())
+      if (const auto *E = dyn_cast<Expr>(CS->body_back()))
+        return evaluateTrylockRangeCond(E, C);
+    return {};
+  }
+
+  if (const auto *CallExp = dyn_cast<CallExpr>(Cond)) {
+    unsigned BuiltinID = CallExp->getBuiltinCallee();
+    if (BuiltinID == Builtin::BI__builtin_expect ||
+        BuiltinID == Builtin::BI__builtin_expect_with_probability)
+      return evaluateTrylockRangeCond(CallExp->getArg(0), C);
+
+    if (const NamedDecl *Callee = getRangeTrylockCallee(CallExp)) {
+      IntDomain Dom = IntDomain::forType(CallExp->getType(), *ASTCtx);
+      IntRangeSet FalseSet = IntRangeSet::single(Dom, llvm::APSInt::get(0));
+      IntRangeSet TrueSet = FalseSet.complement(Dom);
+      return {CallExp, Callee, std::move(Dom), std::move(TrueSet),
+              std::move(FalseSet)};
+    }
+    return {};
+  }
+
+  if (const auto *UOP = dyn_cast<UnaryOperator>(Cond)) {
+    if (UOP->getOpcode() == UO_LNot) {
+      auto Res = evaluateTrylockRangeCond(UOP->getSubExpr(), C);
+      if (Res.Call)
+        std::swap(Res.TrueSet, Res.FalseSet);
+      return Res;
+    }
+    return {};
+  }
+
+  if (const auto *BOP = dyn_cast<BinaryOperator>(Cond)) {
+    if (BOP->getOpcode() == BO_Assign) {
+      // A bit-field assignment truncates the stored value.
+      if (BOP->getLHS()->refersToBitField())
+        return {};
+      return evaluateTrylockRangeCond(BOP->getRHS(), C);
+    }
+
+    if (BOP->isComparisonOp()) {
+      const CallExpr *CallExp = nullptr;
+      BinaryOperator::Opcode CmpOp = BOP->getOpcode();
+      std::optional<llvm::APSInt> ConstVal;
+      if (const CallExpr *LHSVal = unwrapTrylockValueExpr(BOP->getLHS(), C)) {
+        ConstVal = BOP->getRHS()->getIntegerConstantExpr(*ASTCtx);
+        if (ConstVal)
+          CallExp = LHSVal;
+      }
+      if (!CallExp) {
+        if (const CallExpr *RHSVal = unwrapTrylockValueExpr(BOP->getRHS(), C)) {
+          ConstVal = BOP->getLHS()->getIntegerConstantExpr(*ASTCtx);
+          if (ConstVal) {
+            CallExp = RHSVal;
+            CmpOp = BinaryOperator::reverseComparisonOp(CmpOp);
+          }
+        }
+      }
+      if (CallExp && ConstVal) {
+        const NamedDecl *Callee = getRangeTrylockCallee(CallExp);
+        IntDomain Dom = IntDomain::forType(CallExp->getType(), *ASTCtx);
+        IntRangeSet TrueSet = IntRangeSet::forComparison(Dom, CmpOp, *ConstVal);
+        IntRangeSet FalseSet = TrueSet.complement(Dom);
+        return {CallExp, Callee, std::move(Dom), std::move(TrueSet),
+                std::move(FalseSet)};
+      }
+
+      if (BOP->getOpcode() == BO_EQ || BOP->getOpcode() == BO_NE) {
+        auto EvalBoolEq = [&](const Expr *BoolSide,
+                              const Expr *ConstSide) -> TrylockRangeCondResult {
+          auto K = ConstSide->getIntegerConstantExpr(*ASTCtx);
+          if (!K || !isGuaranteedZeroOrOneExpr(BoolSide, C))
+            return {};
+          auto Res = evaluateTrylockRangeCond(BoolSide, C);
+          if (!Res.Call)
+            return {};
+          if (*K == 1) {
+            if (BOP->getOpcode() == BO_NE)
+              std::swap(Res.TrueSet, Res.FalseSet);
+          } else if (*K == 0) {
+            if (BOP->getOpcode() == BO_EQ)
+              std::swap(Res.TrueSet, Res.FalseSet);
+          } else {
+            IntRangeSet All = Res.TrueSet.unionWith(Res.FalseSet);
+            if (BOP->getOpcode() == BO_EQ) {
+              Res.TrueSet = {};
+              Res.FalseSet = std::move(All);
+            } else {
+              Res.TrueSet = std::move(All);
+              Res.FalseSet = {};
+            }
+          }
+          return Res;
+        };
+        if (auto Res = EvalBoolEq(BOP->getLHS(), BOP->getRHS()); Res.Call)
+          return Res;
+        if (auto Res = EvalBoolEq(BOP->getRHS(), BOP->getLHS()); Res.Call)
+          return Res;
+      }
+      return {};
+    }
+
+    if (BOP->getOpcode() == BO_LAnd || BOP->getOpcode() == BO_LOr) {
+      auto RHSRes = evaluateTrylockRangeCond(BOP->getRHS(), C);
+      if (!RHSRes.Call)
+        return {};
+      auto LHSRes = evaluateTrylockRangeCond(BOP->getLHS(), C);
+      IntRangeSet FullDom = IntRangeSet::full(RHSRes.Dom);
+      const IntRangeSet &LHSTrue =
+          (LHSRes.Call == RHSRes.Call) ? LHSRes.TrueSet : FullDom;
+      const IntRangeSet &LHSFalse =
+          (LHSRes.Call == RHSRes.Call) ? LHSRes.FalseSet : FullDom;
+      if (BOP->getOpcode() == BO_LAnd) {
+        RHSRes.TrueSet = LHSTrue.intersect(RHSRes.TrueSet);
+        RHSRes.FalseSet = LHSFalse.unionWith(RHSRes.FalseSet);
+      } else {
+        RHSRes.TrueSet = LHSTrue.unionWith(RHSRes.TrueSet);
+        RHSRes.FalseSet = LHSFalse.intersect(RHSRes.FalseSet);
+      }
+      return RHSRes;
+    }
+    return {};
+  }
+
+  if (const auto *COP = dyn_cast<ConditionalOperator>(Cond)) {
+    bool TCond, FCond;
+    if (getStaticBooleanValue(COP->getTrueExpr(), TCond) &&
+        getStaticBooleanValue(COP->getFalseExpr(), FCond)) {
+      if (TCond && !FCond)
+        return evaluateTrylockRangeCond(COP->getCond(), C);
+      if (!TCond && FCond) {
+        auto Res = evaluateTrylockRangeCond(COP->getCond(), C);
+        if (Res.Call)
+          std::swap(Res.TrueSet, Res.FalseSet);
+        return Res;
+      }
+    }
+    return {};
+  }
+
+  return {};
+}
+
+void ThreadSafetyAnalyzer::applyRangeTrylockEdge(FactSet &Result,
+                                                 const CFGBlock *PredBlock,
+                                                 const CFGBlock *CurrBlock) {
+  const Stmt *Term = PredBlock->getTerminatorStmt();
+  if (!Term || isa<IndirectGotoStmt>(Term))
     return;
+
+  if (const auto *COp = dyn_cast<ConditionalOperator>(Term))
+    if (!COp->getType()->isVoidType())
+      return;
+  if (const auto *BCO = dyn_cast<BinaryConditionalOperator>(Term))
+    if (!BCO->getType()->isVoidType())
+      return;
+
+  const LocalVarContext &LVarCtx =
+      BlockInfo[PredBlock->getBlockID()].ExitContext;
+  const CallExpr *CallExp = nullptr;
+  const NamedDecl *Callee = nullptr;
+  IntRangeSet EdgeSet;
+
+  if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
+    CallExp = unwrapTrylockValueExpr(SS->getCond(), LVarCtx);
+    if (!CallExp)
+      return;
+    Callee = getRangeTrylockCallee(CallExp);
+    if (!Callee)
+      return;
+    IntDomain Dom = IntDomain::forType(CallExp->getType(), *ASTCtx);
+    const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
+    if (!Table.Valid)
+      return;
+    const auto *TargetCS = dyn_cast_if_present<CaseStmt>(CurrBlock->getLabel());
+    if (auto It = Table.CaseSets.find(TargetCS); It != Table.CaseSets.end()) {
+      EdgeSet = It->second;
+    } else {
+      if (!isa_and_nonnull<DefaultStmt>(CurrBlock->getLabel()) &&
+          SS->isAllEnumCasesCovered())
+        return;
+      EdgeSet = Table.DefaultSet;
+    }
+  } else {
+    const Stmt *Cond = PredBlock->getTerminatorCondition();
+    if (!Cond)
+      return;
+    auto CondRes = evaluateTrylockRangeCond(Cond, LVarCtx);
+    if (!CondRes.Call)
+      return;
+    CallExp = CondRes.Call;
+    Callee = CondRes.Callee;
+    int BranchIdx = 0;
+    for (auto SI = PredBlock->succ_begin(), SE = PredBlock->succ_end();
+         SI != SE && BranchIdx < 2; ++SI, ++BranchIdx) {
+      if (*SI == CurrBlock) {
+        EdgeSet = EdgeSet.unionWith(BranchIdx == 0 ? CondRes.TrueSet
+                                                   : CondRes.FalseSet);
+      }
+    }
+  }
+
+  if (EdgeSet.empty())
+    return;
+
+  std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
+  if (Handler.issueBetaWarnings()) {
+    SxBuilder.setLookupLocalVarExpr(
+        [this, Ctx = LVarCtx](const NamedDecl *D) mutable -> const Expr * {
+          return LocalVarMap.lookupExpr(D, Ctx);
+        });
+    Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
+  }
 
   CapExprSet ExclusiveLocksToAdd;
   CapExprSet SharedLocksToAdd;
+  for (const auto *Attr :
+       Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
+    if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue())
+      continue;
+    auto First = Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+    auto Last = Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+    if (!First || !Last)
+      continue;
+    if (EdgeSet.subsetOf(*First, *Last)) {
+      getMutexIDs(Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd,
+                  Attr, CallExp, Callee);
+    }
+  }
 
-  // If the condition is a call to a Trylock function, then grab the attributes
-  for (const auto *Attr : FunDecl->specific_attrs<TryAcquireCapabilityAttr>())
-    getMutexIDs(Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd, Attr,
-                Exp, FunDecl, PredBlock, CurrBlock, Attr->getSuccessValue(),
-                Negate);
+  auto AddTrylockFact = [&](const CapabilityExpr &Cap, LockKind LK,
+                            SourceLocation Loc) {
+    const FactEntry *Existing = Result.findLock(FactMan, Cap);
+    if (Existing && Existing->loc() == Loc && !Existing->asserted()) {
+      // The fact comes from the same trylock call, e.g. because a join kept
+      // the shared fact of a call that acquires the capability exclusively
+      // for other return values. Refine the lock kind instead of reporting a
+      // double acquisition.
+      if (Existing->kind() != LK)
+        Result.replaceLock(FactMan, Cap,
+                           FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
+      return;
+    }
+    addLock(Result, FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
+  };
 
-  // Add and remove locks.
-  SourceLocation Loc = Exp->getExprLoc();
+  SourceLocation Loc = CallExp->getExprLoc();
   for (const auto &ExclusiveLockToAdd : ExclusiveLocksToAdd)
-    addLock(Result, FactMan.createFact<LockableFactEntry>(ExclusiveLockToAdd,
-                                                          LK_Exclusive, Loc));
+    AddTrylockFact(ExclusiveLockToAdd, LK_Exclusive, Loc);
   for (const auto &SharedLockToAdd : SharedLocksToAdd)
-    addLock(Result, FactMan.createFact<LockableFactEntry>(SharedLockToAdd,
-                                                          LK_Shared, Loc));
+    AddTrylockFact(SharedLockToAdd, LK_Shared, Loc);
+}
+
+void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
+                                                         CapExprSet &Caps) {
+  const Stmt *Term = Block->getTerminatorStmt();
+  if (!Term || isa<IndirectGotoStmt>(Term))
+    return;
+  if (const auto *COp = dyn_cast<ConditionalOperator>(Term))
+    if (!COp->getType()->isVoidType())
+      return;
+  if (const auto *BCO = dyn_cast<BinaryConditionalOperator>(Term))
+    if (!BCO->getType()->isVoidType())
+      return;
+
+  const LocalVarContext &LVarCtx = BlockInfo[Block->getBlockID()].ExitContext;
+  const CallExpr *CallExp = nullptr;
+  const NamedDecl *Callee = nullptr;
+  SmallVector<IntRangeSet, 4> BranchSets;
+
+  if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
+    CallExp = unwrapTrylockValueExpr(SS->getCond(), LVarCtx);
+    if (!CallExp)
+      return;
+    Callee = getRangeTrylockCallee(CallExp);
+    if (!Callee)
+      return;
+    IntDomain Dom = IntDomain::forType(CallExp->getType(), *ASTCtx);
+    const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
+    if (!Table.Valid)
+      return;
+    for (const auto &[CS, CaseSet] : Table.CaseSets)
+      BranchSets.push_back(CaseSet);
+    BranchSets.push_back(Table.DefaultSet);
+  } else {
+    const Stmt *Cond = Block->getTerminatorCondition();
+    if (!Cond)
+      return;
+    auto CondRes = evaluateTrylockRangeCond(Cond, LVarCtx);
+    if (!CondRes.Call)
+      return;
+    CallExp = CondRes.Call;
+    Callee = CondRes.Callee;
+    BranchSets.push_back(std::move(CondRes.TrueSet));
+    BranchSets.push_back(std::move(CondRes.FalseSet));
+  }
+
+  std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
+  if (Handler.issueBetaWarnings()) {
+    SxBuilder.setLookupLocalVarExpr(
+        [this, Ctx = LVarCtx](const NamedDecl *D) mutable -> const Expr * {
+          return LocalVarMap.lookupExpr(D, Ctx);
+        });
+    Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
+  }
+
+  for (const auto *Attr :
+       Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
+    if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue())
+      continue;
+    auto First = Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+    auto Last = Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+    if (!First || !Last)
+      continue;
+    bool CleanPartition = llvm::all_of(BranchSets, [&](const IntRangeSet &S) {
+      return S.empty() || S.subsetOf(*First, *Last) ||
+             !S.intersects(*First, *Last);
+    });
+    if (CleanPartition)
+      getMutexIDs(Caps, Attr, CallExp, Callee);
+  }
 }
 
 /// If the terminator of \p Block branches on the result of a try-lock call
@@ -1793,13 +2660,16 @@ void ThreadSafetyAnalyzer::getEdgeLockset(FactSet &Result,
 /// that call to \p Caps.
 void ThreadSafetyAnalyzer::getTerminatorTrylockCaps(const CFGBlock *Block,
                                                     CapExprSet &Caps) {
-  bool Negate = false;
-  auto [Exp, FunDecl, Cleanup] = getTerminatorTrylockCall(Block, Negate);
-  if (!Exp)
-    return;
-
-  for (const auto *Attr : FunDecl->specific_attrs<TryAcquireCapabilityAttr>())
-    getMutexIDs(Caps, Attr, Exp, FunDecl);
+  {
+    bool Negate = false;
+    auto [Exp, FunDecl, Cleanup] = getTerminatorTrylockCall(Block, Negate);
+    if (Exp) {
+      for (const auto *Attr :
+           FunDecl->specific_attrs<TryAcquireCapabilityAttr>())
+        getMutexIDs(Caps, Attr, Exp, FunDecl);
+    }
+  }
+  getRangeTerminatorTrylockCaps(Block, Caps);
 }
 
 namespace {
@@ -2501,6 +3371,7 @@ void BuildLockset::VisitUnaryOperator(const UnaryOperator *UO) {
     case UO_PreDec:
     case UO_PreInc:
       checkAccess(UO->getSubExpr(), AK_Written);
+      updateLocalVarMapCtx(UO);
       break;
     default:
       break;
@@ -2783,6 +3654,12 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
     const CapExprSet *TrylockRebranchCaps) {
   FactSet EntrySetOrig = EntrySet;
 
+  auto GetFactReentrancyDepth = [](const FactEntry &FE) -> unsigned {
+    if (const auto *LFE = dyn_cast<LockableFactEntry>(&FE))
+      return LFE->getReentrancyDepth();
+    return 0;
+  };
+
   auto IsTrylockRebranched = [TrylockRebranchCaps](const FactEntry &FE) {
     return TrylockRebranchCaps &&
            llvm::any_of(*TrylockRebranchCaps, [&FE](const CapabilityExpr &CE) {
@@ -2796,8 +3673,27 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
 
     FactSet::iterator EntryIt = EntrySet.findLockIter(FactMan, ExitFact);
     if (EntryIt != EntrySet.end()) {
-      if (join(FactMan[*EntryIt], ExitFact, JoinLoc, EntryLEK))
+      const FactEntry &EntryFact = FactMan[*EntryIt];
+      if (IsTrylockRebranched(ExitFact) &&
+          EntryLEK == LEK_LockedSomePredecessors &&
+          EntryFact.loc() == ExitFact.loc() && !EntryFact.managed() &&
+          !ExitFact.managed() &&
+          GetFactReentrancyDepth(EntryFact) ==
+              GetFactReentrancyDepth(ExitFact)) {
+        // Both facts have been created by the same trylock call, whose result
+        // is checked again by the terminator of this block. The lock kind may
+        // differ if the trylock function has range attributes for different
+        // lock kinds. Keep the shared fact; the edges out of this block
+        // refine the lock kind.
+        if (EntryFact.kind() != ExitFact.kind()) {
+          if (ExitFact.kind() == LK_Shared)
+            *EntryIt = Fact;
+        } else if (EntryFact.asserted() && !ExitFact.asserted()) {
+          *EntryIt = Fact;
+        }
+      } else if (join(EntryFact, ExitFact, JoinLoc, EntryLEK)) {
         *EntryIt = Fact;
+      }
     } else if ((!ExitFact.managed() || EntryLEK == LEK_LockedAtEndOfFunction) &&
                !IsTrylockRebranched(ExitFact)) {
       ExitFact.handleRemovalFromIntersection(ExitSet, FactMan, JoinLoc,
@@ -2879,6 +3775,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   CFG *CFGraph = walker.getGraph();
   const NamedDecl *D = walker.getDecl();
   ASTCtx = &AC.getASTContext();
+  RangeCondCache.clear();
+  SwitchTables.clear();
   CurrentFunction = dyn_cast<FunctionDecl>(D);
 
   if (D->hasAttr<NoThreadSafetyAnalysisAttr>())
@@ -2919,9 +3817,9 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   CapExprSet ExclusiveLocksAcquired;
   CapExprSet SharedLocksAcquired;
   CapExprSet LocksReleased;
-
   // Add locks from exclusive_locks_required and shared_locks_required
-  // to initial lockset. Also turn off checking for lock and unlock functions.
+  // to initial lockset. Also turn off checking for underlying lock and unlock
+  // primitives that take zero capability arguments.
   // FIXME: is there a more intelligent way to check lock/unlock functions?
   if (!SortedGraph->empty()) {
     assert(*SortedGraph->begin() == &CFGraph->getEntry());
@@ -2956,6 +3854,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         return;
       }
     }
+
     ArrayRef<ParmVarDecl *> Params;
     if (CurrentFunction)
       Params = CurrentFunction->getCanonicalDecl()->parameters();
@@ -3059,8 +3958,10 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     bool TerminatorTrylockCapsComputed = false;
     for (CFGBlock::const_pred_iterator PI = CurrBlock->pred_begin(),
          PE  = CurrBlock->pred_end(); PI != PE; ++PI) {
+      if (*PI == nullptr)
+        continue;
       // if *PI -> CurrBlock is a back edge
-      if (*PI == nullptr || !VisitedBlocks.alreadySet(*PI))
+      if (!VisitedBlocks.alreadySet(*PI))
         continue;
 
       unsigned PrevBlockID = (*PI)->getBlockID();

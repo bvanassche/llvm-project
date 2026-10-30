@@ -31,6 +31,8 @@
 // Capabilities only
 #define EXCLUSIVE_UNLOCK_FUNCTION(...)  __attribute__((release_capability(__VA_ARGS__)))
 #define SHARED_UNLOCK_FUNCTION(...)     __attribute__((release_shared_capability(__VA_ARGS__)))
+#define TRY_ACQUIRE_RANGE(...)          __attribute__((try_acquire_capability_range(__VA_ARGS__)))
+#define TRY_ACQUIRE_SHARED_RANGE(...)   __attribute__((try_acquire_shared_capability_range(__VA_ARGS__)))
 #define GUARDED_BY(...)                 __attribute__((guarded_by(__VA_ARGS__)))
 #define PT_GUARDED_BY(...)              __attribute__((pt_guarded_by(__VA_ARGS__)))
 

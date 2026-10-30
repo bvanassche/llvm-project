@@ -8797,3 +8797,335 @@ void testNamespaceUnion() {
 }
 
 } // namespace AnonymousMembers
+
+namespace TryAcquireRangeTest {
+
+class LOCKABLE RangeMutex {
+public:
+  void Lock() EXCLUSIVE_LOCK_FUNCTION();
+  void Unlock() UNLOCK_FUNCTION();
+  int TryLockNonNeg() TRY_ACQUIRE_RANGE(0, __INT_MAX__);
+  int ReaderTryLockNonNeg() TRY_ACQUIRE_SHARED_RANGE(0, __INT_MAX__);
+};
+
+class LOCKABLE REENTRANT_CAPABILITY ReentrantRangeMutex {
+public:
+  void Lock() EXCLUSIVE_LOCK_FUNCTION();
+  void Unlock() UNLOCK_FUNCTION();
+  int TryLockNonNeg() TRY_ACQUIRE_RANGE(0, __INT_MAX__);
+};
+
+enum RangeLockResult { RANGE_LOCK_OK, RANGE_LOCK_BUSY };
+
+struct TestRange {
+  RangeMutex mu;
+  RangeMutex mu2;
+  int a GUARDED_BY(mu);
+  bool cond;
+
+  int trylockZero() TRY_ACQUIRE_RANGE(0, 0, mu);
+  int trylockPosSigned() TRY_ACQUIRE_RANGE(1, __INT_MAX__, mu);
+  unsigned trylockPosUnsigned() TRY_ACQUIRE_RANGE(1, ~0U, mu);
+  int trylockNeg() TRY_ACQUIRE_RANGE(-10, -1, mu);
+  int trylockBounded() TRY_ACQUIRE_RANGE(1, 10, mu);
+  int trylockSharedBounded() TRY_ACQUIRE_SHARED_RANGE(1, 10, mu);
+  int trylockMode() TRY_ACQUIRE_RANGE(1, 1, mu) TRY_ACQUIRE_SHARED_RANGE(2, 2, mu);
+
+  static void fail() __attribute__((noreturn));
+
+  // Verify that trylock function implementations comply with the annotation.
+  int implTryLock(bool ok) TRY_ACQUIRE_RANGE(0, 0, mu) {
+    if (ok) {
+      mu.Lock();
+      return 0;
+    }
+    return -1;
+  }
+
+  void testImplicitThisAndShared() {
+    if (mu.TryLockNonNeg() >= 0) {
+      a = 1;
+      mu.Unlock();
+    } else {
+      a = 2; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+    }
+
+    if (0 <= mu.ReaderTryLockNonNeg()) {
+      int v = a;
+      (void)v;
+      a = 3; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+      mu.Unlock();
+    }
+  }
+
+  // Bounds may call constexpr member functions that are defined after the
+  // attribute has been parsed.
+  static constexpr int okValue() { return 0; }
+  int trylockMemberBound() TRY_ACQUIRE_RANGE(okValue(), okValue(), mu);
+
+  void testMemberBound() {
+    if (trylockMemberBound() == 0) {
+      a = 1;
+      mu.Unlock();
+    }
+    if (trylockMemberBound() == 1)
+      a = 2; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+  }
+
+  void testZeroSuccess() {
+    if (trylockZero() == 0) {
+      a = 1;
+      mu.Unlock();
+    }
+    if (!trylockZero()) {
+      a = 2;
+      mu.Unlock();
+    }
+    if (trylockZero())
+      return;
+    a = 3;
+    mu.Unlock();
+  }
+
+  void testModifiedResult() {
+    int r = trylockZero();
+    ++r;
+    if (r == 0) {
+      a = 1; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+      mu.Unlock(); // expected-warning {{releasing mutex 'mu' that was not held}}
+    }
+  }
+
+  RangeLockResult trylockEnum() TRY_ACQUIRE_RANGE(RANGE_LOCK_OK, RANGE_LOCK_OK, mu);
+
+  void testUnscopedEnumResult() {
+    if (trylockEnum() == RANGE_LOCK_OK) {
+      a = 1;
+      mu.Unlock();
+    }
+    switch (trylockEnum()) {
+    case RANGE_LOCK_OK:
+      a = 2;
+      mu.Unlock();
+      break;
+    case RANGE_LOCK_BUSY:
+      break;
+    }
+  }
+
+  ReentrantRangeMutex rmu;
+  int b GUARDED_BY(rmu);
+
+  // Re-branching on a trylock result must not hide a reentrancy mismatch.
+  void testReentrantRebranch(bool c) {
+    int r = rmu.TryLockNonNeg(); // expected-note 2{{mutex acquired here}}
+    if (r < 0)
+      return;
+    if (c)
+      rmu.Lock();
+    if (r >= 0) // expected-warning {{mutex 'rmu' is not held on every path through here with equal reentrancy depth}}
+      b = 1;
+    rmu.Unlock();
+  } // expected-warning {{mutex 'rmu' is not held on every path through here}}
+
+  void testSignedVsUnsignedTruthiness() {
+    // Unsigned > 0 matches truthiness because 0 is the only non-success value.
+    if (trylockPosUnsigned()) {
+      a = 1;
+      mu.Unlock();
+    }
+    // Signed [1, INT_MAX] does NOT match truthiness because negative values are
+    // also truthy.
+    if (trylockPosSigned()) {
+      a = 2; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+    }
+    if (trylockPosSigned() > 0) {
+      a = 3;
+      mu.Unlock();
+    }
+  }
+
+  void testBoundedAndNegativeRanges() {
+    int r = trylockBounded();
+    if (r >= 1 && r <= 10) {
+      a = 1;
+      mu.Unlock();
+    }
+
+    int r2 = trylockBounded();
+    if (r2 >= 1) {
+      a = 2; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+    }
+    if (r2 <= 10) {
+      a = 3; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+    }
+
+    int r3 = trylockBounded();
+    if (r3 < 1 || r3 > 10)
+      return;
+    a = 4;
+    mu.Unlock();
+
+    int rn = trylockNeg();
+    if (!(rn >= -10 && rn <= -1))
+      return;
+    a = 5;
+    mu.Unlock();
+  }
+
+  void testSharedBounded() {
+    int r = trylockSharedBounded();
+    bool ok = (1 <= r && 10 >= r);
+    if (ok) {
+      int v = a;
+      (void)v;
+      a = 1; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+      mu.Unlock();
+    }
+  }
+
+  void testLogicalWithExternalCond() {
+    if (cond && mu.TryLockNonNeg() >= 0) {
+      a = 1;
+      mu.Unlock();
+    }
+    if (cond || mu.TryLockNonNeg() < 0)
+      return;
+    a = 2;
+    mu.Unlock();
+  }
+
+  void testLogicalFalseNegationTrap() {
+    int r = mu.TryLockNonNeg();
+    bool failed = (cond && r < 0);
+    if (failed)
+      return;
+    // When !cond and r < 0, failed is false even though trylock failed.
+    a = 1; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+  }
+
+  void testConditionalAndStmtExpr() {
+    if ((mu.TryLockNonNeg() >= 0) ? 1 : 0) {
+      a = 1;
+      mu.Unlock();
+    }
+    if (({ int r = mu.TryLockNonNeg(); __builtin_expect(r < 0, 0); }))
+      return;
+    a = 2;
+    mu.Unlock();
+
+    (mu.TryLockNonNeg() >= 0) ? static_cast<void>(0) : fail();
+    a = 3;
+    mu.Unlock();
+  }
+
+  void testRefinementWithoutFalseDoubleLock() {
+    int r = mu.TryLockNonNeg();
+    if (r < 0)
+      return;
+    if (r == 0) {
+      a = 1;
+    } else if (r > 0) {
+      a = 2;
+    }
+    a = 3;
+    mu.Unlock();
+  }
+
+  void testGenuineDoubleLockWarns() {
+    if (mu.TryLockNonNeg() >= 0) { // expected-note {{mutex acquired here}}
+      if (mu.TryLockNonNeg() >= 0) { // expected-warning {{acquiring mutex 'mu' that is already held}}
+      }
+      mu.Unlock();
+    }
+  }
+
+  void testRebranchAtJoin() {
+    int r = mu.TryLockNonNeg();
+    if (r < 0)
+      cond = true;
+    if (r < 0)
+      return;
+    a = 1;
+    mu.Unlock();
+  }
+
+  void testIncompleteRebranchStillWarns() {
+    int r = mu.TryLockNonNeg(); // expected-note {{mutex acquired here}}
+    if (r < 0)
+      cond = true;
+    // r == 0 does not separate r >= 1 (held) from r < 0 (not held)!
+    if (r == 0) { // expected-warning {{mutex 'mu' is not held on every path through here}}
+      mu.Unlock();
+      return;
+    }
+    a = 1; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+  }
+
+  void testModeRefinementAfterJoin() {
+    int r = trylockMode();
+    if (r == 1)
+      cond = true;
+    else if (r == 2)
+      cond = false;
+    else
+      return;
+    // The join keeps the shared fact. Refining it to exclusive on the r == 1
+    // edge must not be reported as a double acquisition.
+    if (r == 1) {
+      a = 1;
+      mu.Unlock();
+    } else {
+      mu.Unlock();
+    }
+  }
+
+  // Evaluating a long chain of logical operators on local variables must
+  // take linear instead of exponential time.
+  void testLongLogicalChain() {
+    int r = mu.TryLockNonNeg();
+    bool b0 = r >= 0;
+    bool b1 = b0 && b0, b2 = b1 && b1, b3 = b2 && b2, b4 = b3 && b3;
+    bool b5 = b4 && b4, b6 = b5 && b5, b7 = b6 && b6, b8 = b7 && b7;
+    bool b9 = b8 && b8, b10 = b9 && b9, b11 = b10 && b10, b12 = b11 && b11;
+    bool b13 = b12 && b12, b14 = b13 && b13, b15 = b14 && b14;
+    bool b16 = b15 && b15, b17 = b16 && b16, b18 = b17 && b17;
+    bool b19 = b18 && b18, b20 = b19 && b19, b21 = b20 && b20;
+    bool b22 = b21 && b21, b23 = b22 && b22, b24 = b23 && b23;
+    bool b25 = b24 && b24, b26 = b25 && b25, b27 = b26 && b26;
+    bool b28 = b27 && b27, b29 = b28 && b28, b30 = b29 && b29;
+    if (b30) {
+      a = 1;
+      mu.Unlock();
+    }
+  }
+
+  void testMultiAttrExclusiveVsShared() {
+    int r = trylockMode();
+    if (r == 1) {
+      a = 1;
+      mu.Unlock();
+    } else if (r == 2) {
+      int v = a;
+      (void)v;
+      a = 2; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+      mu.Unlock();
+    }
+  }
+};
+
+template <typename... Mus>
+int trylockVariadicRange(Mus &...mus) TRY_ACQUIRE_RANGE(0, 1, mus...);
+
+void testVariadicAndFuncPtr(RangeMutex &m1, RangeMutex &m2,
+                            int (*fp)() TRY_ACQUIRE_RANGE(0, 0, m1)) {
+  if (trylockVariadicRange(m1, m2) == 1) {
+    m1.Unlock();
+    m2.Unlock();
+  }
+  if (fp() == 0) {
+    m1.Unlock();
+  }
+}
+
+} // namespace TryAcquireRangeTest

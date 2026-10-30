@@ -736,6 +736,96 @@ void test_trylock_void_conditional_via_var(void) {
   mutex_unlock(&mu1);
 }
 
+int mutex_trylock_errno(struct Mutex *mu)
+    __attribute__((try_acquire_capability_range(0, __INT_MAX__, mu)));
+int mutex_shared_trylock_errno(struct Mutex *mu)
+    __attribute__((try_acquire_shared_capability_range(0, __INT_MAX__, mu)));
+int mutex_trylock_zero(struct Mutex *mu)
+    __attribute__((try_acquire_capability_range(0, 0, mu)));
+int mutex_trylock_1_to_10(struct Mutex *mu)
+    __attribute__((try_acquire_capability_range(1, 10, mu)));
+
+struct Task *next_task(void);
+
+// Incrementing or decrementing a local variable must keep BuildLockset's
+// LocalVariableMap context synchronized for subsequent local aliases.
+void test_incdec_preserves_local_var_ctx(int count) {
+  int local = count;
+  local--;
+  --local;
+  ++local;
+  {
+    mutex_exclusive_lock(&mu1);
+    struct Mutex *guard __attribute__((cleanup(unlock_scope))) = &mu1;
+    (void)guard;
+    work_data = 1;
+  }
+
+  int n = 0;
+  struct Task *t;
+  while (n < count) {
+    n++;
+    t = next_task();
+    mutex_exclusive_lock(&t->mu);
+    if (n == 1)
+      do_some_work();
+    mutex_unlock(&t->mu);
+  }
+}
+
+void test_trylock_range_c(void) {
+  int err;
+  if ((err = mutex_trylock_errno(&mu1)) < 0)
+    return;
+  work_data = 1;
+  mutex_unlock(&mu1);
+
+  if (__builtin_expect(mutex_trylock_zero(&mu1) != 0, 0))
+    return;
+  work_data = 2;
+  mutex_unlock(&mu1);
+
+  if (!mutex_trylock_zero(&mu1)) {
+    work_data = 3;
+    mutex_unlock(&mu1);
+  }
+
+  if (mutex_shared_trylock_errno(&mu1) >= 0) {
+    int v = work_data;
+    (void)v;
+    work_data = 4; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1);
+  }
+
+  switch (mutex_trylock_1_to_10(&mu1)) {
+  case 1 ... 10:
+    work_data = 5;
+    mutex_unlock(&mu1);
+    break;
+  default:
+    work_data = 6; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    break;
+  }
+
+  // Signed-to-unsigned conversion wraps negative values to positive, so >= 0U
+  // is tautologically true and must not acquire the capability.
+  if (mutex_trylock_errno(&mu1) >= 0U) {
+    work_data = 7; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+
+  // Narrowing conversion may truncate non-zero failure codes to 0.
+  signed char narrow = mutex_trylock_zero(&mu1);
+  if (narrow == 0) {
+    work_data = 8; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+
+  // Bit-field assignments truncate the stored value.
+  struct { int bf : 2; } s;
+  if ((s.bf = mutex_trylock_zero(&mu1)) == 0) {
+    work_data = 9; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

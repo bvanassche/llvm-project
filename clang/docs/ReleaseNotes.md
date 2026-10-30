@@ -480,6 +480,11 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   `s->dst.len`, and is reported as `dst->Scratch::lock` when no enclosing
   object is reachable.
 
+- Added the `try_acquire_capability_range` and
+  `try_acquire_shared_capability_range` thread safety attributes, whose first
+  two arguments specify the inclusive integer range `[low, high]` of return
+  values indicating that the capability was successfully acquired.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed missing `-Wuninitialized-explicit-init` warnings for C file-scope

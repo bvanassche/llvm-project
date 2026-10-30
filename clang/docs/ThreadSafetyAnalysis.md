@@ -498,6 +498,30 @@ void foo() {
 }
 ```
 
+### TRY_ACQUIRE_RANGE(\<low>, \<high>, ...), TRY_ACQUIRE_SHARED_RANGE(\<low>, \<high>, ...)
+
+These are attributes on a function or method that tries to acquire the given
+capability and returns an integer indicating success or failure. The first two
+arguments must be integer constant expressions specifying the inclusive range
+`[low, high]` (with `low <= high`) of return values that indicate success, and
+the remaining arguments are interpreted in the same way as `ACQUIRE`.
+
+```c++
+Mutex mu;
+int a GUARDED_BY(mu);
+
+int try_lock_or_errno() __attribute__((try_acquire_capability_range(0, __INT_MAX__, mu)));
+
+int foo() {
+  int ret = try_lock_or_errno();
+  if (ret < 0)
+    return ret;
+  a = 0;         // Ok, ret is in [0, __INT_MAX__].
+  mu.Unlock();
+  return 0;
+}
+```
+
 ### ASSERT_CAPABILITY(...) and ASSERT_SHARED_CAPABILITY(...)
 
 *Previously:* `ASSERT_EXCLUSIVE_LOCK`, `ASSERT_SHARED_LOCK`
@@ -906,6 +930,12 @@ implementation.
 
 #define TRY_ACQUIRE_SHARED(...) \
   THREAD_ANNOTATION_ATTRIBUTE__(try_acquire_shared_capability(__VA_ARGS__))
+
+#define TRY_ACQUIRE_RANGE(...) \
+  THREAD_ANNOTATION_ATTRIBUTE__(try_acquire_capability_range(__VA_ARGS__))
+
+#define TRY_ACQUIRE_SHARED_RANGE(...) \
+  THREAD_ANNOTATION_ATTRIBUTE__(try_acquire_shared_capability_range(__VA_ARGS__))
 
 #define EXCLUDES(...) \
   THREAD_ANNOTATION_ATTRIBUTE__(locks_excluded(__VA_ARGS__))
