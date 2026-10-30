@@ -9764,6 +9764,18 @@ struct LoopExitAndDerefTryAcquireHolder {
     waitStep();
     return ret;
   }
+
+  int *validUnlockUnrelatedAtExit(bool cond, int *slot)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *res = nullptr;
+    outer_mu.Lock();
+    if (cond && slot) {
+      mu.Lock();
+      res = slot;
+    }
+    outer_mu.Unlock();
+    return res;
+  }
 };
 
 } // namespace TryAcquireBodyVerificationTest

@@ -1491,6 +1491,7 @@ public:
   void updateValueStateForStmt(
       TrylockValueState &State, const Stmt *S, LocalVarContext StmtCtx,
       const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars);
+  bool isPureExitBlock(const CFGBlock *B, const CapExprSet &TargetCaps);
   bool exprHasUnmaterializedTrylock(const Expr *E, LocalVarContext Ctx,
                                     const TrylockValueState &State,
                                     bool UseStateDefs, unsigned Depth = 0);
@@ -3414,40 +3415,130 @@ static bool isStraightLineStmtExprSubStmt(const Stmt *S, bool IsRoot = false) {
   return true;
 }
 
-static bool isPureExitBlockElement(const CFGElement &BI) {
-  switch (BI.getKind()) {
-  case CFGElement::Statement: {
-    const Stmt *S = BI.castAs<CFGStmt>().getStmt();
-    if (const auto *CE = dyn_cast<CallExpr>(S)) {
+bool ThreadSafetyAnalyzer::isPureExitBlock(const CFGBlock *B,
+                                           const CapExprSet &TargetCaps) {
+  unsigned CtxIdx = BlockInfo[B->getBlockID()].EntryIndex;
+  LocalVarContext StmtCtx = BlockInfo[B->getBlockID()].EntryContext;
+
+  for (const CFGElement &BI : *B) {
+    switch (BI.getKind()) {
+    case CFGElement::Statement: {
+      const Stmt *S = BI.castAs<CFGStmt>().getStmt();
+      llvm::scope_exit AdvanceCtx(
+          [&] { StmtCtx = LocalVarMap.getNextContext(CtxIdx, S, StmtCtx); });
+
+      if (const auto *CCE = dyn_cast<CXXConstructExpr>(S)) {
+        if (hasThreadSafetyCallEffects(CCE->getConstructor(), CCE))
+          return false;
+        break;
+      }
+
+      const auto *CE = dyn_cast<CallExpr>(S);
+      if (!CE)
+        break;
+
       unsigned BuiltinID = CE->getBuiltinCallee();
       if (BuiltinID == Builtin::BI__builtin_expect ||
           BuiltinID == Builtin::BI__builtin_expect_with_probability)
-        return true;
+        break;
+
       const auto *Callee = dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl());
-      if (hasThreadSafetyCallEffects(Callee, CE))
+      if (!hasThreadSafetyCallEffects(Callee, CE))
+        break;
+
+      if (!Callee)
         return false;
-    } else if (const auto *CCE = dyn_cast<CXXConstructExpr>(S)) {
-      if (hasThreadSafetyCallEffects(CCE->getConstructor(), CCE))
-        return false;
+      if (const auto *TagT = CE->getType()->getAs<TagType>())
+        if (TagT->getDecl()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>())
+          return false;
+      if (const auto *MD = dyn_cast<CXXMethodDecl>(Callee))
+        if (MD->getParent()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>())
+          return false;
+      if (const auto *FD = dyn_cast<FunctionDecl>(Callee))
+        for (const ParmVarDecl *P : FD->parameters())
+          if (P->hasAttrs())
+            return false;
+
+      std::optional<llvm::scope_exit<std::function<void()>>> LookupCleanup;
+      if (Handler.issueBetaWarnings()) {
+        LocalVarContext LookupCtx = StmtCtx;
+        SxBuilder.setLookupLocalVarExpr(
+            [this, LookupCtx](const NamedDecl *D) mutable -> const Expr * {
+              return LocalVarMap.lookupExpr(D, LookupCtx);
+            });
+        LookupCleanup.emplace(
+            [this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
+      }
+
+      auto CheckCapDisjoint = [&](Expr *Arg) -> bool {
+        CapabilityExpr Cp =
+            SxBuilder.translateAttrExpr(Arg, Callee, CE, /*Self=*/nullptr);
+        if (Cp.isInvalid())
+          return false;
+        if (Cp.shouldIgnore())
+          return true;
+        return llvm::none_of(TargetCaps, [&](const CapabilityExpr &TC) {
+          return TC.equals(Cp);
+        });
+      };
+
+      for (const Attr *At : Callee->attrs()) {
+        switch (At->getKind()) {
+        case attr::AcquireCapability:
+        case attr::TryAcquireCapability:
+        case attr::TryAcquireCapabilityRange:
+        case attr::AssertCapability:
+        case attr::LocksExcluded:
+          return false;
+        case attr::ReleaseCapability: {
+          const auto *A = cast<ReleaseCapabilityAttr>(At);
+          if (A->args_size() == 0) {
+            if (!isa<CXXMethodDecl>(Callee) || !CheckCapDisjoint(nullptr))
+              return false;
+          } else {
+            for (Expr *Arg : A->args())
+              if (!CheckCapDisjoint(Arg))
+                return false;
+          }
+          break;
+        }
+        case attr::RequiresCapability: {
+          const auto *A = cast<RequiresCapabilityAttr>(At);
+          if (A->args_size() == 0) {
+            if (!isa<CXXMethodDecl>(Callee) || !CheckCapDisjoint(nullptr))
+              return false;
+          } else {
+            for (Expr *Arg : A->args())
+              if (!CheckCapDisjoint(Arg))
+                return false;
+          }
+          break;
+        }
+        default:
+          break;
+        }
+      }
+      break;
     }
-    return true;
+    case CFGElement::AutomaticObjectDtor:
+    case CFGElement::CleanupFunction:
+      break;
+    case CFGElement::TemporaryDtor: {
+      // Destroying a temporary does not affect the lockset unless its
+      // destructor has thread safety attributes.
+      const CXXDestructorDecl *DD =
+          BI.castAs<CFGTemporaryDtor>().getDestructorDecl(*ASTCtx);
+      if (!DD ||
+          DD->getParent()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>() ||
+          hasThreadSafetyCallEffects(DD, /*CallOrCtor=*/nullptr))
+        return false;
+      break;
+    }
+    default:
+      return false;
+    }
   }
-  case CFGElement::AutomaticObjectDtor:
-  case CFGElement::CleanupFunction:
-    return true;
-  case CFGElement::TemporaryDtor: {
-    // Destroying a temporary does not affect the lockset unless its
-    // destructor has thread safety attributes.
-    const CXXBindTemporaryExpr *BTE =
-        BI.castAs<CFGTemporaryDtor>().getBindTemporaryExpr();
-    const CXXDestructorDecl *DD = BTE->getTemporary()->getDestructor();
-    return DD &&
-           !DD->getParent()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>() &&
-           !hasThreadSafetyCallEffects(DD, /*CallOrCtor=*/nullptr);
-  }
-  default:
-    return false;
-  }
+  return true;
 }
 
 static std::optional<ThreadSafetyAnalyzer::IntDomain>
@@ -6211,8 +6302,18 @@ void ThreadSafetyAnalyzer::applyScopeExitCleanups(FactSet &StateSet,
       const Stmt *S = CS->getStmt();
       llvm::scope_exit AdvanceCtx(
           [&] { StmtCtx = LocalVarMap.getNextContext(CtxIdx, S, StmtCtx); });
-      if (isa<ReturnStmt>(S))
+      if (isa<ReturnStmt>(S)) {
         SeenReturn = true;
+        continue;
+      }
+      if (!OnlyAfterReturn && !SeenReturn) {
+        if (const auto *CE = dyn_cast<CallExpr>(S)) {
+          const auto *Callee = dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl());
+          if (Callee && Callee->hasAttrs())
+            ApplyCallee(Callee, CE, /*Self=*/nullptr, CE->getExprLoc(),
+                        /*FullyRemove=*/false);
+        }
+      }
       continue;
     }
     if (OnlyAfterReturn && !SeenReturn)
@@ -7843,7 +7944,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       if (!TCaps.empty())
         continue;
 
-      if (!llvm::all_of(*B, isPureExitBlockElement))
+      if (!isPureExitBlock(B, CurrentTrylockExitCaps))
         continue;
 
       PureExitPathBlocks[B->getBlockID()] = true;

@@ -1246,6 +1246,36 @@ int c_coupled_loop_vars_bad(int n) // expected-note{{mutex acquired here}}
   return v2; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
 
+// Releasing an unrelated capability in a shared pure exit block.
+struct Mutex c_outer_mu;
+
+int *c_exit_unlock_unrelated_valid(int ok)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *res = (void *)0;
+  mutex_shared_lock(&c_outer_mu);
+  if (ok) {
+    mutex_exclusive_lock(&mu1);
+    res = &work_data;
+  }
+  mutex_unlock(&c_outer_mu);
+  return res;
+}
+
+int *c_exit_unlock_unrelated_missing_on_path_bad(int ok)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *res = (void *)0;
+  mutex_shared_lock(&c_outer_mu); // expected-note{{mutex acquired here}}
+  if (ok) {
+    mutex_exclusive_lock(&mu1);
+    res = &work_data;
+  } else {
+    mutex_unlock(&c_outer_mu);
+  }
+  mutex_unlock(&c_outer_mu); // expected-warning{{mutex 'c_outer_mu' is not held on every path through here}} \
+                             // expected-warning{{releasing mutex 'c_outer_mu' that was not held}}
+  return res;
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}
