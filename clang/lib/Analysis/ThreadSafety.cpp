@@ -53,6 +53,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -336,10 +337,9 @@ public:
   BeforeInfo *getBeforeInfoForDecl(const ValueDecl *Vd,
                                    ThreadSafetyAnalyzer &Analyzer);
 
-  void checkBeforeAfter(const ValueDecl* Vd,
-                        const FactSet& FSet,
-                        ThreadSafetyAnalyzer& Analyzer,
-                        SourceLocation Loc, StringRef CapKind);
+  void checkBeforeAfter(const ValueDecl *Vd, const FactSet &FSet,
+                        ThreadSafetyAnalyzer &Analyzer, SourceLocation Loc,
+                        StringRef CapKind);
 
 private:
   BeforeMap BMap;
@@ -1268,7 +1268,7 @@ public:
                    const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
                    Expr *BrE, bool Neg);
 
-  const CallExpr* getTrylockCallExpr(const Stmt *Cond, LocalVarContext C,
+  const CallExpr *getTrylockCallExpr(const Stmt *Cond, LocalVarContext C,
                                      bool &Negate);
 
   using TerminatorTrylockCall =
@@ -1279,8 +1279,7 @@ public:
                                                  bool &Negate);
 
   void getEdgeLockset(FactSet &Result, const FactSet &ExitSet,
-                      const CFGBlock* PredBlock,
-                      const CFGBlock *CurrBlock);
+                      const CFGBlock *PredBlock, const CFGBlock *CurrBlock);
 
   void getTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
 
@@ -1388,9 +1387,8 @@ BeforeSet::getBeforeInfoForDecl(const ValueDecl *Vd,
 }
 
 /// Return true if any mutexes in FSet are in the acquired_before set of Vd.
-void BeforeSet::checkBeforeAfter(const ValueDecl* StartVd,
-                                 const FactSet& FSet,
-                                 ThreadSafetyAnalyzer& Analyzer,
+void BeforeSet::checkBeforeAfter(const ValueDecl *StartVd, const FactSet &FSet,
+                                 ThreadSafetyAnalyzer &Analyzer,
                                  SourceLocation Loc, StringRef CapKind) {
   SmallVector<BeforeInfo*, 8> InfoVect;
 
