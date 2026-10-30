@@ -63,6 +63,28 @@ void Func24(void) __attribute__((try_acquire_shared_capability(1, GUI))) {}
 void Func25(void) __attribute__((try_acquire_capability())) {} // expected-error {{'try_acquire_capability' attribute takes at least 1 argument}}
 void Func26(void) __attribute__((try_acquire_shared_capability())) {} // expected-error {{'try_acquire_shared_capability' attribute takes at least 1 argument}}
 
+int TestRangeVar __attribute__((try_acquire_capability_range(0, 1, GUI))); // expected-warning {{'try_acquire_capability_range' attribute on a variable requires the variable to be of function pointer type}}
+int TestSharedRangeVar __attribute__((try_acquire_shared_capability_range(0, 1, GUI))); // expected-warning {{'try_acquire_shared_capability_range' attribute on a variable requires the variable to be of function pointer type}}
+int (*FuncPtrRange)(void) __attribute__((try_acquire_capability_range(0, 1, GUI)));
+int (*FuncPtrSharedRange)(void) __attribute__((try_acquire_shared_capability_range(0, 1, GUI)));
+
+int FuncRange1(void) __attribute__((try_acquire_capability_range(0, 1))); // expected-warning {{'try_acquire_capability_range' attribute without capability arguments can only be applied to non-static methods of a class}}
+int FuncRange2(void) __attribute__((try_acquire_shared_capability_range(0, 1))); // expected-warning {{'try_acquire_shared_capability_range' attribute without capability arguments can only be applied to non-static methods of a class}}
+
+int FuncRange3(void) __attribute__((try_acquire_capability_range(0, 1, GUI)));
+int FuncRange4(void) __attribute__((try_acquire_shared_capability_range(-10, -1, GUI, Worker)));
+
+int FuncRange5(void) __attribute__((try_acquire_capability_range())); // expected-error {{'try_acquire_capability_range' attribute takes at least 2 arguments}}
+int FuncRange6(void) __attribute__((try_acquire_capability_range(0))); // expected-error {{'try_acquire_capability_range' attribute takes at least 2 arguments}}
+int FuncRange7(void) __attribute__((try_acquire_shared_capability_range(0))); // expected-error {{'try_acquire_shared_capability_range' attribute takes at least 2 arguments}}
+int FuncRange8(void) __attribute__((try_acquire_capability_range("bad", 1, GUI))); // expected-error {{'try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}}
+int FuncRange9(void) __attribute__((try_acquire_shared_capability_range(0, "bad", GUI))); // expected-error {{'try_acquire_shared_capability_range' attribute requires parameter 2 to be an integer constant}}
+int FuncRange10(void) __attribute__((try_acquire_capability_range(2, 1, GUI))); // expected-error {{'try_acquire_capability_range' attribute range [2, 1] is empty}}
+int FuncRange11(void) __attribute__((try_acquire_shared_capability_range(0, -1, GUI))); // expected-error {{'try_acquire_shared_capability_range' attribute range [0, -1] is empty}}
+int FuncRange12(void) __attribute__((try_acquire_capability_range(0, 1, BadCapability))); // expected-warning {{'try_acquire_capability_range' attribute requires arguments whose type is annotated with 'capability' attribute; type here is 'struct NotACapability'}}
+void FuncRange13(void) __attribute__((try_acquire_capability_range(0, 0, GUI))); // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void'}}
+unsigned char FuncRange14(void) __attribute__((try_acquire_capability_range(256, 512, GUI))); // expected-warning {{'try_acquire_capability_range' attribute range [256, 512] does not contain any value of return type 'unsigned char'}}
+
 // Test that boolean logic works with capability attributes
 void Func27(void) __attribute__((requires_capability(!GUI)));
 void Func28(void) __attribute__((requires_capability(GUI && Worker)));

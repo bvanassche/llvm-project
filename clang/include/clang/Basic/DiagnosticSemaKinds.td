@@ -4401,6 +4401,16 @@ def err_attribute_argument_out_of_bounds_extra_info : Error<
   "%plural{0:no parameters to index into|"
   "1:can only be 1, since there is one parameter|"
   ":must be between 1 and %2}2">;
+def err_attribute_empty_range : Error<
+  "%0 attribute range [%1, %2] is empty">;
+def warn_thread_attribute_range_return_type : Warning<
+  "%0 attribute only applies to functions that return an integer or "
+  "unscoped enumeration type; type here is %1">,
+  InGroup<ThreadSafetyAttributes>, DefaultIgnore;
+def warn_thread_attribute_range_outside_return_type : Warning<
+  "%0 attribute range [%1, %2] does not contain any value of return type "
+  "%3">,
+  InGroup<ThreadSafetyAttributes>, DefaultIgnore;
 
 // Thread Safety Analysis
 def warn_unlock_but_no_lock : Warning<"releasing %0 '%1' that was not held">,

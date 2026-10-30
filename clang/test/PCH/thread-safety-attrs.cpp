@@ -37,6 +37,8 @@ class  __attribute__((lockable)) Mutex {
   void Unlock() __attribute__((unlock_function));
   bool TryLock() __attribute__((exclusive_trylock_function(true)));
   bool ReaderTryLock() __attribute__((shared_trylock_function(true)));
+  int TryLockRange() __attribute__((try_acquire_capability_range(0, 1)));
+  int ReaderTryLockRange() __attribute__((try_acquire_shared_capability_range(0, 1)));
   void LockWhen(const int &cond) __attribute__((exclusive_lock_function));
 };
 

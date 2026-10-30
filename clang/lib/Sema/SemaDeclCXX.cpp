@@ -19871,6 +19871,12 @@ bool Sema::checkThisInStaticMemberFunctionAttributes(CXXMethodDecl *Method) {
     else if (const auto *AC = dyn_cast<TryAcquireCapabilityAttr>(A)) {
       Arg = AC->getSuccessValue();
       Args = llvm::ArrayRef(AC->args_begin(), AC->args_size());
+    } else if (const auto *AC = dyn_cast<TryAcquireCapabilityRangeAttr>(A)) {
+      if (AC->getFirstSuccessValue() &&
+          !Finder.TraverseStmt(AC->getFirstSuccessValue()))
+        return true;
+      Arg = AC->getLastSuccessValue();
+      Args = llvm::ArrayRef(AC->args_begin(), AC->args_size());
     } else if (const auto *RC = dyn_cast<ReleaseCapabilityAttr>(A))
       Args = llvm::ArrayRef(RC->args_begin(), RC->args_size());
 

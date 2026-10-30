@@ -8282,6 +8282,18 @@ TEST_P(ImportAttributes, ImportTryAcquireCapability) {
   checkImportVariadicArg(FromAttr->args(), ToAttr->args());
 }
 
+TEST_P(ImportAttributes, ImportTryAcquireCapabilityRange) {
+  TryAcquireCapabilityRangeAttr *FromAttr, *ToAttr;
+  importAttr<FunctionDecl>(
+      "int test(int A1, int A2) "
+      "__attribute__((try_acquire_capability_range(0, 1, A1, A2)));",
+      FromAttr, ToAttr);
+  checkImported(FromAttr->getFirstSuccessValue(),
+                ToAttr->getFirstSuccessValue());
+  checkImported(FromAttr->getLastSuccessValue(), ToAttr->getLastSuccessValue());
+  checkImportVariadicArg(FromAttr->args(), ToAttr->args());
+}
+
 TEST_P(ImportAttributes, ImportReleaseCapability) {
   ReleaseCapabilityAttr *FromAttr, *ToAttr;
   importAttr<FunctionDecl>(

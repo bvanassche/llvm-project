@@ -17,6 +17,8 @@
 #define ASSERT_SHARED_LOCK(...)         __attribute__ ((assert_shared_lock(__VA_ARGS__)))
 #define EXCLUSIVE_TRYLOCK_FUNCTION(...) __attribute__ ((exclusive_trylock_function(__VA_ARGS__)))
 #define SHARED_TRYLOCK_FUNCTION(...)    __attribute__ ((shared_trylock_function(__VA_ARGS__)))
+#define TRY_ACQUIRE_RANGE(...)          __attribute__ ((try_acquire_capability_range(__VA_ARGS__)))
+#define TRY_ACQUIRE_SHARED_RANGE(...)   __attribute__ ((try_acquire_shared_capability_range(__VA_ARGS__)))
 #define UNLOCK_FUNCTION(...)            __attribute__ ((unlock_function(__VA_ARGS__)))
 #define LOCK_RETURNED(x)    __attribute__ ((lock_returned(x)))
 #define LOCKS_EXCLUDED(...) __attribute__ ((locks_excluded(__VA_ARGS__)))
@@ -1854,3 +1856,210 @@ DependentFPFields<GoodLockFn> dependent_fp_fields_ok;
 DependentFPFields<int> dependent_fp_fields_bad; // expected-note {{in instantiation of template class 'FunctionPointers::DependentFPFields<int>' requested here}}
 
 }  // namespace FunctionPointers
+
+//-----------------------------------------//
+//  TryAcquireCapabilityRange
+//-----------------------------------------//
+
+#if !__has_attribute(try_acquire_capability_range)
+#error "Should support try_acquire_capability_range attribute"
+#endif
+
+#if !__has_attribute(try_acquire_shared_capability_range)
+#error "Should support try_acquire_shared_capability_range attribute"
+#endif
+
+#if __cplusplus >= 201103
+#if !__has_cpp_attribute(clang::try_acquire_capability_range)
+#error "Should support clang::try_acquire_capability_range attribute"
+#endif
+#if !__has_cpp_attribute(clang::try_acquire_shared_capability_range)
+#error "Should support clang::try_acquire_shared_capability_range attribute"
+#endif
+#endif
+
+namespace TryAcquireRangeParsing {
+
+enum RangeEnum { RE_Neg = -2, RE_Zero = 0, RE_Pos = 5 };
+int non_const_range_bound;
+
+class LOCKABLE RangeLock {
+public:
+  int tryLock() TRY_ACQUIRE_RANGE(0, 1);
+  int readerTryLock() TRY_ACQUIRE_SHARED_RANGE(0, 1);
+
+  static int badStaticImplicit() TRY_ACQUIRE_RANGE(0, 1); // \
+    // expected-warning {{'try_acquire_capability_range' attribute without capability arguments can only be applied to non-static methods of a class}}
+  static int badStaticSharedImplicit() TRY_ACQUIRE_SHARED_RANGE(0, 1); // \
+    // expected-warning {{'try_acquire_shared_capability_range' attribute without capability arguments can only be applied to non-static methods of a class}}
+};
+
+class RangeNonLockable {
+public:
+  int field TRY_ACQUIRE_RANGE(0, 1, mu1); // \
+    // expected-warning {{'try_acquire_capability_range' attribute on a field requires the field to be of function pointer type}}
+  int method() TRY_ACQUIRE_RANGE(0, 1); // \
+    // expected-warning {{'try_acquire_capability_range' attribute without capability arguments refers to 'this', but 'RangeNonLockable' isn't annotated with 'capability' or 'scoped_lockable' attribute}}
+  int sharedMethod() TRY_ACQUIRE_SHARED_RANGE(0, 1); // \
+    // expected-warning {{'try_acquire_shared_capability_range' attribute without capability arguments refers to 'this', but 'RangeNonLockable' isn't annotated with 'capability' or 'scoped_lockable' attribute}}
+};
+
+class TRY_ACQUIRE_RANGE(0, 1, mu1) RangeBadClassSubject { // \
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions, variables, and non-static data members}}
+};
+
+// Valid declarations
+int tacr_fn_1() TRY_ACQUIRE_RANGE(0, 0, mu1);
+int tacr_fn_2() TRY_ACQUIRE_RANGE(-10, -1, mu1, mu2);
+int tacr_fn_3() TRY_ACQUIRE_RANGE(RE_Neg, RE_Pos, muWrapper.mu);
+int tacr_fn_4() TRY_ACQUIRE_RANGE(-1, 1U, mu1);
+int tascr_fn_1() TRY_ACQUIRE_SHARED_RANGE(0, 100, mu1);
+int (*tacr_fp)(void) TRY_ACQUIRE_RANGE(0, 1, mu1);
+int (*tascr_fp)(void) TRY_ACQUIRE_SHARED_RANGE(0, 1, mu1);
+
+// Missing capability arguments on free functions
+int tacr_no_cap() TRY_ACQUIRE_RANGE(0, 1); // \
+  // expected-warning {{'try_acquire_capability_range' attribute without capability arguments can only be applied to non-static methods of a class}}
+int tascr_no_cap() TRY_ACQUIRE_SHARED_RANGE(0, 1); // \
+  // expected-warning {{'try_acquire_shared_capability_range' attribute without capability arguments can only be applied to non-static methods of a class}}
+
+// Invalid argument counts, types, and empty ranges
+int tacr_bad_0() TRY_ACQUIRE_RANGE(); // \
+  // expected-error {{'try_acquire_capability_range' attribute takes at least 2 arguments}}
+int tacr_bad_1() TRY_ACQUIRE_RANGE(0); // \
+  // expected-error {{'try_acquire_capability_range' attribute takes at least 2 arguments}}
+int tascr_bad_1() TRY_ACQUIRE_SHARED_RANGE(0); // \
+  // expected-error {{'try_acquire_shared_capability_range' attribute takes at least 2 arguments}}
+int tacr_bad_bool_1() TRY_ACQUIRE_RANGE(false, 1, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}}
+int tacr_bad_bool_2() TRY_ACQUIRE_RANGE(0, true, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 2 to be an integer constant}}
+int tascr_bad_bool() TRY_ACQUIRE_SHARED_RANGE(true, true, mu1); // \
+  // expected-error {{'try_acquire_shared_capability_range' attribute requires parameter 1 to be an integer constant}}
+int tacr_bad_nonconst_1() TRY_ACQUIRE_RANGE(non_const_range_bound, 1, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}}
+int tacr_bad_nonconst_2() TRY_ACQUIRE_RANGE(0, non_const_range_bound, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 2 to be an integer constant}}
+int tacr_bad_str() TRY_ACQUIRE_RANGE("0", 1, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}}
+int tacr_bad_mu() TRY_ACQUIRE_RANGE(mu1, 1, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}}
+int tacr_bad_empty_1() TRY_ACQUIRE_RANGE(5, 1, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute range [5, 1] is empty}}
+int tacr_bad_empty_2() TRY_ACQUIRE_RANGE(1U, -1, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute range [1, -1] is empty}}
+int tascr_bad_empty() TRY_ACQUIRE_SHARED_RANGE(-1, -5, mu1); // \
+  // expected-error {{'try_acquire_shared_capability_range' attribute range [-1, -5] is empty}}
+int tacr_bad_cap() TRY_ACQUIRE_RANGE(0, 1, umu); // \
+  // expected-warning {{'try_acquire_capability_range' attribute requires arguments whose type is annotated with 'capability' attribute}}
+
+// Return types
+RangeEnum tacr_ret_enum() TRY_ACQUIRE_RANGE(RE_Zero, RE_Zero, mu1);
+unsigned tacr_ret_unsigned() TRY_ACQUIRE_RANGE(-1, 0, mu1);
+void tacr_ret_void() TRY_ACQUIRE_RANGE(0, 0, mu1); // \
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void'}}
+void *tacr_ret_ptr() TRY_ACQUIRE_RANGE(1, 1, mu1); // \
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void *'}}
+void (*tacr_fp_ret_void)(void) TRY_ACQUIRE_RANGE(0, 0, mu1); // \
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void'}}
+unsigned tacr_ret_unsigned_neg() TRY_ACQUIRE_RANGE(-2, -1, mu1); // \
+  // expected-warning {{'try_acquire_capability_range' attribute range [-2, -1] does not contain any value of return type 'unsigned int'}}
+signed char tacr_ret_schar() TRY_ACQUIRE_SHARED_RANGE(128, 300, mu1); // \
+  // expected-warning {{'try_acquire_shared_capability_range' attribute range [128, 300] does not contain any value of return type 'signed char'}}
+
+template <typename T>
+T tacr_template_ret() TRY_ACQUIRE_RANGE(0, 0, mu1) { return T(); } // \
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void *'}}
+template int tacr_template_ret<int>();
+template void *tacr_template_ret<void *>(); // \
+  // expected-note {{in instantiation of function template specialization 'TryAcquireRangeParsing::tacr_template_ret<void *>' requested here}}
+
+// Templates
+template <typename Mu>
+int tacr_template_cap(Mu &mu) TRY_ACQUIRE_RANGE(0, 1, mu) { return 0; }
+template int tacr_template_cap<Mutex>(Mutex &);
+
+template <int Lo, int Hi>
+int tacr_template_bounds() TRY_ACQUIRE_RANGE(Lo, Hi, mu1) { return Lo; }
+template int tacr_template_bounds<0, 1>();
+template int tacr_template_bounds<5, 1>(); // \
+  // expected-error@-2 {{'try_acquire_capability_range' attribute range [5, 1] is empty}} \
+  // expected-note {{in instantiation of function template specialization 'TryAcquireRangeParsing::tacr_template_bounds<5, 1>' requested here}}
+
+template <typename T, T Lo, T Hi>
+int tacr_template_dep_type() TRY_ACQUIRE_RANGE(Lo, Hi, mu1) { return 0; }
+template int tacr_template_dep_type<int, 0, 1>();
+template int tacr_template_dep_type<bool, false, true>(); // \
+  // expected-error@-2 {{'try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}} \
+  // expected-note {{in instantiation of function template specialization 'TryAcquireRangeParsing::tacr_template_dep_type<bool, false, true>' requested here}}
+
+template <typename FuncPtr>
+struct DependentRangeFP {
+  FuncPtr trylock TRY_ACQUIRE_RANGE(0, 1, mu1); // \
+    // expected-warning {{'try_acquire_capability_range' attribute on a field requires the field to be of function pointer type}}
+};
+typedef int (*GoodTryLockRangeFn)(void);
+DependentRangeFP<GoodTryLockRangeFn> dep_range_fp_ok;
+DependentRangeFP<int> dep_range_fp_bad; // \
+  // expected-note {{in instantiation of template class 'TryAcquireRangeParsing::DependentRangeFP<int>' requested here}}
+
+#if __cplusplus >= 201103
+constexpr int kLo = -3;
+constexpr int kHi = 0;
+constexpr bool kBool = true;
+enum class ScopedEnum { A = 0, B = 1 };
+
+[[clang::try_acquire_capability_range(kLo, kHi, mu1)]] int tacr_cxx11();
+[[clang::try_acquire_shared_capability_range(kLo, kHi, mu1)]] int tascr_cxx11();
+[[clang::try_acquire_capability_range(kLo, kHi, mu1)]] int (*tacr_fp_cxx11)(void);
+
+// Constexpr function templates must be instantiated to evaluate the bounds.
+template <typename T> constexpr T maxOf() { return T(~0u >> 1); }
+int tacr_constexpr_template() TRY_ACQUIRE_RANGE(0, maxOf<int>(), mu1);
+
+[[clang::try_acquire_capability_range(kBool, 1, mu1)]] int tacr_cxx11_bool(); // \
+  // expected-error {{'clang::try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}}
+[[clang::try_acquire_capability_range(ScopedEnum::A, ScopedEnum::B, mu1)]] int tacr_cxx11_scoped_enum(); // \
+  // expected-error {{'clang::try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}}
+
+template <typename... Mus>
+int tacr_variadic(Mus &...mus) TRY_ACQUIRE_RANGE(0, 1, mus...) { return 0; }
+template int tacr_variadic<Mutex, Mutex>(Mutex &, Mutex &);
+
+template <int... Bs>
+int tacr_pack_bounds() TRY_ACQUIRE_RANGE(Bs..., mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}}
+template <int... Bs>
+int tacr_pack_last_bound() TRY_ACQUIRE_RANGE(0, Bs..., mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 2 to be an integer constant}}
+
+// Attributes of member functions are parsed before the member function
+// bodies. Bounds that call constexpr members are evaluated by the analysis.
+struct MemberBound {
+  Mutex mu;
+  static constexpr int okValue() { return 0; }
+  int tryLock() TRY_ACQUIRE_RANGE(okValue(), okValue(), mu);
+};
+
+struct StaticThisCheck {
+  Mutex mu;
+  constexpr int bound() const { return 0; }
+  static int s1() TRY_ACQUIRE_RANGE(0, 1, this->mu); // \
+    // expected-error {{invalid use of 'this' outside of a non-static member function}}
+  static int s2() TRY_ACQUIRE_RANGE(this->bound(), 1, mu1); // \
+    // expected-error {{invalid use of 'this' outside of a non-static member function}}
+  static int s3() TRY_ACQUIRE_RANGE(0, this->bound(), mu1); // \
+    // expected-error {{invalid use of 'this' outside of a non-static member function}}
+  static int s4();
+  static int s5();
+  static int s6();
+};
+int StaticThisCheck::s4() TRY_ACQUIRE_RANGE(0, 1, this->mu) { return 0; } // \
+  // expected-error {{invalid use of 'this' outside of a non-static member function}}
+int StaticThisCheck::s5() TRY_ACQUIRE_RANGE(this->bound(), 1, mu1) { return 0; } // \
+  // expected-error {{invalid use of 'this' outside of a non-static member function}}
+int StaticThisCheck::s6() TRY_ACQUIRE_RANGE(0, bound(), mu1) { return 0; } // \
+  // expected-error {{call to non-static member function without an object argument}}
+#endif
+
+} // namespace TryAcquireRangeParsing

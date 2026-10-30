@@ -563,14 +563,117 @@ static bool checkThreadSafetyAttrSubject(Sema &S, Decl *D, const ParsedAttr &AL,
   return checkThreadSafetyValueDeclIsFunPtr(S, VD, AL);
 }
 
+static bool
+checkTryAcquireCapabilityRangeArg(Sema &S, const AttributeCommonInfo &AL,
+                                  const Expr *Arg, unsigned ArgNum,
+                                  std::optional<llvm::APSInt> &Val) {
+  if (!Arg->isTypeDependent() &&
+      (Arg->getType()->isBooleanType() ||
+       !Arg->getType()->isIntegralOrUnscopedEnumerationType())) {
+    S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
+        << AL << ArgNum << AANT_ArgumentIntegerConstant
+        << Arg->getSourceRange();
+    return false;
+  }
+
+  if (Arg->isTypeDependent() || Arg->isValueDependent())
+    return true;
+
+  markThreadSafetyConstantArgReferenced(S, Arg);
+  Val = Arg->getIntegerConstantExpr(S.Context);
+  if (!Val) {
+    // The analysis evaluates the bound once the constexpr functions it calls
+    // have been defined.
+    if (callsUndefinedConstexprFunction(Arg))
+      return true;
+    S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
+        << AL << ArgNum << AANT_ArgumentIntegerConstant
+        << Arg->getSourceRange();
+    return false;
+  }
+
+  return true;
+}
+
+/// Returns the return type of the function, Objective-C method, function
+/// pointer or function reference D, or a null type if D is none of these.
+static QualType getThreadSafetyAttrReturnType(const Decl *D) {
+  if (const auto *FD = dyn_cast<FunctionDecl>(D))
+    return FD->getReturnType();
+  if (const auto *MD = dyn_cast<ObjCMethodDecl>(D))
+    return MD->getReturnType();
+  if (const auto *VD = dyn_cast<ValueDecl>(D)) {
+    QualType T = VD->getType().getNonReferenceType();
+    if (const auto *PT = T->getAs<PointerType>())
+      T = PT->getPointeeType();
+    if (const auto *FT = T->getAs<FunctionType>())
+      return FT->getReturnType();
+  }
+  return QualType();
+}
+
+static bool checkTryAcquireCapabilityRangeBounds(Sema &S, const Decl *D,
+                                                 const AttributeCommonInfo &AL,
+                                                 const Expr *FirstExpr,
+                                                 const Expr *LastExpr) {
+  std::optional<llvm::APSInt> FirstVal, LastVal;
+  if (!checkTryAcquireCapabilityRangeArg(S, AL, FirstExpr, 1, FirstVal) ||
+      !checkTryAcquireCapabilityRangeArg(S, AL, LastExpr, 2, LastVal))
+    return false;
+
+  if (FirstVal && LastVal &&
+      llvm::APSInt::compareValues(*FirstVal, *LastVal) > 0) {
+    S.Diag(AL.getLoc(), diag::err_attribute_empty_range)
+        << AL << toString(*FirstVal, 10) << toString(*LastVal, 10)
+        << FirstExpr->getSourceRange() << LastExpr->getSourceRange();
+    return false;
+  }
+
+  // The analysis compares the return value with the range. Hence, the return
+  // type must be an integer or unscoped enumeration type and the range must
+  // contain at least one value of the return type.
+  QualType RetTy = getThreadSafetyAttrReturnType(D);
+  if (RetTy.isNull() || RetTy->isDependentType() || RetTy->isUndeducedType())
+    return true;
+  if (!RetTy->isIntegralOrUnscopedEnumerationType()) {
+    S.Diag(AL.getLoc(), diag::warn_thread_attribute_range_return_type)
+        << AL << RetTy;
+    return false;
+  }
+  if (FirstVal && LastVal) {
+    unsigned Width = S.Context.getIntWidth(RetTy);
+    bool IsUnsigned = !RetTy->isSignedIntegerOrEnumerationType();
+    llvm::APSInt Min = llvm::APSInt::getMinValue(Width, IsUnsigned);
+    llvm::APSInt Max = llvm::APSInt::getMaxValue(Width, IsUnsigned);
+    if (llvm::APSInt::compareValues(*LastVal, Min) < 0 ||
+        llvm::APSInt::compareValues(*FirstVal, Max) > 0) {
+      S.Diag(AL.getLoc(), diag::warn_thread_attribute_range_outside_return_type)
+          << AL << toString(*FirstVal, 10) << toString(*LastVal, 10) << RetTy
+          << FirstExpr->getSourceRange() << LastExpr->getSourceRange();
+      return false;
+    }
+  }
+
+  return true;
+}
+
 bool Sema::checkInstantiatedThreadSafetyAttrs(const Decl *D, const Attr *A) {
   if (!isa<AssertCapabilityAttr, AcquireCapabilityAttr,
-           TryAcquireCapabilityAttr, ReleaseCapabilityAttr,
-           RequiresCapabilityAttr, LocksExcludedAttr, LockReturnedAttr>(A))
+           TryAcquireCapabilityAttr, TryAcquireCapabilityRangeAttr,
+           ReleaseCapabilityAttr, RequiresCapabilityAttr, LocksExcludedAttr,
+           LockReturnedAttr>(A))
     return true;
 
   if (const auto *TAC = dyn_cast<TryAcquireCapabilityAttr>(A))
     checkTryAcquireCapabilitySuccessValue(*this, *TAC, TAC->getSuccessValue());
+
+  if (const auto *TACR = dyn_cast<TryAcquireCapabilityRangeAttr>(A)) {
+    if (TACR->getFirstSuccessValue() && TACR->getLastSuccessValue() &&
+        !checkTryAcquireCapabilityRangeBounds(*this, D, *TACR,
+                                              TACR->getFirstSuccessValue(),
+                                              TACR->getLastSuccessValue()))
+      return false;
+  }
 
   const auto *VD = dyn_cast<ValueDecl>(D);
   if (!VD)
@@ -759,6 +862,22 @@ static bool checkTryLockFunAttrCommon(Sema &S, Decl *D, const ParsedAttr &AL,
 
   // check that all arguments are lockable objects
   checkAttrArgsAreCapabilityObjs(S, D, AL, Args, 1);
+
+  return true;
+}
+
+static bool checkTryLockRangeFunAttrCommon(Sema &S, Decl *D,
+                                           const ParsedAttr &AL,
+                                           SmallVectorImpl<Expr *> &Args) {
+  if (!AL.checkAtLeastNumArgs(S, 2))
+    return false;
+
+  if (!checkTryAcquireCapabilityRangeBounds(S, D, AL, AL.getArgAsExpr(0),
+                                            AL.getArgAsExpr(1)))
+    return false;
+
+  // check that all arguments are lockable objects
+  checkAttrArgsAreCapabilityObjs(S, D, AL, Args, 2);
 
   return true;
 }
@@ -7013,6 +7132,20 @@ static void handleTryAcquireCapabilityAttr(Sema &S, Decl *D,
       S.Context, AL, AL.getArgAsExpr(0), Args.data(), Args.size()));
 }
 
+static void handleTryAcquireCapabilityRangeAttr(Sema &S, Decl *D,
+                                                const ParsedAttr &AL) {
+  if (!checkThreadSafetyAttrSubject(S, D, AL))
+    return;
+
+  SmallVector<Expr *, 2> Args;
+  if (!checkTryLockRangeFunAttrCommon(S, D, AL, Args))
+    return;
+
+  D->addAttr(::new (S.Context) TryAcquireCapabilityRangeAttr(
+      S.Context, AL, AL.getArgAsExpr(0), AL.getArgAsExpr(1), Args.data(),
+      Args.size()));
+}
+
 static void handleReleaseCapabilityAttr(Sema &S, Decl *D,
                                         const ParsedAttr &AL) {
   if (!checkThreadSafetyAttrSubject(S, D, AL, /*CheckParmVar=*/true))
@@ -7737,6 +7870,20 @@ ProcessDeclAttribute(Sema &S, Decl *D, const ParsedAttr &AL,
           return;
         }
       }
+    }
+  }
+
+  // The bounds of a try_acquire_capability_range attribute must be integer
+  // constants. Reject pack expansions in the bound positions since these
+  // would delay the arguments and bypass the range validation.
+  if (AL.getKind() == ParsedAttr::AT_TryAcquireCapabilityRange) {
+    for (unsigned I = 0, E = std::min(AL.getNumArgs(), 2u); I != E; ++I) {
+      if (!AL.isArgExpr(I) || !isa<PackExpansionExpr>(AL.getArgAsExpr(I)))
+        continue;
+      S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
+          << AL << I + 1 << AANT_ArgumentIntegerConstant
+          << AL.getArgAsExpr(I)->getSourceRange();
+      return;
     }
   }
 
@@ -8481,6 +8628,9 @@ ProcessDeclAttribute(Sema &S, Decl *D, const ParsedAttr &AL,
     break;
   case ParsedAttr::AT_TryAcquireCapability:
     handleTryAcquireCapabilityAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_TryAcquireCapabilityRange:
+    handleTryAcquireCapabilityRangeAttr(S, D, AL);
     break;
 
   // Consumed analysis attributes.

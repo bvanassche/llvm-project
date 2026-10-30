@@ -11,6 +11,8 @@
 #define RELEASE(...)      __attribute__((release_capability(__VA_ARGS__)))
 #define ASSERT_CAP(...)   __attribute__((assert_capability(__VA_ARGS__)))
 #define TRY_ACQUIRE(...)  __attribute__((try_acquire_capability(__VA_ARGS__)))
+#define TRY_ACQUIRE_RANGE(...) __attribute__((try_acquire_capability_range(__VA_ARGS__)))
+#define TRY_ACQUIRE_SHARED_RANGE(...) __attribute__((try_acquire_shared_capability_range(__VA_ARGS__)))
 #define EXCLUDES(...)     __attribute__((locks_excluded(__VA_ARGS__)))
 #define RETURN_CAP(x)     __attribute__((lock_returned(x)))
 #define GUARDED_BY(x)     __attribute__((guarded_by(x)))
@@ -42,6 +44,12 @@ struct Assert {
 
 struct TryAcquire {
   int (*cb)(void) TRY_ACQUIRE(1, mu); // early-error{{use of undeclared identifier 'mu'}}
+  struct Mutex mu;
+};
+
+struct TryAcquireRange {
+  int (*cb)(void) TRY_ACQUIRE_RANGE(0, 1, mu); // early-error{{use of undeclared identifier 'mu'}}
+  int (*cb_shared)(void) TRY_ACQUIRE_SHARED_RANGE(0, 1, mu); // early-error{{use of undeclared identifier 'mu'}}
   struct Mutex mu;
 };
 

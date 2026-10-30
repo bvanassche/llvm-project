@@ -2950,7 +2950,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         getMutexIDs(A->isShared() ? SharedLocksAcquired
                                   : ExclusiveLocksAcquired,
                     A, nullptr, D);
-      } else if (isa<TryAcquireCapabilityAttr>(Attr)) {
+      } else if (isa<TryAcquireCapabilityAttr,
+                     TryAcquireCapabilityRangeAttr>(Attr)) {
         // Don't try to check trylock functions for now.
         return;
       }
