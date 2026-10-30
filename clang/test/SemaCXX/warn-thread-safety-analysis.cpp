@@ -9746,6 +9746,24 @@ struct LoopExitAndDerefTryAcquireHolder {
     }
     return ret;
   }
+
+  int validLoopInvariantRet(bool fatal) TRY_ACQUIRE_SHARED_RANGE(0, 0, mu) {
+    int ret = 0;
+    mu.ReaderLock();
+    for (;;) {
+      if (ready())
+        break;
+      if (fatal)
+        ret = -11;
+      mu.Unlock();
+      if (ret)
+        break;
+      waitStep();
+      mu.ReaderLock();
+    }
+    waitStep();
+    return ret;
+  }
 };
 
 } // namespace TryAcquireBodyVerificationTest

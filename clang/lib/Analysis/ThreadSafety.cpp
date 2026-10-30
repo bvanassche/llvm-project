@@ -8122,9 +8122,125 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
             for (const ValueDecl *VD : BlockModifiedVars[B->getBlockID()])
               EraseModifiedVar(VD);
         } else {
+          llvm::SmallPtrSet<const ValueDecl *, 8> LoopModVars;
           for (const CFGBlock *LB : LoopBlocks)
             for (const ValueDecl *VD : BlockModifiedVars[LB->getBlockID()])
-              EraseModifiedVar(VD);
+              LoopModVars.insert(VD);
+
+          llvm::SmallPtrSet<const ValueDecl *, 8> CandidateVars;
+          for (const ValueDecl *VD : LoopModVars) {
+            if (!isTrackableLocalVar(VD, EscapedVars))
+              continue;
+            if (auto It = CurrValState.VarRanges.find(VD);
+                It != CurrValState.VarRanges.end() && !It->second.empty())
+              CandidateVars.insert(VD);
+          }
+
+          if (!CandidateVars.empty() && CandidateVars.size() <= 8 &&
+              LoopBlocks.size() <= 64) {
+            SmallVector<const CFGBlock *, 16> OrderedLoopBlocks;
+            OrderedLoopBlocks.reserve(LoopBlocks.size());
+            for (const CFGBlock *B : *SortedGraph)
+              if (LoopBlocks.contains(B))
+                OrderedLoopBlocks.push_back(B);
+
+            llvm::DenseMap<unsigned, TrylockValueState> SimExit;
+            while (!CandidateVars.empty()) {
+              SimExit.clear();
+              TrylockValueState HeaderState;
+              HeaderState.Infeasible = false;
+              for (const auto &[VD, R] : CurrValState.VarRanges)
+                if (!LoopModVars.contains(VD) || CandidateVars.contains(VD))
+                  HeaderState.VarRanges.try_emplace(VD, R);
+
+              for (const CFGBlock *LB : OrderedLoopBlocks) {
+                TrylockValueState LBS;
+                if (LB == CurrBlock) {
+                  LBS = HeaderState;
+                } else {
+                  LBS.Infeasible = true;
+                  bool HasInnerBackEdge = false;
+                  for (auto LPI = LB->pred_begin(), LPE = LB->pred_end();
+                       LPI != LPE; ++LPI) {
+                    const CFGBlock *Pred = *LPI;
+                    if (!Pred || RPOIdx[Pred->getBlockID()] == UINT_MAX ||
+                        neverReturns(Pred) || !LoopBlocks.contains(Pred))
+                      continue;
+                    if (RPOIdx[Pred->getBlockID()] >=
+                        RPOIdx[LB->getBlockID()]) {
+                      HasInnerBackEdge = true;
+                      continue;
+                    }
+                    auto It = SimExit.find(Pred->getBlockID());
+                    if (It == SimExit.end() || It->second.Infeasible)
+                      continue;
+                    TrylockValueState EdgeS = It->second;
+                    constrainValueStateOnEdge(EdgeS, Pred, LB, EscapedVars);
+                    unionIntoValueState(LBS, EdgeS, *ASTCtx);
+                  }
+                  if (!LBS.Infeasible && HasInnerBackEdge) {
+                    for (const ValueDecl *MVD : LoopModVars) {
+                      LBS.VarRanges.erase(MVD);
+                      LBS.UnmaterializedVarDefs.erase(MVD);
+                    }
+                    LBS.ExprRanges.clear();
+                    LBS.ShortCircuitedOps.clear();
+                  }
+                }
+
+                if (!LBS.Infeasible) {
+                  unsigned SimCtxIdx = BlockInfo[LB->getBlockID()].EntryIndex;
+                  LocalVarContext SimStmtCtx =
+                      BlockInfo[LB->getBlockID()].EntryContext;
+                  for (const CFGElement &BI : *LB) {
+                    if (std::optional<CFGStmt> CS = BI.getAs<CFGStmt>()) {
+                      const Stmt *S = CS->getStmt();
+                      updateValueStateForStmt(LBS, S, SimStmtCtx, EscapedVars);
+                      SimStmtCtx =
+                          LocalVarMap.getNextContext(SimCtxIdx, S, SimStmtCtx);
+                    }
+                  }
+                }
+                SimExit.try_emplace(LB->getBlockID(), std::move(LBS));
+              }
+
+              SmallVector<const ValueDecl *, 4> FailedVars;
+              for (const CFGBlock *BP : UnvisitedBackPreds) {
+                if (neverReturns(BP))
+                  continue;
+                auto It = SimExit.find(BP->getBlockID());
+                if (It == SimExit.end() || It->second.Infeasible)
+                  continue;
+                TrylockValueState BackS = It->second;
+                constrainValueStateOnEdge(BackS, BP, CurrBlock, EscapedVars);
+                if (BackS.Infeasible)
+                  continue;
+                for (const ValueDecl *CVD : CandidateVars) {
+                  auto BackIt = BackS.VarRanges.find(CVD);
+                  auto EntryIt = HeaderState.VarRanges.find(CVD);
+                  if (BackIt == BackS.VarRanges.end() ||
+                      EntryIt == HeaderState.VarRanges.end() ||
+                      !BackIt->second.subsetOfSet(EntryIt->second)) {
+                    if (!llvm::is_contained(FailedVars, CVD))
+                      FailedVars.push_back(CVD);
+                  }
+                }
+              }
+
+              if (FailedVars.empty())
+                break;
+              for (const ValueDecl *FVD : FailedVars)
+                CandidateVars.erase(FVD);
+            }
+          } else {
+            CandidateVars.clear();
+          }
+
+          for (const ValueDecl *VD : LoopModVars) {
+            CurrValState.UnmaterializedVarDefs.erase(VD);
+            if (!CandidateVars.contains(VD))
+              CurrValState.VarRanges.erase(VD);
+          }
         }
         CurrValState.ExprRanges.clear();
         CurrValState.ShortCircuitedOps.clear();

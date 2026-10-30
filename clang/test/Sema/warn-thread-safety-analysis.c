@@ -1215,6 +1215,37 @@ int c_loop_unmodified_var_valid(int fail)
   return ret;
 }
 
+// Loop-invariant variable ranges across retry loops (e.g. usermodehelper).
+int c_loop_invariant_ret_valid(int fatal)
+    __attribute__((try_acquire_shared_capability_range(0, 0, mu1))) {
+  int ret = 0;
+  mutex_shared_lock(&mu1);
+  for (;;) {
+    do_some_work();
+    if (check_hw_ready())
+      break;
+    if (fatal)
+      ret = -11;
+    mutex_unlock(&mu1);
+    if (ret)
+      break;
+    do_some_work();
+    mutex_shared_lock(&mu1);
+  }
+  do_some_work();
+  return ret;
+}
+
+int c_coupled_loop_vars_bad(int n) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int v1 = -1, v2 = -1;
+  for (int i = 0; i < n; ++i) {
+    v2 = v1;
+    v1 = 0;
+  }
+  return v2; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}
