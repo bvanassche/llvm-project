@@ -9481,6 +9481,19 @@ class BodyCheckSuite {
     return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
+  // The trylock result is not used by the return statements.
+  bool badUnusedResult(bool dead) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = mu.TryLock(); // expected-note {{mutex acquired here}}
+    if (dead)
+      return false; // expected-warning {{mutex 'mu' is still held at the end of function}}
+    return ok;
+  }
+
+  bool badDiscardedResult() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    (void)mu.TryLock(); // expected-note {{mutex acquired here}}
+    return false; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
   bool badFailureStillLocked() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
     mu.Lock(); // expected-note {{mutex acquired here}}
     return false; // expected-warning {{mutex 'mu' is still held at the end of function}}

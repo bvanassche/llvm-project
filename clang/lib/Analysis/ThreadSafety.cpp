@@ -39,6 +39,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ImmutableMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
@@ -1357,6 +1358,8 @@ public:
     // no longer held, e.g. because these have been released. Branching again
     // on the result of such a call must not acquire the capabilities again.
     llvm::SmallDenseSet<AcquiredTrylockKey, 4> ConsumedTrylockAttrs;
+    // Trylock calls whose result has been discarded.
+    llvm::SmallSetVector<const CallExpr *, 2> DiscardedTrylockCalls;
     llvm::SmallDenseMap<const ValueDecl *,
                         std::pair<const Expr *, LocalVarContext>, 2>
         UnmaterializedVarDefs;
@@ -1490,6 +1493,12 @@ public:
       const SmallVectorImpl<PendingTrylockAcquire> &InPending,
       const TrylockValueState &State, LocalVarContext Ctx, bool UseVarRanges,
       SmallVectorImpl<ReturnEvalOutcome> &Out, unsigned Depth);
+  void evaluateReturnWithPendingTrylocks(
+      const Expr *RetVal, const FactSet &InLockset,
+      const TrylockValueState &State, LocalVarContext Ctx,
+      SmallVectorImpl<ReturnEvalOutcome> &Out);
+  // Trylock calls in the function being verified whose result is discarded.
+  llvm::SmallPtrSet<const CallExpr *, 4> DiscardedCalls;
   void applyScopeExitCleanups(FactSet &StateSet, const CFGBlock *B,
                               bool OnlyAfterReturn = false);
   void checkTrylockExitOutcome(const FactSet &BaseExpectedExitSet,
@@ -3895,6 +3904,8 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
     Dst.AcquiredTrylockAttrs.insert(Key);
   for (const auto &Key : Src.ConsumedTrylockAttrs)
     Dst.ConsumedTrylockAttrs.insert(Key);
+  for (const CallExpr *CE : Src.DiscardedTrylockCalls)
+    Dst.DiscardedTrylockCalls.insert(CE);
 
   SmallVector<const ValueDecl *, 2> DefsToErase;
   for (const auto &[VD, DefPair] : Dst.UnmaterializedVarDefs) {
@@ -4460,6 +4471,14 @@ void ThreadSafetyAnalyzer::updateValueStateForStmt(
         }
       }
     }
+    if (const auto *CE = dyn_cast<CallExpr>(E);
+        CE && DiscardedCalls.contains(CE)) {
+      if (const auto *Callee =
+              dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl());
+          Callee && (Callee->hasAttr<TryAcquireCapabilityAttr>() ||
+                     Callee->hasAttr<TryAcquireCapabilityRangeAttr>()))
+        State.DiscardedTrylockCalls.insert(CE);
+    }
     if (const auto *CE = dyn_cast<CallExpr>(E)) {
       SmallVector<AcquiredTrylockKey, 2> ToErase;
       for (const auto &Key : State.AcquiredTrylockAttrs)
@@ -4676,6 +4695,94 @@ bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
 /// The maximum number of distinct outcomes that evaluateReturnOutcomes()
 /// produces for a single expression.
 static constexpr unsigned MaxReturnOutcomes = 64;
+
+/// Evaluate the return value \p RetVal. Before doing that, split the outcomes
+/// on every trylock call that may have succeeded on the current path but
+/// whose result is not referenced by \p RetVal, either because the result has
+/// been stored in a variable that is not used by \p RetVal or because the
+/// result has been discarded. Without this, the capabilities acquired by such
+/// a trylock call would not be taken into account.
+void ThreadSafetyAnalyzer::evaluateReturnWithPendingTrylocks(
+    const Expr *RetVal, const FactSet &InLockset,
+    const TrylockValueState &State, LocalVarContext Ctx,
+    SmallVectorImpl<ReturnEvalOutcome> &Out) {
+  // The trylock calls referenced by the return value.
+  llvm::SmallPtrSet<const Expr *, 4> ReferencedDefs;
+  auto CollectRefs = [&](auto &Self, const Stmt *S) -> void {
+    if (!S)
+      return;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {
+      const auto *VD = cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+      if (auto It = State.UnmaterializedVarDefs.find(VD);
+          It != State.UnmaterializedVarDefs.end())
+        ReferencedDefs.insert(It->second.first);
+    }
+    for (const Stmt *Child : S->children())
+      Self(Self, Child);
+  };
+  CollectRefs(CollectRefs, RetVal);
+
+  // Sort the variables by source location for deterministic diagnostics.
+  SmallVector<std::pair<const ValueDecl *, std::pair<const Expr *,
+                                                     LocalVarContext>>,
+              4>
+      Defs(State.UnmaterializedVarDefs.begin(),
+           State.UnmaterializedVarDefs.end());
+  llvm::sort(Defs, [](const auto &A, const auto &B) {
+    return A.first->getLocation().getRawEncoding() <
+           B.first->getLocation().getRawEncoding();
+  });
+
+  struct Start {
+    FactSet Lockset;
+    SmallVector<PendingTrylockAcquire, 2> Pending;
+  };
+  SmallVector<Start, 2> Starts;
+  Starts.push_back({InLockset, {}});
+  TrylockValueState EmptyState;
+  llvm::SmallPtrSet<const Expr *, 4> Done;
+
+  auto Fork = [&](const Expr *DefE, LocalVarContext DefCtx,
+                  const IntRangeSet *Allowed, const IntDomain &Dom) {
+    SmallVector<Start, 2> Next;
+    for (const Start &St : Starts) {
+      SmallVector<ReturnEvalOutcome, 2> Outs;
+      evaluateReturnOutcomes(DefE, Dom, St.Lockset, St.Pending, State, DefCtx,
+                             /*UseVarRanges=*/false, Outs);
+      for (ReturnEvalOutcome &O : Outs) {
+        if (Allowed && O.Values.intersect(*Allowed).empty())
+          continue;
+        Next.push_back({std::move(O.Lockset), std::move(O.PendingAcquires)});
+      }
+    }
+    if (!Next.empty() && Next.size() <= MaxReturnOutcomes)
+      Starts = std::move(Next);
+  };
+
+  for (const auto &[VD, DefPair] : Defs) {
+    const Expr *DefE = DefPair.first;
+    if (ReferencedDefs.contains(DefE) || !Done.insert(DefE).second)
+      continue;
+    auto Dom = getScalarDomain(VD->getType());
+    if (!Dom)
+      continue;
+    auto VR = State.VarRanges.find(VD);
+    Fork(DefE, DefPair.second,
+         VR != State.VarRanges.end() ? &VR->second : nullptr, *Dom);
+  }
+  for (const CallExpr *CE : State.DiscardedTrylockCalls) {
+    if (!Done.insert(CE).second)
+      continue;
+    auto Dom = getScalarDomain(CE->getType());
+    if (!Dom)
+      continue;
+    Fork(CE, Ctx, /*Allowed=*/nullptr, *Dom);
+  }
+
+  for (const Start &St : Starts)
+    evaluateReturnOutcomes(RetVal, CurrentTrylockRetDom, St.Lockset, St.Pending,
+                           State, Ctx, /*UseVarRanges=*/true, Out);
+}
 
 void ThreadSafetyAnalyzer::evaluateReturnOutcomes(
     const Expr *E, const IntDomain &TargetDom, const FactSet &InLockset,
@@ -6952,6 +7059,58 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 
     scanTrylockVars(AC.getBody(), EscapedVars, LoopModifiedVars);
 
+    // Collect the calls whose result is discarded: expression statements and
+    // casts to void.
+    DiscardedCalls.clear();
+    auto CollectDiscarded = [&](auto &Self, const Stmt *S) -> void {
+      if (!S || isa<LambdaExpr, BlockExpr, CapturedStmt>(S))
+        return;
+      auto Note = [&](const Stmt *Child) {
+        const auto *E = dyn_cast_or_null<Expr>(Child);
+        while (E) {
+          E = E->IgnoreParens();
+          if (const auto *FE = dyn_cast<FullExpr>(E)) {
+            E = FE->getSubExpr();
+            continue;
+          }
+          if (const auto *CE = dyn_cast<CastExpr>(E);
+              CE && CE->getCastKind() == CK_ToVoid) {
+            E = CE->getSubExpr();
+            continue;
+          }
+          break;
+        }
+        if (const auto *Call = dyn_cast_or_null<CallExpr>(E))
+          DiscardedCalls.insert(Call);
+      };
+      if (const auto *CS = dyn_cast<CompoundStmt>(S)) {
+        // The value of the last statement of a statement expression is used.
+        for (const Stmt *Child : CS->body())
+          Note(Child);
+      } else if (const auto *CE = dyn_cast<CastExpr>(S);
+                 CE && CE->getCastKind() == CK_ToVoid) {
+        Note(CE);
+      }
+      for (const Stmt *Child : S->children())
+        Self(Self, Child);
+    };
+    CollectDiscarded(CollectDiscarded, AC.getBody());
+
+    // The result of the last statement of a statement expression is used.
+    auto UnmarkStmtExprResults = [&](auto &Self, const Stmt *S) -> void {
+      if (!S)
+        return;
+      if (const auto *SE = dyn_cast<StmtExpr>(S))
+        if (const CompoundStmt *CS = SE->getSubStmt(); CS && !CS->body_empty())
+          if (const auto *E = dyn_cast<Expr>(CS->body_back()))
+            if (const auto *Call =
+                    dyn_cast<CallExpr>(E->IgnoreParens()->IgnoreImplicit()))
+              DiscardedCalls.erase(Call);
+      for (const Stmt *Child : S->children())
+        Self(Self, Child);
+    };
+    UnmarkStmtExprResults(UnmarkStmtExprResults, AC.getBody());
+
     RPOIdx.assign(NumBlocks, 0);
     unsigned CurRPO = 0;
     for (const CFGBlock *B : *SortedGraph)
@@ -7044,6 +7203,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
               Candidate.ValState.AcquiredTrylockAttrs &&
           Existing.ValState.ConsumedTrylockAttrs ==
               Candidate.ValState.ConsumedTrylockAttrs &&
+          Existing.ValState.DiscardedTrylockCalls ==
+              Candidate.ValState.DiscardedTrylockCalls &&
           SameUnmaterializedDefs(Existing.ValState, Candidate.ValState)) {
         unionIntoValueState(Existing.ValState, Candidate.ValState, *ASTCtx);
         return;
@@ -7370,7 +7531,6 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 
   if (CheckingTrylockBody) {
     DedupThreadSafetyHandler DedupHandler(Handler);
-    SmallVector<PendingTrylockAcquire, 0> EmptyPending;
 
     for (CFGBlock::const_pred_iterator PI = ExitBlock->pred_begin(),
                                        PE = ExitBlock->pred_end();
@@ -7446,18 +7606,16 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
               continue;
           }
           SmallVector<ReturnEvalOutcome, 2> Outcomes;
-          evaluateReturnOutcomes(RetVal, CurrentTrylockRetDom, Bnd.Lockset,
-                                 EmptyPending, EvalState, EvalCtx,
-                                 /*UseVarRanges=*/true, Outcomes);
+          evaluateReturnWithPendingTrylocks(RetVal, Bnd.Lockset, EvalState,
+                                            EvalCtx, Outcomes);
           for (ReturnEvalOutcome &Outcome : Outcomes)
             VerifyExitOutcome(Outcome);
         }
       } else if (RS) {
         SmallVector<ReturnEvalOutcome, 2> Outcomes;
-        evaluateReturnOutcomes(
-            RetVal, CurrentTrylockRetDom, PreReturnLocksets[PredID],
-            EmptyPending, PreReturnValStates[PredID], PreReturnVarCtx[PredID],
-            /*UseVarRanges=*/true, Outcomes);
+        evaluateReturnWithPendingTrylocks(
+            RetVal, PreReturnLocksets[PredID], PreReturnValStates[PredID],
+            PreReturnVarCtx[PredID], Outcomes);
         for (ReturnEvalOutcome &Outcome : Outcomes)
           VerifyExitOutcome(Outcome);
       } else {
