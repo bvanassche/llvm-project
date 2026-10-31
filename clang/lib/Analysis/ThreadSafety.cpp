@@ -2088,8 +2088,13 @@ void ThreadSafetyAnalyzer::getAcquiredTrylockCaps(const AcquiredTrylockKey &Key,
     getMutexIDs(Caps, A, Key.first, Callee);
 }
 
+static bool isRangeTrylockReturnType(QualType Ty) {
+  return !Ty.isNull() && !Ty->isDependentType() &&
+         (Ty->isIntegralOrEnumerationType() || Ty->isAnyPointerType());
+}
+
 static const NamedDecl *getRangeTrylockCallee(const CallExpr *CallExp) {
-  if (!CallExp || !CallExp->getType()->isIntegralOrEnumerationType())
+  if (!CallExp || !isRangeTrylockReturnType(CallExp->getType()))
     return nullptr;
   const auto *FunDecl = dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl());
   if (!FunDecl || !FunDecl->hasAttr<TryAcquireCapabilityRangeAttr>())
@@ -2116,6 +2121,32 @@ static bool isValuePreservingIntegralCast(QualType SrcTy, QualType DstTy,
   bool SrcUnsigned = SrcTy->isUnsignedIntegerOrEnumerationType();
   bool DstUnsigned = DstTy->isUnsignedIntegerOrEnumerationType();
   return SrcUnsigned == DstUnsigned || (SrcUnsigned && DstBits > SrcBits);
+}
+
+static bool isValuePreservingCast(const CastExpr *CE, const ASTContext &Ctx) {
+  QualType SubTy = CE->getSubExpr()->getType();
+  QualType DstTy = CE->getType();
+  switch (CE->getCastKind()) {
+  case CK_LValueToRValue:
+  case CK_NoOp:
+    return true;
+  case CK_IntegralCast:
+    return isValuePreservingIntegralCast(SubTy, DstTy, Ctx);
+  case CK_BitCast:
+    return DstTy->isAnyPointerType() && SubTy->isAnyPointerType();
+  case CK_PointerToIntegral:
+    return SubTy->isAnyPointerType() &&
+           DstTy->isUnsignedIntegerOrEnumerationType() &&
+           !DstTy->isBooleanType() &&
+           Ctx.getIntWidth(DstTy) >= Ctx.getIntWidth(Ctx.getUIntPtrType());
+  case CK_IntegralToPointer:
+    return DstTy->isAnyPointerType() &&
+           SubTy->isUnsignedIntegerOrEnumerationType() &&
+           !SubTy->isBooleanType() &&
+           Ctx.getIntWidth(SubTy) <= Ctx.getIntWidth(Ctx.getUIntPtrType());
+  default:
+    return false;
+  }
 }
 
 ThreadSafetyAnalyzer::IntDomain
@@ -2400,21 +2431,11 @@ ThreadSafetyAnalyzer::unwrapTrylockValueExpr(const Expr *E, LocalVarContext C) {
       continue;
     }
     if (const auto *CE = dyn_cast<CastExpr>(E)) {
-      switch (CE->getCastKind()) {
-      case CK_LValueToRValue:
-      case CK_NoOp:
+      if (isValuePreservingCast(CE, *ASTCtx)) {
         E = CE->getSubExpr();
         continue;
-      case CK_IntegralCast:
-        if (isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
-                                          CE->getType(), *ASTCtx)) {
-          E = CE->getSubExpr();
-          continue;
-        }
-        return nullptr;
-      default:
-        return nullptr;
       }
+      return nullptr;
     }
     if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
       E = LocalVarMap.lookupExpr(DRE->getDecl(), C);
@@ -2462,11 +2483,7 @@ bool ThreadSafetyAnalyzer::isGuaranteedZeroOrOneExpr(const Expr *E,
       continue;
     }
     if (const auto *CE = dyn_cast<CastExpr>(E)) {
-      if (CE->getCastKind() == CK_LValueToRValue ||
-          CE->getCastKind() == CK_NoOp ||
-          (CE->getCastKind() == CK_IntegralCast &&
-           isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
-                                         CE->getType(), *ASTCtx))) {
+      if (isValuePreservingCast(CE, *ASTCtx)) {
         E = CE->getSubExpr();
         continue;
       }
@@ -2531,19 +2548,11 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
     return evaluateTrylockRangeCond(FE->getSubExpr(), C);
 
   if (const auto *CE = dyn_cast<CastExpr>(Cond)) {
-    switch (CE->getCastKind()) {
-    case CK_LValueToRValue:
-    case CK_NoOp:
-    case CK_IntegralToBoolean:
+    if (CE->getCastKind() == CK_IntegralToBoolean ||
+        CE->getCastKind() == CK_PointerToBoolean ||
+        isValuePreservingCast(CE, *ASTCtx))
       return evaluateTrylockRangeCond(CE->getSubExpr(), C);
-    case CK_IntegralCast:
-      if (isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
-                                        CE->getType(), *ASTCtx))
-        return evaluateTrylockRangeCond(CE->getSubExpr(), C);
-      return {};
-    default:
-      return {};
-    }
+    return {};
   }
 
   if (const auto *DRE = dyn_cast<DeclRefExpr>(Cond)) {
@@ -2565,7 +2574,7 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
       return evaluateTrylockRangeCond(CallExp->getArg(0), C);
 
     if (const NamedDecl *Callee = getRangeTrylockCallee(CallExp)) {
-      IntDomain Dom = IntDomain::forType(CallExp->getType(), *ASTCtx);
+      IntDomain Dom = *getScalarDomain(CallExp->getType());
       IntRangeSet FalseSet = IntRangeSet::single(Dom, llvm::APSInt::get(0));
       IntRangeSet TrueSet = FalseSet.complement(Dom);
       return {CallExp, Callee, std::move(Dom), std::move(TrueSet),
@@ -2593,17 +2602,32 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
     }
 
     if (BOP->isComparisonOp()) {
+      auto EvalConstSide =
+          [&](const Expr *ConstSide) -> std::optional<llvm::APSInt> {
+        if (ConstSide->getType()->isIntegralOrEnumerationType())
+          return ConstSide->getIntegerConstantExpr(*ASTCtx);
+        if (ConstSide->getType()->isAnyPointerType() ||
+            ConstSide->getType()->isNullPtrType()) {
+          TrylockValueState EmptyState;
+          if (auto R = evaluatePureExprRange(ConstSide, EmptyState)) {
+            llvm::APSInt K;
+            if (R->isSingleValue(K))
+              return K;
+          }
+        }
+        return std::nullopt;
+      };
       const CallExpr *CallExp = nullptr;
       BinaryOperator::Opcode CmpOp = BOP->getOpcode();
       std::optional<llvm::APSInt> ConstVal;
       if (const CallExpr *LHSVal = unwrapTrylockValueExpr(BOP->getLHS(), C)) {
-        ConstVal = BOP->getRHS()->getIntegerConstantExpr(*ASTCtx);
+        ConstVal = EvalConstSide(BOP->getRHS());
         if (ConstVal)
           CallExp = LHSVal;
       }
       if (!CallExp) {
         if (const CallExpr *RHSVal = unwrapTrylockValueExpr(BOP->getRHS(), C)) {
-          ConstVal = BOP->getLHS()->getIntegerConstantExpr(*ASTCtx);
+          ConstVal = EvalConstSide(BOP->getLHS());
           if (ConstVal) {
             CallExp = RHSVal;
             CmpOp = BinaryOperator::reverseComparisonOp(CmpOp);
@@ -2612,7 +2636,7 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
       }
       if (CallExp && ConstVal) {
         const NamedDecl *Callee = getRangeTrylockCallee(CallExp);
-        IntDomain Dom = IntDomain::forType(CallExp->getType(), *ASTCtx);
+        IntDomain Dom = *getScalarDomain(CallExp->getType());
         IntRangeSet TrueSet = IntRangeSet::forComparison(Dom, CmpOp, *ConstVal);
         IntRangeSet FalseSet = TrueSet.complement(Dom);
         return {CallExp, Callee, std::move(Dom), std::move(TrueSet),
@@ -2723,7 +2747,7 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
     Callee = getRangeTrylockCallee(CallExp);
     if (!Callee)
       return;
-    IntDomain Dom = IntDomain::forType(CallExp->getType(), *ASTCtx);
+    IntDomain Dom = *getScalarDomain(CallExp->getType());
     const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
     if (!Table.Valid)
       return;
@@ -2840,7 +2864,7 @@ void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
     Callee = getRangeTrylockCallee(CallExp);
     if (!Callee)
       return;
-    IntDomain Dom = IntDomain::forType(CallExp->getType(), *ASTCtx);
+    IntDomain Dom = *getScalarDomain(CallExp->getType());
     const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
     if (!Table.Valid)
       return;
@@ -3595,37 +3619,10 @@ bool ThreadSafetyAnalyzer::isTrackableLocalVar(
 const ValueDecl *ThreadSafetyAnalyzer::extractTrackableVarExpr(
     const Expr *E,
     const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const {
-  const unsigned PtrBits = ASTCtx->getIntWidth(ASTCtx->getUIntPtrType());
   while (E) {
     E = stripNoOpExprWrappers(E);
     if (const auto *CE = dyn_cast<CastExpr>(E)) {
-      QualType SubTy = CE->getSubExpr()->getType();
-      QualType DstTy = CE->getType();
-      if (CE->getCastKind() == CK_LValueToRValue) {
-        E = CE->getSubExpr();
-        continue;
-      }
-      if (CE->getCastKind() == CK_IntegralCast &&
-          isValuePreservingIntegralCast(SubTy, DstTy, *ASTCtx)) {
-        E = CE->getSubExpr();
-        continue;
-      }
-      if (CE->getCastKind() == CK_BitCast && DstTy->isAnyPointerType() &&
-          SubTy->isAnyPointerType()) {
-        E = CE->getSubExpr();
-        continue;
-      }
-      if (CE->getCastKind() == CK_PointerToIntegral &&
-          SubTy->isAnyPointerType() &&
-          DstTy->isUnsignedIntegerOrEnumerationType() &&
-          !DstTy->isBooleanType() && ASTCtx->getIntWidth(DstTy) >= PtrBits) {
-        E = CE->getSubExpr();
-        continue;
-      }
-      if (CE->getCastKind() == CK_IntegralToPointer &&
-          DstTy->isAnyPointerType() &&
-          SubTy->isUnsignedIntegerOrEnumerationType() &&
-          !SubTy->isBooleanType() && ASTCtx->getIntWidth(SubTy) <= PtrBits) {
+      if (isValuePreservingCast(CE, *ASTCtx)) {
         E = CE->getSubExpr();
         continue;
       }
@@ -3721,6 +3718,21 @@ static ThreadSafetyAnalyzer::IntRangeSet
 nonZeroRangeSet(const ThreadSafetyAnalyzer::IntDomain &Dom) {
   return ThreadSafetyAnalyzer::IntRangeSet::single(Dom, llvm::APSInt::get(0))
       .complement(Dom);
+}
+
+/// Range of addresses that a valid object, function, or dereferenced pointer
+/// can have. On 32-bit and wider targets, exclude the top 4 KiB page so that
+/// valid addresses are disjoint from negative errno sentinel pointers such as
+/// Linux's ERR_PTR(-errno).
+static ThreadSafetyAnalyzer::IntRangeSet
+validObjectPtrRangeSet(QualType Ty, const ThreadSafetyAnalyzer::IntDomain &Dom,
+                       const ASTContext &Ctx) {
+  if (!Ty->isAnyPointerType() || Ctx.getIntWidth(Ctx.getUIntPtrType()) < 32)
+    return nonZeroRangeSet(Dom);
+  llvm::APSInt One(llvm::APInt(Dom.BitWidth, 1), /*isUnsigned=*/false);
+  llvm::APSInt TopPage(llvm::APInt(Dom.BitWidth, 4096), /*isUnsigned=*/false);
+  return ThreadSafetyAnalyzer::IntRangeSet::closedRange(Dom, One,
+                                                        Dom.Hi - TopPage);
 }
 
 static ThreadSafetyAnalyzer::IntRangeSet
@@ -3997,7 +4009,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
   if (isa<CXXNullPtrLiteralExpr, GNUNullExpr>(E))
     return IntRangeSet::single(Dom, llvm::APSInt::get(0));
   if (isa<CXXThisExpr>(E))
-    return nonZeroRangeSet(Dom);
+    return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
 
   if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
     const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
@@ -4007,13 +4019,13 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
     if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
       R = reprojectRangeSet(It->second, Dom);
     if (AssumeDerefNonNull && State.DerefNonNullVars.contains(VD)) {
-      // The pointer has been dereferenced, so assume that it is not null
-      // unless that contradicts what is known about its value. Branch
-      // conditions do not use this assumption because code built with
-      // -fno-delete-null-pointer-checks may check a pointer for null after
-      // having dereferenced it.
-      IntRangeSet NonNull = R ? R->intersect(nonZeroRangeSet(Dom))
-                              : nonZeroRangeSet(Dom);
+      // The pointer has been dereferenced, so assume that it points to a valid
+      // object (neither null nor in the top error-pointer page) unless that
+      // contradicts what is known about its value. Branch conditions do not use
+      // this assumption because code built with -fno-delete-null-pointer-checks
+      // may check a pointer for null after having dereferenced it.
+      IntRangeSet ValidPtr = validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
+      IntRangeSet NonNull = R ? R->intersect(ValidPtr) : ValidPtr;
       if (!NonNull.empty())
         return NonNull;
     }
@@ -4033,7 +4045,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
       return IntRangeSet::single(Dom, llvm::APSInt::get(0));
     case CK_ArrayToPointerDecay:
     case CK_FunctionToPointerDecay:
-      return nonZeroRangeSet(Dom);
+      return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
     case CK_BitCast:
       if (CE->getType()->isAnyPointerType() &&
           CE->getSubExpr()->getType()->isAnyPointerType()) {
@@ -4158,7 +4170,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
   if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
     switch (UO->getOpcode()) {
     case UO_AddrOf:
-      return nonZeroRangeSet(Dom);
+      return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
     case UO_Plus:
       return evaluatePureExprRange(UO->getSubExpr(), State, Depth + 1);
     case UO_Minus: {
@@ -4996,19 +5008,11 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
     while (E) {
       E = stripNoOpExprWrappers(E);
       if (const auto *CE = dyn_cast<CastExpr>(E)) {
-        switch (CE->getCastKind()) {
-        case CK_LValueToRValue:
-        case CK_NoOp:
+        if (isValuePreservingCast(CE, *ASTCtx)) {
           E = CE->getSubExpr();
           continue;
-        case CK_IntegralCast:
-          if (isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
-                                            CE->getType(), *ASTCtx)) {
-            E = CE->getSubExpr();
-            continue;
-          }
-          return nullptr;
-        case CK_BitCast:
+        }
+        switch (CE->getCastKind()) {
         case CK_DerivedToBase:
         case CK_UncheckedDerivedToBase:
           if (CE->getType()->isAnyPointerType() &&
@@ -5129,9 +5133,8 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
       }
     }
 
-    if (PreservesExactInt &&
-        CallExp->getType()->isIntegralOrEnumerationType() &&
-        VD->getType()->isIntegralOrEnumerationType()) {
+    if (PreservesExactInt && isRangeTrylockReturnType(CallExp->getType()) &&
+        isRangeTrylockReturnType(VD->getType())) {
       for (const auto *Attr :
            Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
         if (State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
@@ -5484,7 +5487,7 @@ bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
            Callee->specific_attrs<TryAcquireCapabilityAttr>())
         if (!State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
           return true;
-      if (CallExp->getType()->isIntegralOrEnumerationType()) {
+      if (isRangeTrylockReturnType(CallExp->getType())) {
         for (const auto *Attr :
              Callee->specific_attrs<TryAcquireCapabilityRangeAttr>())
           if (!State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
@@ -6298,7 +6301,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
                      Attr->isShared() ? LK_Shared : LK_Exclusive);
     }
 
-    if (CallExp->getType()->isIntegralOrEnumerationType()) {
+    if (isRangeTrylockReturnType(CallExp->getType())) {
       for (const auto *Attr :
            Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
         if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue()) {
@@ -7878,8 +7881,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         if (A->args_size() == 0)
           return;
         SawTryAcquireAttr = true;
-        if (FuncReturnType.isNull() || FuncReturnType->isDependentType() ||
-            !FuncReturnType->isIntegralOrEnumerationType() ||
+        if (!isRangeTrylockReturnType(FuncReturnType) ||
             FuncReturnType->isBooleanType())
           return;
         auto RetDom = getScalarDomain(FuncReturnType);

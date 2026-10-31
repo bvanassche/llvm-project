@@ -1956,14 +1956,20 @@ int tacr_bad_cap() TRY_ACQUIRE_RANGE(0, 1, umu); // \
 // Return types
 RangeEnum tacr_ret_enum() TRY_ACQUIRE_RANGE(RE_Zero, RE_Zero, mu1);
 unsigned tacr_ret_unsigned() TRY_ACQUIRE_RANGE(-1, 0, mu1);
+void *tacr_ret_ptr() TRY_ACQUIRE_RANGE(1, 1, mu1);
+void *(*tacr_fp_ret_ptr)(void) TRY_ACQUIRE_RANGE(0, (__UINTPTR_TYPE__)-4096, mu1);
 void tacr_ret_void() TRY_ACQUIRE_RANGE(0, 0, mu1); // \
-  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void'}}
-void *tacr_ret_ptr() TRY_ACQUIRE_RANGE(1, 1, mu1); // \
-  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void *'}}
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'void'}}
+double tacr_ret_double() TRY_ACQUIRE_RANGE(0, 1, mu1); // \
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'double'}}
+int RangeNonLockable::*tacr_ret_memptr() TRY_ACQUIRE_RANGE(0, 1, mu1); // \
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'int RangeNonLockable::*'}}
 void (*tacr_fp_ret_void)(void) TRY_ACQUIRE_RANGE(0, 0, mu1); // \
-  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void'}}
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'void'}}
 unsigned tacr_ret_unsigned_neg() TRY_ACQUIRE_RANGE(-2, -1, mu1); // \
   // expected-warning {{'try_acquire_capability_range' attribute range [-2, -1] does not contain any value of return type 'unsigned int'}}
+void *tacr_ret_ptr_neg() TRY_ACQUIRE_RANGE(-2, -1, mu1); // \
+  // expected-warning {{'try_acquire_capability_range' attribute range [-2, -1] does not contain any value of return type 'void *'}}
 signed char tacr_ret_schar() TRY_ACQUIRE_SHARED_RANGE(128, 300, mu1); // \
   // expected-warning {{'try_acquire_shared_capability_range' attribute range [128, 300] does not contain any value of return type 'signed char'}}
 
@@ -1973,10 +1979,11 @@ signed char tacr_ret_schar() TRY_ACQUIRE_SHARED_RANGE(128, 300, mu1); // \
 // tests that verify the implementation of template trylock functions.
 template <typename T>
 T tacr_template_ret() TRY_ACQUIRE_RANGE(0, 0, mu1) { return T(); } // \
-  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void *'}}
+  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'double'}}
 template int tacr_template_ret<int>();
-template void *tacr_template_ret<void *>(); // \
-  // expected-note {{in instantiation of function template specialization 'TryAcquireRangeParsing::tacr_template_ret<void *>' requested here}}
+template void *tacr_template_ret<void *>();
+template double tacr_template_ret<double>(); // \
+  // expected-note {{in instantiation of function template specialization 'TryAcquireRangeParsing::tacr_template_ret<double>' requested here}}
 
 // Templates
 template <typename Mu>

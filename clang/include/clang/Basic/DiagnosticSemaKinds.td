@@ -4404,8 +4404,8 @@ def err_attribute_argument_out_of_bounds_extra_info : Error<
 def err_attribute_empty_range : Error<
   "%0 attribute range [%1, %2] is empty">;
 def warn_thread_attribute_range_return_type : Warning<
-  "%0 attribute only applies to functions that return an integer or "
-  "unscoped enumeration type; type here is %1">,
+  "%0 attribute only applies to functions that return an integer, unscoped "
+  "enumeration, or pointer type; type here is %1">,
   InGroup<ThreadSafetyAttributes>, DefaultIgnore;
 def warn_thread_attribute_range_outside_return_type : Warning<
   "%0 attribute range [%1, %2] does not contain any value of return type "

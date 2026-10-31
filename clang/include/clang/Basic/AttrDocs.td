@@ -1179,12 +1179,13 @@ def TryAcquireCapabilityRangeDocs : Documentation {
   let Category = DocCatFunction;
   let Heading = "try_acquire_capability_range, try_acquire_shared_capability_range";
   let Content = [{
-Marks a function that attempts to acquire a capability and returns an integer
-indicating whether acquisition succeeded. The first two arguments specify the
-inclusive range ``[low, high]`` of return values that indicate that the
-capability was successfully acquired; any remaining arguments specify the
-capabilities acquired on success (defaulting to ``this`` when omitted on a
-non-static member function of a capability type).
+Marks a function that attempts to acquire a capability and returns an integer,
+unscoped enumeration, or pointer value indicating whether acquisition
+succeeded. The first two arguments specify the inclusive range ``[low, high]``
+of return values that indicate that the capability was successfully acquired
+(pointer return values are compared as unsigned integers of type ``uintptr_t``);
+any remaining arguments specify the capabilities acquired on success (defaulting
+to ``this`` when omitted on a non-static member function of a capability type).
   }];
 }
 

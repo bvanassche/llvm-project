@@ -482,8 +482,9 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
 
 - Added the `try_acquire_capability_range` and
   `try_acquire_shared_capability_range` thread safety attributes, whose first
-  two arguments specify the inclusive integer range `[low, high]` of return
-  values indicating that the capability was successfully acquired.
+  two arguments specify the inclusive range `[low, high]` of integer, unscoped
+  enumeration, or pointer return values (with pointers compared as `uintptr_t`)
+  indicating that the capability was successfully acquired.
 
 - `-Wthread-safety-analysis` now checks the bodies of functions annotated with
   `try_acquire_capability`, `try_acquire_shared_capability`,

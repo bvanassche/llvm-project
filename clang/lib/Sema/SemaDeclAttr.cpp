@@ -630,19 +630,23 @@ static bool checkTryAcquireCapabilityRangeBounds(Sema &S, const Decl *D,
   }
 
   // The analysis compares the return value with the range. Hence, the return
-  // type must be an integer or unscoped enumeration type and the range must
-  // contain at least one value of the return type.
+  // type must be an integer, unscoped enumeration, or pointer type and the
+  // range must contain at least one value of the return type (with pointers
+  // modeled in the uintptr_t domain).
   QualType RetTy = getThreadSafetyAttrReturnType(D);
   if (RetTy.isNull() || RetTy->isDependentType() || RetTy->isUndeducedType())
     return true;
-  if (!RetTy->isIntegralOrUnscopedEnumerationType()) {
+  if (!RetTy->isIntegralOrUnscopedEnumerationType() &&
+      !RetTy->isAnyPointerType()) {
     S.Diag(AL.getLoc(), diag::warn_thread_attribute_range_return_type)
         << AL << RetTy;
     return false;
   }
   if (FirstVal && LastVal) {
-    unsigned Width = S.Context.getIntWidth(RetTy);
-    bool IsUnsigned = !RetTy->isSignedIntegerOrEnumerationType();
+    QualType BoundTy =
+        RetTy->isAnyPointerType() ? S.Context.getUIntPtrType() : RetTy;
+    unsigned Width = S.Context.getIntWidth(BoundTy);
+    bool IsUnsigned = !BoundTy->isSignedIntegerOrEnumerationType();
     llvm::APSInt Min = llvm::APSInt::getMinValue(Width, IsUnsigned);
     llvm::APSInt Max = llvm::APSInt::getMaxValue(Width, IsUnsigned);
     if (llvm::APSInt::compareValues(*LastVal, Min) < 0 ||

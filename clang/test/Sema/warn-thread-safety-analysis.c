@@ -1340,6 +1340,87 @@ struct CNetDev *c_deref_then_reassign_in_stmtexpr_bad(struct CNetDev *dev,
   return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
 }
 
+// Pointer return types on try_acquire_[shared_]capability_range.
+#define TEST_IS_ERR_VALUE_MACRO(x)                                             \
+  __builtin_expect(                                                            \
+      !!((__UINTPTR_TYPE__)(void *)(x) >= (__UINTPTR_TYPE__)-4095), 0)
+
+struct CGroupObj {
+  int id;
+};
+struct CGroupObj g_cgrp_obj;
+
+struct CGroupObj *c_ptr_range_lock_live(int ok)
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1))) {
+  if (!ok)
+    return (struct CGroupObj *)(__INTPTR_TYPE__)-2;
+  mutex_exclusive_lock(&mu1);
+  return &g_cgrp_obj;
+}
+
+struct CGroupObj *c_ptr_range_lock_live_leak_bad(void)
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return (struct CGroupObj *)(__INTPTR_TYPE__)-16; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+struct CGroupObj *c_ptr_range_lock_live_missing_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1))) {
+  return (struct CGroupObj *)0; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+struct CGroupObj *c_ptr_range_shared_nonnull(int mode)
+    __attribute__((try_acquire_shared_capability_range(1, (__UINTPTR_TYPE__)-4096, mu1)));
+
+void *c_ptr_range_map_or_failed(void)
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-2, mu1)));
+
+void test_ptr_range_callers_c(int ok, int mode) {
+  struct CGroupObj *cgrp = c_ptr_range_lock_live(ok);
+  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)cgrp))
+    return;
+  work_data = 1;
+  mutex_unlock(&mu1);
+
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)c_ptr_range_lock_live(ok))) {
+    work_data = 2;
+    mutex_unlock(&mu1);
+  }
+
+  // Range [1, -4096]: both NULL and ERR_PTR indicate failure.
+  struct CGroupObj *sc = c_ptr_range_shared_nonnull(mode);
+  if (sc && !TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)sc)) {
+    int v = work_data;
+    (void)v;
+    mutex_unlock(&mu1);
+  }
+
+  // Missing NULL check when 0 is outside [1, -4096].
+  struct CGroupObj *sc2 = c_ptr_range_shared_nonnull(mode);
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)sc2)) {
+    int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+    (void)v;
+  }
+
+  // MAP_FAILED ((void *)-1) sentinel comparison.
+  void *mapped = c_ptr_range_map_or_failed();
+  if (mapped != (void *)(__INTPTR_TYPE__)-1) {
+    work_data = 3;
+    mutex_unlock(&mu1);
+  }
+
+  // Switch on uintptr_t cast of pointer range trylock.
+  switch ((__UINTPTR_TYPE__)c_ptr_range_lock_live(ok)) {
+  case (__UINTPTR_TYPE__)-4095 ... (__UINTPTR_TYPE__)-1:
+    work_data = 4; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    break;
+  default:
+    work_data = 5;
+    mutex_unlock(&mu1);
+    break;
+  }
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

@@ -82,8 +82,10 @@ int FuncRange9(void) __attribute__((try_acquire_shared_capability_range(0, "bad"
 int FuncRange10(void) __attribute__((try_acquire_capability_range(2, 1, GUI))); // expected-error {{'try_acquire_capability_range' attribute range [2, 1] is empty}}
 int FuncRange11(void) __attribute__((try_acquire_shared_capability_range(0, -1, GUI))); // expected-error {{'try_acquire_shared_capability_range' attribute range [0, -1] is empty}}
 int FuncRange12(void) __attribute__((try_acquire_capability_range(0, 1, BadCapability))); // expected-warning {{'try_acquire_capability_range' attribute requires arguments whose type is annotated with 'capability' attribute; type here is 'struct NotACapability'}}
-void FuncRange13(void) __attribute__((try_acquire_capability_range(0, 0, GUI))); // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void'}}
+void FuncRange13(void) __attribute__((try_acquire_capability_range(0, 0, GUI))); // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'void'}}
 unsigned char FuncRange14(void) __attribute__((try_acquire_capability_range(256, 512, GUI))); // expected-warning {{'try_acquire_capability_range' attribute range [256, 512] does not contain any value of return type 'unsigned char'}}
+void *FuncRange15(void) __attribute__((try_acquire_capability_range(1, (__UINTPTR_TYPE__)-4096, GUI)));
+void *FuncRange16(void) __attribute__((try_acquire_capability_range(-2, -1, GUI))); // expected-warning {{'try_acquire_capability_range' attribute range [-2, -1] does not contain any value of return type 'void *'}}
 
 // Test that boolean logic works with capability attributes
 void Func27(void) __attribute__((requires_capability(!GUI)));

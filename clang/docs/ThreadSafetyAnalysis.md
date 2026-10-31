@@ -507,15 +507,17 @@ void foo() {
 ### TRY_ACQUIRE_RANGE(\<low>, \<high>, ...), TRY_ACQUIRE_SHARED_RANGE(\<low>, \<high>, ...)
 
 These are attributes on a function or method that tries to acquire the given
-capability and returns an integer indicating success or failure. The first two
-arguments must be integer constant expressions specifying the inclusive range
-`[low, high]` (with `low <= high`) of return values that indicate success, and
-the remaining arguments are interpreted in the same way as `ACQUIRE`. As with
-`TRY_ACQUIRE`, when capability arguments are explicitly provided, the analysis
-verifies that the function body holds the specified capabilities on return paths
-whose value is within `[low, high]` and does not hold them on return paths
-outside `[low, high]`; if capability arguments are omitted, the capability is
-assumed to be `this` and the function body is not checked.
+capability and returns an integer, unscoped enumeration, or pointer value
+indicating success or failure. The first two arguments must be integer constant
+expressions specifying the inclusive range `[low, high]` (with `low <= high`) of
+return values that indicate success (pointer return values are compared as
+unsigned integers of type `uintptr_t`), and the remaining arguments are
+interpreted in the same way as `ACQUIRE`. As with `TRY_ACQUIRE`, when capability
+arguments are explicitly provided, the analysis verifies that the function body
+holds the specified capabilities on return paths whose value is within
+`[low, high]` and does not hold them on return paths outside `[low, high]`; if
+capability arguments are omitted, the capability is assumed to be `this` and the
+function body is not checked.
 
 ```c++
 Mutex mu;

@@ -9808,4 +9808,42 @@ struct LoopExitAndDerefTryAcquireHolder {
   }
 };
 
+struct PtrRangeTryAcquireHolder {
+  Mutex mu;
+  int guarded GUARDED_BY(mu);
+
+  int *tryLockNonNullOrErr(int mode)
+      TRY_ACQUIRE_RANGE(1, (__UINTPTR_TYPE__)-4096, mu) {
+    if (mode == 0)
+      return nullptr;
+    if (mode < 0)
+      return reinterpret_cast<int *>(static_cast<__INTPTR_TYPE__>(-16));
+    mu.Lock();
+    return &guarded;
+  }
+
+  void *delegateAndUse(int mode)
+      TRY_ACQUIRE_RANGE(1, (__UINTPTR_TYPE__)-4096, mu) {
+    int *p = tryLockNonNullOrErr(mode);
+    if (p == nullptr ||
+        reinterpret_cast<__UINTPTR_TYPE__>(p) >= (__UINTPTR_TYPE__)-4095)
+      return p;
+    guarded = 7;
+    return p;
+  }
+
+  void testCaller(int mode) {
+    int *p = tryLockNonNullOrErr(mode);
+    if (p != nullptr &&
+        reinterpret_cast<__UINTPTR_TYPE__>(p) < (__UINTPTR_TYPE__)-4095) {
+      guarded = 8;
+      mu.Unlock();
+    }
+    int *p2 = tryLockNonNullOrErr(mode);
+    if (p2 != nullptr) {
+      guarded = 9; // expected-warning {{writing variable 'guarded' requires holding mutex 'mu' exclusively}}
+    }
+  }
+};
+
 } // namespace TryAcquireBodyVerificationTest
