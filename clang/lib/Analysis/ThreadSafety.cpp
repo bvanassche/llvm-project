@@ -1257,6 +1257,13 @@ static constexpr unsigned MaxInlineDepth = 4;
 /// The maximum number of inline helper expansions per analyzed function.
 /// Bounds the cost of analyzing helpers that call other helpers many times.
 static constexpr unsigned MaxInlineExpansions = 512;
+/// The maximum number of nested helpers that return their argument unchanged
+/// that is looked through, e.g. ERR_CAST(ERR_CAST(p)).
+static constexpr unsigned MaxIdentityProbeDepth = 16;
+/// The maximum recursion depth of isGuaranteedZeroOrOneExpr().
+static constexpr unsigned MaxZeroOrOneDepth = 8;
+/// The maximum recursion depth of constrainExprComparison().
+static constexpr unsigned MaxConstrainExprDepth = 24;
 
 /// Class which implements the core thread safety analysis routines.
 /// The body of a trivial inline or constexpr function whose return value can
@@ -1443,10 +1450,19 @@ public:
 
   const CallExpr *getTrylockCallExpr(const Stmt *Cond, LocalVarContext C,
                                      bool &Negate);
+  std::optional<unsigned>
+  getIdentityInlineParamIndex(const CallExpr *CallExp) const;
   const Expr *skipValuePreservingWrappers(const Expr *E, LocalVarContext *C,
                                           bool IgnoreSideEffects = true) const;
+  const CallExpr *unwrapValuePreservingToCallExpr(const Expr *E,
+                                                  LocalVarContext &C);
   const CallExpr *unwrapTrylockValueExpr(const Expr *E, LocalVarContext C);
-  bool isGuaranteedZeroOrOneExpr(const Expr *E, LocalVarContext C);
+  bool isGuaranteedZeroOrOneExpr(const Expr *E, LocalVarContext C,
+                                 unsigned Depth = 0);
+  TrylockRangeCondResult evaluateInlineCallRangeCond(
+      const CallExpr *InlineCall, LocalVarContext C,
+      std::optional<std::pair<BinaryOperator::Opcode, llvm::APSInt>> OuterCmp =
+          std::nullopt);
   TrylockRangeCondResult evaluateTrylockRangeCond(const Stmt *Cond,
                                                   LocalVarContext C);
   TrylockRangeCondResult evaluateTrylockRangeCondImpl(const Stmt *Cond,
@@ -1493,6 +1509,11 @@ public:
   std::optional<IntRangeSet>
   evaluatePureExprRange(const Expr *E, const TrylockValueState &State,
                         unsigned Depth = 0) const;
+  bool constrainExprComparison(
+      TrylockValueState &State, const Expr *VarSide,
+      BinaryOperator::Opcode EffectiveOp, const llvm::APSInt &KVal,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
+      unsigned Depth = 0) const;
   void constrainLeafCondition(
       TrylockValueState &State, const Expr *Cond, bool WantTrue,
       const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
@@ -1546,6 +1567,15 @@ public:
   mutable unsigned InlineDepth = 0;
   // The number of inline expansions performed for the current function.
   mutable unsigned InlineExpansionCount = 0;
+  // Cache of getIdentityInlineParamIndex() results, keyed by the canonical
+  // declaration of the callee. While a result is being computed, its entry is
+  // std::nullopt such that recursive helpers are not treated as identities.
+  // Unlike inline expansions, these lookups do not count against
+  // MaxInlineExpansions because they happen for unrelated calls too.
+  mutable llvm::DenseMap<const FunctionDecl *, std::optional<unsigned>>
+      IdentityParamCache;
+  // Nesting depth of getIdentityInlineParamIndex() computations.
+  mutable unsigned IdentityProbeDepth = 0;
   // Results of evaluatePureExprRange() for calls of inline helpers, keyed by
   // makeInlineCallCacheKey(). The result of expanding a helper only depends
   // on the callee and on the ranges of its arguments. Caching it keeps calls
@@ -1583,6 +1613,8 @@ public:
     InlineExpansionScope &operator=(const InlineExpansionScope &) = delete;
   };
 
+  std::optional<TrivialInlineBody>
+  lookupTrivialInlineBody(const CallExpr *CallExp) const;
   // Whether evaluatePureExprRange() may assume that dereferenced pointers
   // are not null. Only set while evaluating return values such that null
   // checks after a dereference remain feasible.
@@ -2464,6 +2496,13 @@ bool ThreadSafetyAnalyzer::IntRangeSet::isSingleValue(llvm::APSInt &Val) const {
   return true;
 }
 
+static ThreadSafetyAnalyzer::IntRangeSet
+reprojectRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                  const ThreadSafetyAnalyzer::IntDomain &Dom);
+static ThreadSafetyAnalyzer::IntRangeSet
+castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                     QualType DstTy, const ASTContext &Ctx);
+
 static const Expr *stripNoOpExprWrappers(const Expr *E);
 
 static bool isBuiltinExpectCall(const CallExpr *CallExp) {
@@ -2472,16 +2511,40 @@ static bool isBuiltinExpectCall(const CallExpr *CallExp) {
          BuiltinID == Builtin::BI__builtin_expect_with_probability;
 }
 
+/// Whether \p CE converts a pointer into a signed integer as wide as a
+/// pointer, e.g. (intptr_t)ptr or (long)ptr.
+static bool isSignedPointerToIntptrCast(const CastExpr *CE,
+                                        const ASTContext &Ctx) {
+  return CE->getCastKind() == CK_PointerToIntegral &&
+         CE->getSubExpr()->getType()->isAnyPointerType() &&
+         CE->getType()->isSignedIntegerOrEnumerationType() &&
+         Ctx.getIntWidth(CE->getType()) ==
+             Ctx.getIntWidth(Ctx.getUIntPtrType());
+}
+
+/// Translate the comparison (signed)ptr Op K, where the cast satisfies
+/// isSignedPointerToIntptrCast(), into the set of pointer values in \p Dom.
+static ThreadSafetyAnalyzer::IntRangeSet signedPointerCmpRangeSet(
+    const CastExpr *CE, BinaryOperator::Opcode Op, const llvm::APSInt &K,
+    const ThreadSafetyAnalyzer::IntDomain &Dom, const ASTContext &Ctx) {
+  auto SignedDom = ThreadSafetyAnalyzer::IntDomain::forType(CE->getType(), Ctx);
+  return reprojectRangeSet(
+      castIntegralRangeSet(
+          ThreadSafetyAnalyzer::IntRangeSet::forComparison(SignedDom, Op, K),
+          Ctx.getUIntPtrType(), Ctx),
+      Dom);
+}
+
 /// Skip the expressions that do not change the value of \p E: parentheses,
-/// full expressions, value-preserving casts, __builtin_expect() and
-/// statement expressions that consist of a single expression. If \p C is not
-/// null, also look through local variables to their known definitions and
-/// update \p C to the context of the definition. If \p IgnoreSideEffects is
-/// set, also look through assignments and statement expressions with
-/// multiple statements. That is only correct if the caller does not reason
-/// about the values of variables, e.g. if it only determines the call that
-/// produced a value. Returns the first expression that is not such a
-/// wrapper.
+/// full expressions, value-preserving casts, __builtin_expect(), statement
+/// expressions that consist of a single expression and calls of inline
+/// helpers that return their argument unchanged. If \p C is not null, also
+/// look through local variables to their known definitions and update \p C
+/// to the context of the definition. If \p IgnoreSideEffects is set, also
+/// look through assignments and statement expressions with multiple
+/// statements. That is only correct if the caller does not reason about the
+/// values of variables, e.g. if it only determines the call that produced a
+/// value. Returns the first expression that is not such a wrapper.
 const Expr *ThreadSafetyAnalyzer::skipValuePreservingWrappers(
     const Expr *E, LocalVarContext *C, bool IgnoreSideEffects) const {
   while (E) {
@@ -2519,6 +2582,10 @@ const Expr *ThreadSafetyAnalyzer::skipValuePreservingWrappers(
         E = CallExp->getArg(0);
         continue;
       }
+      if (auto ParamIdx = getIdentityInlineParamIndex(CallExp)) {
+        E = CallExp->getArg(*ParamIdx);
+        continue;
+      }
       return E;
     }
     return E;
@@ -2527,21 +2594,50 @@ const Expr *ThreadSafetyAnalyzer::skipValuePreservingWrappers(
 }
 
 const CallExpr *
+ThreadSafetyAnalyzer::unwrapValuePreservingToCallExpr(const Expr *E,
+                                                      LocalVarContext &C) {
+  return dyn_cast_or_null<CallExpr>(skipValuePreservingWrappers(E, &C));
+}
+
+const CallExpr *
 ThreadSafetyAnalyzer::unwrapTrylockValueExpr(const Expr *E, LocalVarContext C) {
-  const auto *CallExp =
-      dyn_cast_or_null<CallExpr>(skipValuePreservingWrappers(E, &C));
+  const CallExpr *CallExp = unwrapValuePreservingToCallExpr(E, C);
   return getRangeTrylockCallee(CallExp) ? CallExp : nullptr;
 }
 
 bool ThreadSafetyAnalyzer::isGuaranteedZeroOrOneExpr(const Expr *E,
-                                                     LocalVarContext C) {
-  if (E && E->getType()->isBooleanType())
-    return true;
+                                                     LocalVarContext C,
+                                                     unsigned Depth) {
+  if (!E || Depth > MaxZeroOrOneDepth)
+    return false;
+  auto IsZeroOrOneLeaf = [&](const Expr *Leaf) -> std::optional<bool> {
+    if (Leaf->getType()->isBooleanType())
+      return true;
+    if (Leaf->getType()->isIntegralOrEnumerationType())
+      if (auto ICE = Leaf->getIntegerConstantExpr(*ASTCtx))
+        return *ICE == 0 || *ICE == 1;
+    return std::nullopt;
+  };
+  if (auto Res = IsZeroOrOneLeaf(E))
+    return *Res;
   E = skipValuePreservingWrappers(E, &C);
   if (!E)
     return false;
-  if (E->getType()->isBooleanType())
-    return true;
+  if (auto Res = IsZeroOrOneLeaf(E))
+    return *Res;
+  if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+    auto InlineInfo = getCachedTrivialInlineBody(CallExp);
+    if (!InlineInfo)
+      return false;
+    InlineExpansionScope Scope(*this, InlineInfo->DefFD);
+    LocalVarContext EmptyCtx = LocalVarMap.getEmptyContext();
+    if (InlineInfo->SingleRet)
+      return isGuaranteedZeroOrOneExpr(InlineInfo->SingleRet, EmptyCtx,
+                                       Depth + 1);
+    return isGuaranteedZeroOrOneExpr(InlineInfo->ThenRet, EmptyCtx,
+                                     Depth + 1) &&
+           isGuaranteedZeroOrOneExpr(InlineInfo->ElseRet, EmptyCtx, Depth + 1);
+  }
   if (const auto *UOP = dyn_cast<UnaryOperator>(E))
     return UOP->getOpcode() == UO_LNot;
   if (const auto *BOP = dyn_cast<BinaryOperator>(E))
@@ -2604,7 +2700,9 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
       return {CallExp, Callee, std::move(Dom), std::move(TrueSet),
               std::move(FalseSet)};
     }
-    return {};
+    if (auto ParamIdx = getIdentityInlineParamIndex(CallExp))
+      return evaluateTrylockRangeCond(CallExp->getArg(*ParamIdx), C);
+    return evaluateInlineCallRangeCond(CallExp, C);
   }
 
   if (const auto *UOP = dyn_cast<UnaryOperator>(Cond)) {
@@ -2642,39 +2740,91 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
         return std::nullopt;
       };
       const CallExpr *CallExp = nullptr;
+      LocalVarContext CallCtx = C;
       BinaryOperator::Opcode CmpOp = BOP->getOpcode();
       std::optional<llvm::APSInt> ConstVal;
-      if (const CallExpr *LHSVal = unwrapTrylockValueExpr(BOP->getLHS(), C)) {
-        ConstVal = EvalConstSide(BOP->getRHS());
-        if (ConstVal)
-          CallExp = LHSVal;
+      {
+        LocalVarContext LHSCtx = C;
+        if (const CallExpr *LHSVal =
+                unwrapValuePreservingToCallExpr(BOP->getLHS(), LHSCtx)) {
+          ConstVal = EvalConstSide(BOP->getRHS());
+          if (ConstVal) {
+            CallExp = LHSVal;
+            CallCtx = LHSCtx;
+          }
+        }
       }
       if (!CallExp) {
-        if (const CallExpr *RHSVal = unwrapTrylockValueExpr(BOP->getRHS(), C)) {
+        LocalVarContext RHSCtx = C;
+        if (const CallExpr *RHSVal =
+                unwrapValuePreservingToCallExpr(BOP->getRHS(), RHSCtx)) {
           ConstVal = EvalConstSide(BOP->getLHS());
           if (ConstVal) {
             CallExp = RHSVal;
+            CallCtx = RHSCtx;
             CmpOp = BinaryOperator::reverseComparisonOp(CmpOp);
           }
         }
       }
       if (CallExp && ConstVal) {
-        const NamedDecl *Callee = getRangeTrylockCallee(CallExp);
-        IntDomain Dom = *getScalarDomain(CallExp->getType());
-        IntRangeSet TrueSet = IntRangeSet::forComparison(Dom, CmpOp, *ConstVal);
-        IntRangeSet FalseSet = TrueSet.complement(Dom);
-        return {CallExp, Callee, std::move(Dom), std::move(TrueSet),
-                std::move(FalseSet)};
+        if (const NamedDecl *Callee = getRangeTrylockCallee(CallExp)) {
+          IntDomain Dom = *getScalarDomain(CallExp->getType());
+          IntRangeSet TrueSet =
+              IntRangeSet::forComparison(Dom, CmpOp, *ConstVal);
+          IntRangeSet FalseSet = TrueSet.complement(Dom);
+          return {CallExp, Callee, std::move(Dom), std::move(TrueSet),
+                  std::move(FalseSet)};
+        }
+        if (auto Res = evaluateInlineCallRangeCond(
+                CallExp, CallCtx, std::make_pair(CmpOp, *ConstVal));
+            Res.Call)
+          return Res;
       }
+
+      // Recognize pointer-to-intptr_t casts such as ((long)ptr < 0).
+      auto EvalSignedIntPtrCmp =
+          [&](const Expr *PtrSide, const Expr *ConstSide,
+              BinaryOperator::Opcode SideOp) -> TrylockRangeCondResult {
+        auto K = EvalConstSide(ConstSide);
+        if (!K)
+          return {};
+        LocalVarContext SubCtx = C;
+        const auto *CE = dyn_cast_or_null<CastExpr>(
+            skipValuePreservingWrappers(PtrSide, &SubCtx));
+        if (!CE || !isSignedPointerToIntptrCast(CE, *ASTCtx))
+          return {};
+        const CallExpr *PtrCall =
+            unwrapTrylockValueExpr(CE->getSubExpr(), SubCtx);
+        const NamedDecl *Callee = getRangeTrylockCallee(PtrCall);
+        if (!Callee)
+          return {};
+        IntDomain Dom = *getScalarDomain(PtrCall->getType());
+        IntRangeSet TrueSet =
+            signedPointerCmpRangeSet(CE, SideOp, *K, Dom, *ASTCtx);
+        IntRangeSet FalseSet = TrueSet.complement(Dom);
+        return {PtrCall, Callee, std::move(Dom), std::move(TrueSet),
+                std::move(FalseSet)};
+      };
+      if (auto Res = EvalSignedIntPtrCmp(BOP->getLHS(), BOP->getRHS(),
+                                         BOP->getOpcode());
+          Res.Call)
+        return Res;
+      if (auto Res = EvalSignedIntPtrCmp(
+              BOP->getRHS(), BOP->getLHS(),
+              BinaryOperator::reverseComparisonOp(BOP->getOpcode()));
+          Res.Call)
+        return Res;
 
       if (BOP->getOpcode() == BO_EQ || BOP->getOpcode() == BO_NE) {
         auto EvalBoolEq = [&](const Expr *BoolSide,
                               const Expr *ConstSide) -> TrylockRangeCondResult {
           auto K = ConstSide->getIntegerConstantExpr(*ASTCtx);
-          if (!K || !isGuaranteedZeroOrOneExpr(BoolSide, C))
+          if (!K)
             return {};
+          // Evaluate the trylock condition first such that conditions that
+          // are unrelated to range trylocks do not expand inline helpers.
           auto Res = evaluateTrylockRangeCond(BoolSide, C);
-          if (!Res.Call)
+          if (!Res.Call || !isGuaranteedZeroOrOneExpr(BoolSide, C))
             return {};
           if (*K == 1) {
             if (BOP->getOpcode() == BO_NE)
@@ -3460,19 +3610,25 @@ static std::string makeInlineCallCacheKey(
 }
 
 std::optional<TrivialInlineBody>
-ThreadSafetyAnalyzer::getCachedTrivialInlineBody(const CallExpr *CallExp) const {
+ThreadSafetyAnalyzer::lookupTrivialInlineBody(const CallExpr *CallExp) const {
   const FunctionDecl *FD = CallExp ? CallExp->getDirectCallee() : nullptr;
   if (!FD || CallExp->isTypeDependent() || CallExp->isValueDependent())
-    return std::nullopt;
-  if (InlineDepth >= MaxInlineDepth ||
-      InlineExpansionCount >= MaxInlineExpansions)
     return std::nullopt;
   std::pair<const FunctionDecl *, unsigned> Key(FD->getCanonicalDecl(),
                                                 CallExp->getNumArgs());
   auto [It, Inserted] = InlineBodyCache.try_emplace(Key);
   if (Inserted)
     It->second = getTrivialInlineBody(CallExp);
-  std::optional<TrivialInlineBody> Info = It->second;
+  return It->second;
+}
+
+std::optional<TrivialInlineBody>
+ThreadSafetyAnalyzer::getCachedTrivialInlineBody(
+    const CallExpr *CallExp) const {
+  if (InlineDepth >= MaxInlineDepth ||
+      InlineExpansionCount >= MaxInlineExpansions)
+    return std::nullopt;
+  std::optional<TrivialInlineBody> Info = lookupTrivialInlineBody(CallExp);
   // Do not expand recursive calls.
   if (Info && ActiveInlineCallees.contains(Info->DefFD))
     return std::nullopt;
@@ -4558,6 +4714,43 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
     Dst.UnmaterializedVarDefs.erase(VD);
 }
 
+/// If \p CallExp calls a trivial inline helper that returns its only argument
+/// unchanged, e.g. ERR_CAST(), return the index of that argument.
+std::optional<unsigned> ThreadSafetyAnalyzer::getIdentityInlineParamIndex(
+    const CallExpr *CallExp) const {
+  if (!CallExp || CallExp->getNumArgs() != 1 ||
+      !isRangeTrylockReturnType(CallExp->getType()))
+    return std::nullopt;
+  const FunctionDecl *FD = CallExp->getDirectCallee();
+  if (!FD || IdentityProbeDepth >= MaxIdentityProbeDepth)
+    return std::nullopt;
+  FD = FD->getCanonicalDecl();
+  if (auto It = IdentityParamCache.find(FD); It != IdentityParamCache.end())
+    return It->second;
+  // Mark the computation as in progress such that recursive helpers are not
+  // treated as identities.
+  IdentityParamCache[FD] = std::nullopt;
+  ++IdentityProbeDepth;
+  llvm::scope_exit PopProbe([&] { --IdentityProbeDepth; });
+
+  std::optional<unsigned> Res;
+  auto InlineInfo = lookupTrivialInlineBody(CallExp);
+  const auto *CS =
+      InlineInfo ? dyn_cast_or_null<CompoundStmt>(InlineInfo->DefFD->getBody())
+                 : nullptr;
+  if (InlineInfo && InlineInfo->SingleRet && CS && CS->size() == 1 &&
+      InlineInfo->DefFD->getNumParams() == 1) {
+    const ParmVarDecl *Param = InlineInfo->DefFD->getParamDecl(0);
+    const auto *DRE = dyn_cast_or_null<DeclRefExpr>(skipValuePreservingWrappers(
+        InlineInfo->SingleRet, /*C=*/nullptr, /*IgnoreSideEffects=*/false));
+    if (isRangeTrylockReturnType(Param->getType()) && DRE &&
+        DRE->getDecl()->getCanonicalDecl() == Param->getCanonicalDecl())
+      Res = 0;
+  }
+  IdentityParamCache[FD] = Res;
+  return Res;
+}
+
 /// Intersect the range of \p VD in \p State with \p Constraint, marking
 /// \p State as infeasible if the intersection is empty.
 static void
@@ -4574,6 +4767,294 @@ restrictVarRange(ThreadSafetyAnalyzer::TrylockValueState &State,
     State.Infeasible = true;
   else
     State.VarRanges[VD] = std::move(Restricted);
+}
+
+/// Constrain \p State such that \p VarSide EffectiveOp \p KVal holds. Returns
+/// whether \p VarSide could be related to tracked variables.
+bool ThreadSafetyAnalyzer::constrainExprComparison(
+    TrylockValueState &State, const Expr *VarSide,
+    BinaryOperator::Opcode EffectiveOp, const llvm::APSInt &KVal,
+    const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
+    unsigned Depth) const {
+  if (State.Infeasible || Depth > MaxConstrainExprDepth)
+    return false;
+
+  const Expr *E = VarSide;
+  while (E) {
+    if (const ValueDecl *VD = extractTrackableVarExpr(E, EscapedVars)) {
+      auto VarDom = getScalarDomain(VD->getType());
+      if (!VarDom)
+        return false;
+      if (E->getType()->isMemberPointerType() &&
+          ((EffectiveOp != BO_EQ && EffectiveOp != BO_NE) || KVal != 0))
+        return false;
+      restrictVarRange(State, VD, *VarDom,
+                       IntRangeSet::forComparison(*VarDom, EffectiveOp, KVal));
+      return true;
+    }
+
+    E = skipValuePreservingWrappers(E, /*C=*/nullptr,
+                                    /*IgnoreSideEffects=*/false);
+    if (!E)
+      return false;
+
+    if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      // A narrowing integral cast preserves the value if the operand fits.
+      if (CE->getCastKind() == CK_IntegralCast &&
+          CE->getType()->isIntegralOrEnumerationType() &&
+          !CE->getType()->isBooleanType() &&
+          CE->getSubExpr()->getType()->isIntegralOrEnumerationType()) {
+        IntDomain DstDom = IntDomain::forType(CE->getType(), *ASTCtx);
+        auto SubR = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+        if (SubR && SubR->subsetOf(DstDom.Lo, DstDom.Hi)) {
+          E = CE->getSubExpr();
+          continue;
+        }
+        return false;
+      }
+      if (isSignedPointerToIntptrCast(CE, *ASTCtx)) {
+        const ValueDecl *VD =
+            extractTrackableVarExpr(CE->getSubExpr(), EscapedVars);
+        auto VarDom = VD ? getScalarDomain(VD->getType()) : std::nullopt;
+        if (!VarDom)
+          return false;
+        restrictVarRange(
+            State, VD, *VarDom,
+            signedPointerCmpRangeSet(CE, EffectiveOp, KVal, *VarDom, *ASTCtx));
+        return true;
+      }
+      return false;
+    }
+
+    const auto *CallExp = dyn_cast<CallExpr>(E);
+    if (!CallExp || CallExp->getNumArgs() != 1)
+      return false;
+    // Translate the comparison of the result of a single-argument helper
+    // into a constraint on the variable passed to the helper.
+    const ValueDecl *CallerVD =
+        extractTrackableVarExpr(CallExp->getArg(0), EscapedVars);
+    auto CallerDom =
+        CallerVD ? getScalarDomain(CallerVD->getType()) : std::nullopt;
+    if (!CallerDom)
+      return false;
+    auto InlineInfo = getCachedTrivialInlineBody(CallExp);
+    if (!InlineInfo || !InlineInfo->SingleRet)
+      return false;
+    const auto *PVD =
+        cast<ValueDecl>(InlineInfo->DefFD->getParamDecl(0)->getCanonicalDecl());
+    auto PDom = getScalarDomain(PVD->getType());
+    if (!PDom)
+      return false;
+    IntRangeSet CallerCur = IntRangeSet::full(*CallerDom);
+    if (auto CIt = State.VarRanges.find(CallerVD); CIt != State.VarRanges.end())
+      CallerCur = CIt->second;
+    TrylockValueState SubState;
+    SubState.VarRanges[PVD] = reprojectRangeSet(CallerCur, *PDom);
+    InlineExpansionScope Scope(*this, InlineInfo->DefFD);
+    if (!constrainExprComparison(SubState, InlineInfo->SingleRet, EffectiveOp,
+                                 KVal, InlineInfo->CalleeEscaped, Depth + 1))
+      return false;
+    if (SubState.Infeasible)
+      State.Infeasible = true;
+    else if (auto PIt = SubState.VarRanges.find(PVD);
+             PIt != SubState.VarRanges.end())
+      restrictVarRange(State, CallerVD, *CallerDom,
+                       reprojectRangeSet(PIt->second, *CallerDom));
+    return true;
+  }
+  return false;
+}
+
+ThreadSafetyAnalyzer::TrylockRangeCondResult
+ThreadSafetyAnalyzer::evaluateInlineCallRangeCond(
+    const CallExpr *InlineCall, LocalVarContext C,
+    std::optional<std::pair<BinaryOperator::Opcode, llvm::APSInt>> OuterCmp) {
+  if (!InlineCall)
+    return {};
+  auto RetDomOpt = getScalarDomain(InlineCall->getType());
+  if (!RetDomOpt)
+    return {};
+
+  // Check arguments before inspecting the callee body so calls unrelated to
+  // range trylocks incur negligible overhead.
+  const CallExpr *TargetCall = nullptr;
+  SmallVector<unsigned, 2> TargetParamIndices;
+  for (unsigned I = 0, N = InlineCall->getNumArgs(); I < N; ++I) {
+    if (const CallExpr *ArgTrylock =
+            unwrapTrylockValueExpr(InlineCall->getArg(I), C)) {
+      if (TargetCall && TargetCall != ArgTrylock)
+        return {};
+      TargetCall = ArgTrylock;
+      TargetParamIndices.push_back(I);
+    }
+  }
+  if (!TargetCall)
+    return {};
+  const NamedDecl *TargetCallee = getRangeTrylockCallee(TargetCall);
+  if (!TargetCallee)
+    return {};
+
+  auto InlineInfo = getCachedTrivialInlineBody(InlineCall);
+  if (!InlineInfo)
+    return {};
+
+  IntDomain TargetDom = *getScalarDomain(TargetCall->getType());
+  const IntDomain &RetDom = *RetDomOpt;
+
+  TrylockValueState BaseCalleeState;
+  for (unsigned I = 0, N = InlineCall->getNumArgs(); I < N; ++I) {
+    const auto *PVD =
+        cast<ValueDecl>(InlineInfo->DefFD->getParamDecl(I)->getCanonicalDecl());
+    auto PDom = getScalarDomain(PVD->getType());
+    if (llvm::is_contained(TargetParamIndices, I)) {
+      if (!PDom)
+        return {};
+      BaseCalleeState.VarRanges[PVD] =
+          reprojectRangeSet(IntRangeSet::full(TargetDom), *PDom);
+    } else if (PDom) {
+      TrylockValueState EmptyState;
+      LocalVarContext ArgCtx = C;
+      const Expr *ArgE = skipValuePreservingWrappers(
+          InlineCall->getArg(I), &ArgCtx, /*IgnoreSideEffects=*/false);
+      if (auto ArgR =
+              ArgE ? evaluatePureExprRange(ArgE, EmptyState) : std::nullopt)
+        BaseCalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgR, *PDom);
+    }
+  }
+
+  InlineExpansionScope Scope(*this, InlineInfo->DefFD);
+
+  auto ConstrainRetExpr = [&](TrylockValueState &S, const Expr *RetE,
+                              bool WantTrue) {
+    if (S.Infeasible || !RetE)
+      return;
+    if (!OuterCmp) {
+      constrainLeafCondition(S, RetE, WantTrue, InlineInfo->CalleeEscaped,
+                             /*Depth=*/1);
+      return;
+    }
+    BinaryOperator::Opcode EffectiveOp =
+        WantTrue ? OuterCmp->first
+                 : BinaryOperator::negateComparisonOp(OuterCmp->first);
+    const llvm::APSInt &ConstK = OuterCmp->second;
+    IntRangeSet AllowedRet =
+        IntRangeSet::forComparison(RetDom, EffectiveOp, ConstK);
+    if (AllowedRet.empty()) {
+      S.Infeasible = true;
+      return;
+    }
+    if (auto Cur = evaluatePureExprRange(RetE, S, /*Depth=*/1)) {
+      if (reprojectRangeSet(*Cur, RetDom).intersect(AllowedRet).empty()) {
+        S.Infeasible = true;
+        return;
+      }
+    }
+    if (isGuaranteedZeroOrOneExpr(RetE, LocalVarMap.getEmptyContext(),
+                                  /*Depth=*/1)) {
+      llvm::APSInt Zero = llvm::APSInt::get(0);
+      llvm::APSInt One = llvm::APSInt::get(1);
+      bool CanBeZero = AllowedRet.intersects(Zero, Zero);
+      bool CanBeOne = AllowedRet.intersects(One, One);
+      if (!CanBeZero && !CanBeOne)
+        S.Infeasible = true;
+      else if (CanBeOne && !CanBeZero)
+        constrainLeafCondition(S, RetE, /*WantTrue=*/true,
+                               InlineInfo->CalleeEscaped, /*Depth=*/1);
+      else if (CanBeZero && !CanBeOne)
+        constrainLeafCondition(S, RetE, /*WantTrue=*/false,
+                               InlineInfo->CalleeEscaped, /*Depth=*/1);
+      return;
+    }
+    constrainExprComparison(S, RetE, EffectiveOp, ConstK,
+                            InlineInfo->CalleeEscaped, /*Depth=*/1);
+  };
+
+  // Return the values of the trylock result for which the helper may return
+  // a value that makes the condition evaluate to WantTrue, starting from
+  // the parameter ranges in Init.
+  auto EvalArm = [&](const TrylockValueState &Init,
+                     bool WantTrue) -> IntRangeSet {
+    TrylockValueState ArmState = Init;
+    if (InlineInfo->SingleRet) {
+      ConstrainRetExpr(ArmState, InlineInfo->SingleRet, WantTrue);
+    } else {
+      TrylockValueState TState = ArmState;
+      TrylockValueState FState = ArmState;
+      constrainLeafCondition(TState, InlineInfo->CondExpr, /*WantTrue=*/true,
+                             InlineInfo->CalleeEscaped, /*Depth=*/1);
+      if (!TState.Infeasible)
+        ConstrainRetExpr(TState, InlineInfo->ThenRet, WantTrue);
+      constrainLeafCondition(FState, InlineInfo->CondExpr, /*WantTrue=*/false,
+                             InlineInfo->CalleeEscaped, /*Depth=*/1);
+      if (!FState.Infeasible)
+        ConstrainRetExpr(FState, InlineInfo->ElseRet, WantTrue);
+      ArmState.Infeasible = true;
+      unionIntoValueState(ArmState, TState, *ASTCtx);
+      unionIntoValueState(ArmState, FState, *ASTCtx);
+    }
+    if (ArmState.Infeasible)
+      return {};
+    IntRangeSet Allowed = IntRangeSet::full(TargetDom);
+    for (unsigned ParamIdx : TargetParamIndices) {
+      const auto *PVD = cast<ValueDecl>(
+          InlineInfo->DefFD->getParamDecl(ParamIdx)->getCanonicalDecl());
+      if (auto It = ArmState.VarRanges.find(PVD);
+          It != ArmState.VarRanges.end())
+        Allowed = Allowed.intersect(reprojectRangeSet(It->second, TargetDom));
+    }
+    return Allowed;
+  };
+
+  IntRangeSet TrueSet, FalseSet;
+  IntRangeSet FullDom = IntRangeSet::full(TargetDom);
+  if (TargetParamIndices.size() == 1) {
+    TrueSet = EvalArm(BaseCalleeState, /*WantTrue=*/true);
+    FalseSet = EvalArm(BaseCalleeState, /*WantTrue=*/false);
+  } else {
+    // All target parameters receive the same value, but the parameter
+    // ranges are tracked independently. Hence a condition that combines
+    // several target parameters, e.g. the disjunction in the false branch of
+    // IS_ERR(a) && IS_ERR(b), constrains none of them. Evaluate the helper
+    // separately for each piece of the partition of the trylock result range
+    // induced by the success ranges of the trylock function such that all
+    // target parameters are known to be in the same piece. Whether the
+    // capability is held only depends on the piece of the result.
+    SmallVector<IntRangeSet, 4> Pieces{FullDom};
+    for (const auto *Attr :
+         TargetCallee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
+      if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue())
+        continue;
+      auto First =
+          Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+      auto Last = Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+      if (!First || !Last)
+        continue;
+      IntRangeSet Success = IntRangeSet::closedRange(TargetDom, *First, *Last);
+      IntRangeSet Failure = Success.complement(TargetDom);
+      SmallVector<IntRangeSet, 4> Refined;
+      for (const IntRangeSet &Piece : Pieces)
+        for (const IntRangeSet *Part : {&Success, &Failure})
+          if (IntRangeSet Sub = Piece.intersect(*Part); !Sub.empty())
+            Refined.push_back(std::move(Sub));
+      Pieces = std::move(Refined);
+    }
+    for (const IntRangeSet &Piece : Pieces) {
+      TrylockValueState Init = BaseCalleeState;
+      for (unsigned ParamIdx : TargetParamIndices) {
+        const auto *PVD = cast<ValueDecl>(
+            InlineInfo->DefFD->getParamDecl(ParamIdx)->getCanonicalDecl());
+        Init.VarRanges[PVD] =
+            reprojectRangeSet(Piece, *getScalarDomain(PVD->getType()));
+      }
+      TrueSet = TrueSet.unionWith(EvalArm(Init, /*WantTrue=*/true));
+      FalseSet = FalseSet.unionWith(EvalArm(Init, /*WantTrue=*/false));
+    }
+  }
+  if (TrueSet.subsetOfSet(FullDom) && FullDom.subsetOfSet(TrueSet) &&
+      FalseSet.subsetOfSet(FullDom) && FullDom.subsetOfSet(FalseSet))
+    return {};
+  return {TargetCall, TargetCallee, std::move(TargetDom), std::move(TrueSet),
+          std::move(FalseSet)};
 }
 
 void ThreadSafetyAnalyzer::constrainLeafCondition(
@@ -4905,13 +5386,6 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
     if (BO->isComparisonOp()) {
       auto TryConstrainVarCmp = [&](const Expr *VarSide, const Expr *ConstSide,
                                     BinaryOperator::Opcode CmpOp) -> bool {
-        const ValueDecl *VD = extractTrackableVarExpr(VarSide, EscapedVars);
-        if (!VD)
-          return false;
-        auto VarDom = getScalarDomain(VD->getType());
-        if (!VarDom)
-          return false;
-
         std::optional<llvm::APSInt> KVal;
         if (auto R = evaluatePureExprRange(ConstSide, State, Depth + 1)) {
           llvm::APSInt SingleK;
@@ -4920,19 +5394,10 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
         }
         if (!KVal)
           return false;
-
-        bool IsMemberPtr = VarSide->getType()->isMemberPointerType();
-        if (IsMemberPtr && CmpOp != BO_EQ && CmpOp != BO_NE)
-          return false;
-        if (IsMemberPtr && *KVal != 0)
-          return false;
-
-        IntRangeSet Constraint =
-            IntRangeSet::forComparison(*VarDom, CmpOp, *KVal);
-        if (!WantTrue)
-          Constraint = Constraint.complement(*VarDom);
-        restrictVarRange(State, VD, *VarDom, Constraint);
-        return true;
+        BinaryOperator::Opcode EffectiveOp =
+            WantTrue ? CmpOp : BinaryOperator::negateComparisonOp(CmpOp);
+        return constrainExprComparison(State, VarSide, EffectiveOp, *KVal,
+                                       EscapedVars, Depth + 1);
       };
 
       if (TryConstrainVarCmp(BO->getLHS(), BO->getRHS(), BO->getOpcode()))
@@ -5552,6 +6017,8 @@ bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
   }
 
   if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+    if (CallExp->isUnevaluatedBuiltinCall(*ASTCtx))
+      return false;
     unsigned BuiltinID = CallExp->getBuiltinCallee();
     if (BuiltinID == Builtin::BI__builtin_expect ||
         BuiltinID == Builtin::BI__builtin_expect_with_probability)
@@ -5570,6 +6037,10 @@ bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
             return true;
       }
     }
+    for (const Expr *Arg : CallExp->arguments())
+      if (exprHasUnmaterializedTrylock(Arg, Ctx, State, UseStateDefs,
+                                       Depth + 1))
+        return true;
     return false;
   }
 
@@ -5634,7 +6105,8 @@ void ThreadSafetyAnalyzer::evaluateReturnWithPendingTrylocks(
       const auto *VD = cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
       if (auto It = State.UnmaterializedVarDefs.find(VD);
           It != State.UnmaterializedVarDefs.end())
-        ReferencedDefs.insert(It->second.first);
+        if (ReferencedDefs.insert(It->second.first).second)
+          Self(Self, It->second.first);
     }
     for (const Stmt *Child : S->children())
       Self(Self, Child);
@@ -6317,13 +6789,96 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       return;
     }
 
-    std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
-    if (Handler.issueBetaWarnings()) {
-      SxBuilder.setLookupLocalVarExpr(
-          [this, LookupCtx = Ctx](const NamedDecl *D) mutable -> const Expr * {
-            return LocalVarMap.lookupExpr(D, LookupCtx);
-          });
-      Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
+    if (!Callee->hasAttr<TryAcquireCapabilityAttr>() &&
+        !Callee->hasAttr<TryAcquireCapabilityRangeAttr>()) {
+      if (auto InlineInfo = getCachedTrivialInlineBody(CallExp)) {
+        struct InlineArgBranch {
+          FactSet Lockset;
+          SmallVector<PendingTrylockAcquire, 2> Pending;
+          TrylockValueState CalleeState;
+        };
+        SmallVector<InlineArgBranch, 2> Branches;
+        Branches.push_back({InLockset,
+                            SmallVector<PendingTrylockAcquire, 2>(
+                                InPending.begin(), InPending.end()),
+                            {}});
+        bool ArgsSupported = true;
+        for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
+          const auto *PVD = cast<ValueDecl>(
+              InlineInfo->DefFD->getParamDecl(I)->getCanonicalDecl());
+          auto PDom = getScalarDomain(PVD->getType());
+          if (!PDom) {
+            if (exprHasUnmaterializedTrylock(CallExp->getArg(I), Ctx, State,
+                                             UseVarRanges, Depth + 1)) {
+              ArgsSupported = false;
+              break;
+            }
+            continue;
+          }
+          SmallVector<InlineArgBranch, 2> NextBranches;
+          for (const InlineArgBranch &B : Branches) {
+            SmallVector<ReturnEvalOutcome, 2> ArgOuts;
+            evaluateReturnOutcomes(CallExp->getArg(I), *PDom, B.Lockset,
+                                   B.Pending, State, Ctx, UseVarRanges, ArgOuts,
+                                   Depth + 1);
+            for (ReturnEvalOutcome &AO : ArgOuts) {
+              InlineArgBranch NB;
+              NB.Lockset = std::move(AO.Lockset);
+              NB.Pending = std::move(AO.PendingAcquires);
+              NB.CalleeState = B.CalleeState;
+              NB.CalleeState.VarRanges[PVD] = std::move(AO.Values);
+              NextBranches.push_back(std::move(NB));
+            }
+          }
+          if (NextBranches.size() > MaxReturnOutcomes) {
+            ArgsSupported = false;
+            break;
+          }
+          Branches = std::move(NextBranches);
+        }
+
+        if (ArgsSupported) {
+          InlineExpansionScope Scope(*this, InlineInfo->DefFD);
+          llvm::SaveAndRestore AssumeNonNull(AssumeDerefNonNull, true);
+
+          auto EmitCalleeRet =
+              [&](const Expr *RetE, const TrylockValueState &CS,
+                  const FactSet &LS, ArrayRef<PendingTrylockAcquire> PA) {
+                auto R = evaluatePureExprRange(RetE, CS, Depth + 1);
+                IntRangeSet Vals = R ? reprojectRangeSet(*R, TargetDom)
+                                     : IntRangeSet::full(TargetDom);
+                if (!Vals.empty()) {
+                  ReturnEvalOutcome O;
+                  O.Values = std::move(Vals);
+                  O.Lockset = LS;
+                  O.PendingAcquires.assign(PA.begin(), PA.end());
+                  Out.push_back(std::move(O));
+                }
+              };
+
+          for (const InlineArgBranch &B : Branches) {
+            if (InlineInfo->SingleRet) {
+              EmitCalleeRet(InlineInfo->SingleRet, B.CalleeState, B.Lockset,
+                            B.Pending);
+              continue;
+            }
+            TrylockValueState TState = B.CalleeState;
+            TrylockValueState FState = B.CalleeState;
+            constrainLeafCondition(TState, InlineInfo->CondExpr,
+                                   /*WantTrue=*/true, InlineInfo->CalleeEscaped,
+                                   Depth + 1);
+            constrainLeafCondition(FState, InlineInfo->CondExpr,
+                                   /*WantTrue=*/false,
+                                   InlineInfo->CalleeEscaped, Depth + 1);
+            if (!TState.Infeasible)
+              EmitCalleeRet(InlineInfo->ThenRet, TState, B.Lockset, B.Pending);
+            if (!FState.Infeasible)
+              EmitCalleeRet(InlineInfo->ElseRet, FState, B.Lockset, B.Pending);
+          }
+          ApplyExprConstraint();
+          return;
+        }
+      }
     }
 
     SmallVector<ReturnEvalOutcome, 2> CallOutcomes;
@@ -6332,6 +6887,39 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     InitO.Lockset = InLockset;
     InitO.PendingAcquires.assign(InPending.begin(), InPending.end());
     CallOutcomes.push_back(std::move(InitO));
+
+    for (const Expr *Arg : CallExp->arguments()) {
+      if (!exprHasUnmaterializedTrylock(Arg, Ctx, State, UseVarRanges,
+                                        Depth + 1))
+        continue;
+      auto ArgDom = getScalarDomain(Arg->getType());
+      if (!ArgDom)
+        continue;
+      SmallVector<ReturnEvalOutcome, 2> Next;
+      for (const ReturnEvalOutcome &CO : CallOutcomes) {
+        SmallVector<ReturnEvalOutcome, 2> ArgOuts;
+        evaluateReturnOutcomes(Arg, *ArgDom, CO.Lockset, CO.PendingAcquires,
+                               State, Ctx, UseVarRanges, ArgOuts, Depth + 1);
+        for (ReturnEvalOutcome &AO : ArgOuts) {
+          ReturnEvalOutcome Forked;
+          Forked.Values = IntRangeSet::full(TargetDom);
+          Forked.Lockset = std::move(AO.Lockset);
+          Forked.PendingAcquires = std::move(AO.PendingAcquires);
+          Next.push_back(std::move(Forked));
+        }
+      }
+      if (!Next.empty() && Next.size() <= MaxReturnOutcomes)
+        CallOutcomes = std::move(Next);
+    }
+
+    std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
+    if (Handler.issueBetaWarnings()) {
+      SxBuilder.setLookupLocalVarExpr(
+          [this, LookupCtx = Ctx](const NamedDecl *D) mutable -> const Expr * {
+            return LocalVarMap.lookupExpr(D, LookupCtx);
+          });
+      Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
+    }
 
     SmallVector<TrylockExitSpec, 2> CallSpecs;
     SmallVector<std::pair<CapabilityExpr, LockKind>, 2> AlreadyAcquiredCaps;
@@ -7837,6 +8425,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   SwitchTables.clear();
   InlineBodyCache.clear();
   InlineExpansionCount = 0;
+  IdentityParamCache.clear();
   InlineCallRangeCache.clear();
   InlineCondCache.clear();
   CurrentFunction = dyn_cast<FunctionDecl>(D);

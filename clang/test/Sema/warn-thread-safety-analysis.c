@@ -1454,6 +1454,256 @@ void test_ptr_range_callers_c(int ok, int mode) {
   }
 }
 
+// Inline helper expansion (IS_ERR, IS_ERR_OR_NULL, PTR_ERR, PTR_ERR_OR_ZERO,
+// ERR_CAST) in caller-side range trylock conditions and trylock bodies.
+static inline _Bool c_is_err_or_null(const void *ptr) {
+  return TEST_UNLIKELY_STMTEXPR(!ptr) ||
+         c_is_err_value((__UINTPTR_TYPE__)ptr);
+}
+
+static inline void *c_err_cast(const void *ptr) {
+  return (void *)ptr;
+}
+
+static inline int c_is_err_int(const void *ptr) {
+  return (__UINTPTR_TYPE__)ptr >= (__UINTPTR_TYPE__)-4095;
+}
+
+static inline _Bool c_recursive_ptr_helper(const void *ptr) {
+  if (c_recursive_ptr_helper(ptr))
+    return 1;
+  return c_recursive_ptr_helper(ptr);
+}
+
+_Bool c_opaque_is_err(const void *ptr);
+int c_opaque_err_or_zero(const void *ptr);
+
+void test_inline_helper_range_callers_c(int ok, int mode) {
+  // Direct call passed to IS_ERR() (matches Linux debug_populate()).
+  if (c_is_err(c_ptr_range_lock_live(ok)))
+    return;
+  work_data = 10;
+  mutex_unlock(&mu1);
+
+  // Local variable passed to IS_ERR() (matches Linux cgroup_masks_read()).
+  struct CGroupObj *cgrp = c_ptr_range_lock_live(ok);
+  if (!c_is_err(cgrp)) {
+    work_data = 11;
+    mutex_unlock(&mu1);
+  }
+
+  // Wrong branch of IS_ERR() must warn.
+  struct CGroupObj *cgrp_bad = c_ptr_range_lock_live(ok);
+  if (c_is_err(cgrp_bad)) {
+    work_data = 12; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  } else {
+    mutex_unlock(&mu1);
+  }
+
+  // IS_ERR_OR_NULL() on [1, -4096].
+  struct CGroupObj *sc = c_ptr_range_shared_nonnull(mode);
+  if (!c_is_err_or_null(sc)) {
+    int v = work_data;
+    (void)v;
+    mutex_unlock(&mu1);
+  }
+
+  // IS_ERR() alone is insufficient when NULL (0) is outside [1, -4096].
+  struct CGroupObj *sc_bad = c_ptr_range_shared_nonnull(mode);
+  if (!c_is_err(sc_bad)) {
+    int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+    (void)v;
+  }
+
+  // ERR_CAST() identity wrapper in both direct and local-variable forms.
+  if (!c_is_err(c_err_cast(c_ptr_range_lock_live(ok)))) {
+    work_data = 13;
+    mutex_unlock(&mu1);
+  }
+  void *ec = c_err_cast(c_ptr_range_lock_live(ok));
+  if (!c_is_err(ec)) {
+    work_data = 14;
+    mutex_unlock(&mu1);
+  }
+
+  // PTR_ERR_OR_ZERO() in boolean and comparison contexts, including SSA
+  // tracking when the pointer variable is reassigned before the branch.
+  if (!c_ptr_err_or_zero(c_ptr_range_lock_live(ok))) {
+    work_data = 15;
+    mutex_unlock(&mu1);
+  }
+  struct CGroupObj *reassigned = c_ptr_range_lock_live(ok);
+  int err = c_ptr_err_or_zero(reassigned);
+  reassigned = 0;
+  if (err == 0) {
+    work_data = 16;
+    mutex_unlock(&mu1);
+  }
+  if (c_ptr_err_or_zero(c_ptr_range_lock_live(ok)) >= 0) {
+    work_data = 17;
+    mutex_unlock(&mu1);
+  }
+
+  // PTR_ERR() signed intptr_t comparison and int-returning predicate == 0.
+  __INTPTR_TYPE__ pe = c_ptr_err(c_ptr_range_lock_live(ok));
+  if (!(pe >= -4095 && pe < 0)) {
+    work_data = 18;
+    mutex_unlock(&mu1);
+  }
+  if (c_is_err_int(c_ptr_range_lock_live(ok)) == 0) {
+    work_data = 19;
+    mutex_unlock(&mu1);
+  }
+
+  // Opaque and recursive helpers must not falsely acquire the capability.
+  if (!c_opaque_is_err(c_ptr_range_lock_live(ok))) {
+    work_data = 20; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+  if (!c_recursive_ptr_helper(c_ptr_range_lock_live(ok))) {
+    work_data = 21; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+}
+
+int c_delegate_ptr_err_or_zero_direct_valid(int ok)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return c_ptr_err_or_zero(c_ptr_range_lock_live(ok));
+}
+
+int c_delegate_ptr_err_or_zero_vars_valid(int ok)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  struct CGroupObj *p = c_ptr_range_lock_live(ok);
+  int err = c_ptr_err_or_zero(p);
+  return err;
+}
+
+void *c_delegate_err_cast_valid(int ok)
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1))) {
+  void *p = c_err_cast(c_ptr_range_lock_live(ok));
+  if (c_is_err(p))
+    return p;
+  work_data = 22;
+  return p;
+}
+
+int c_delegate_opaque_helper_bad(int ok) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return c_opaque_err_or_zero(c_ptr_range_lock_live(ok)); // \
+    // expected-note{{mutex acquired here}} \
+    // expected-warning{{mutex 'mu1' is still held at the end of function}} \
+    // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+// Conditions that call helpers that are unrelated to range trylocks must not
+// use up the inline expansion budget of the analyzed function.
+void test_inline_budget_unrelated_calls_c(int ok) {
+  C_REP1024(if (c_unrelated_helper(c_unrelated_data)) c_unrelated_data = 0;)
+  C_REP1024(if (c_unrelated_helper(c_unrelated_data) == 0) c_unrelated_data = 1;)
+  struct CGroupObj *cgrp = c_ptr_range_lock_live(ok);
+  if (c_is_err(cgrp))
+    return;
+  work_data = 30;
+  mutex_unlock(&mu1);
+}
+
+int c_delegate_budget_unrelated_calls(int ok)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  C_REP1024(if (c_unrelated_helper(c_unrelated_data)) c_unrelated_data = 0;)
+  return c_ptr_err_or_zero(c_ptr_range_lock_live(ok));
+}
+
+// Multiple arguments of one helper that are derived from range trylocks.
+static inline _Bool c_both_err(const void *a, const void *b) {
+  return c_is_err(a) && c_is_err(b);
+}
+
+static inline _Bool c_err_and_not_err(const void *a, const void *b) {
+  return c_is_err(a) && !c_is_err(b);
+}
+
+static inline _Bool c_both_err_mixed(const void *a, __UINTPTR_TYPE__ b) {
+  return c_is_err(a) && c_is_err_value(b);
+}
+
+void test_inline_helper_multi_trylock_args_c(int ok) {
+  // The results of two different trylock calls are not tracked.
+  if (!c_both_err(c_ptr_range_lock_live(ok), c_ptr_range_lock_live(ok))) {
+    work_data = 31; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+  // The same trylock result passed twice: the false branch of a && b only
+  // implies that a or b is not an error pointer, and since a == b, that the
+  // capability is held.
+  struct CGroupObj *p = c_ptr_range_lock_live(ok);
+  if (!c_both_err(p, p)) {
+    work_data = 32;
+    mutex_unlock(&mu1);
+  }
+  // Also for parameters of different types.
+  struct CGroupObj *q = c_ptr_range_lock_live(ok);
+  if (!c_both_err_mixed(q, (__UINTPTR_TYPE__)q)) {
+    work_data = 33;
+    mutex_unlock(&mu1);
+  }
+  // c_err_and_not_err(r, r) is always false, which says nothing about r.
+  struct CGroupObj *r = c_ptr_range_lock_live(ok);
+  if (!c_err_and_not_err(r, r)) {
+    work_data = 34; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+}
+
+// Signed pointer comparisons, e.g. (long)ptr < 0, in callers.
+void test_signed_ptr_cmp_callers_c(int ok) {
+  if ((__INTPTR_TYPE__)c_ptr_range_lock_live(ok) < 0)
+    return;
+  work_data = 33;
+  mutex_unlock(&mu1);
+
+  struct CGroupObj *p = c_ptr_range_lock_live(ok);
+  if (0 <= (__INTPTR_TYPE__)p) {
+    work_data = 34;
+    mutex_unlock(&mu1);
+  }
+
+  // [-4096, INTPTR_MAX] includes the error pointers [-4095, -1].
+  if ((__INTPTR_TYPE__)c_ptr_range_lock_live(ok) >= -4096) {
+    work_data = 35; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  } else {
+    work_data = 36;
+    mutex_unlock(&mu1);
+  }
+}
+
+// Value-changing argument conversions must not be looked through.
+long long c_llong_range_lock(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1)));
+static inline int c_is_zero_int(int v) { return v == 0; }
+static inline int c_is_zero_llong(long long v) { return v == 0; }
+
+void test_narrowing_helper_arg_c(void) {
+  // Truncation to int may map a nonzero value to zero.
+  if (c_is_zero_int(c_llong_range_lock())) {
+    work_data = 37; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+  long long r = c_llong_range_lock();
+  if (c_is_zero_int(r)) {
+    work_data = 38; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+  if (c_is_zero_llong(c_llong_range_lock())) {
+    work_data = 39;
+    mutex_unlock(&mu1);
+  }
+}
+
+// A recursive helper does not return its argument unchanged.
+static inline void *c_recursive_identity(const void *p) {
+  return c_recursive_identity(p);
+}
+
+void test_recursive_identity_helper_c(int ok) {
+  if (!c_is_err(c_recursive_identity(c_ptr_range_lock_live(ok)))) {
+    work_data = 40; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

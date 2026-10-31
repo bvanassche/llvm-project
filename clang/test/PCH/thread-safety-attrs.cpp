@@ -39,8 +39,14 @@ class  __attribute__((lockable)) Mutex {
   bool ReaderTryLock() __attribute__((shared_trylock_function(true)));
   int TryLockRange() __attribute__((try_acquire_capability_range(0, 1)));
   int ReaderTryLockRange() __attribute__((try_acquire_shared_capability_range(0, 1)));
+  void *TryLockPtrOrErr()
+      __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096)));
   void LockWhen(const int &cond) __attribute__((exclusive_lock_function));
 };
+
+inline bool pchIsErr(const void *p) {
+  return reinterpret_cast<__UINTPTR_TYPE__>(p) >= (__UINTPTR_TYPE__)-4095;
+}
 
 class __attribute__((scoped_lockable)) MutexLock {
  public:
@@ -337,6 +343,12 @@ void sls_trylock_range_ok() {
 void sls_trylock_range_bad() {
   if (sls_mu.TryLockRange() >= 0) {
     pch_protected = 1; // expected-warning{{writing variable 'pch_protected' requires holding mutex 'sls_mu' exclusively}}
+  }
+  if (pchIsErr(sls_mu.TryLockPtrOrErr())) {
+    pch_protected = 2; // expected-warning{{writing variable 'pch_protected' requires holding mutex 'sls_mu' exclusively}}
+  } else {
+    pch_protected = 3;
+    sls_mu.Unlock();
   }
 }
 

@@ -9832,6 +9832,37 @@ struct PtrRangeTryAcquireHolder {
     return p;
   }
 
+  static inline bool isErr(const void *p) {
+    return reinterpret_cast<__UINTPTR_TYPE__>(p) >= (__UINTPTR_TYPE__)-4095;
+  }
+
+  static inline bool isErrOrNull(const void *p) {
+    return p == nullptr || isErr(p);
+  }
+
+  template <typename T>
+  static constexpr void *errCast(const T *p) {
+    return const_cast<void *>(static_cast<const void *>(p));
+  }
+
+  static inline int ptrErrOrZero(const void *p) {
+    if (isErr(p))
+      return static_cast<int>(reinterpret_cast<__INTPTR_TYPE__>(p));
+    return 0;
+  }
+
+  int *tryLockOrErr(int mode)
+      TRY_ACQUIRE_RANGE(0, (__UINTPTR_TYPE__)-4096, mu) {
+    if (mode < 0)
+      return reinterpret_cast<int *>(static_cast<__INTPTR_TYPE__>(-16));
+    mu.Lock();
+    return &guarded;
+  }
+
+  int delegatePtrErrOrZero(int mode) TRY_ACQUIRE_RANGE(0, 0, mu) {
+    return ptrErrOrZero(tryLockOrErr(mode));
+  }
+
   void testCaller(int mode) {
     int *p = tryLockNonNullOrErr(mode);
     if (p != nullptr &&
@@ -9842,6 +9873,21 @@ struct PtrRangeTryAcquireHolder {
     int *p2 = tryLockNonNullOrErr(mode);
     if (p2 != nullptr) {
       guarded = 9; // expected-warning {{writing variable 'guarded' requires holding mutex 'mu' exclusively}}
+    }
+    if (!isErrOrNull(tryLockNonNullOrErr(mode))) {
+      guarded = 10;
+      mu.Unlock();
+    }
+    if (!isErr(errCast(tryLockOrErr(mode)))) {
+      guarded = 11;
+      mu.Unlock();
+    }
+    if (ptrErrOrZero(tryLockOrErr(mode)) == 0) {
+      guarded = 12;
+      mu.Unlock();
+    }
+    if (!isErr(tryLockNonNullOrErr(mode))) {
+      guarded = 13; // expected-warning {{writing variable 'guarded' requires holding mutex 'mu' exclusively}}
     }
   }
 };
