@@ -487,7 +487,7 @@ public:
   /// Look up the definition for D within the given context.  Returns
   /// NULL if the expression is not statically known.  If successful, also
   /// modifies Ctx to hold the context of the return Expr.
-  const Expr* lookupExpr(const NamedDecl *D, Context &Ctx) {
+  const Expr *lookupExpr(const NamedDecl *D, Context &Ctx) const {
     const unsigned *P = Ctx.lookup(D);
     if (!P)
       return nullptr;
@@ -1252,6 +1252,12 @@ private:
   }
 };
 
+/// The maximum nesting depth of inline helper expansion.
+static constexpr unsigned MaxInlineDepth = 4;
+/// The maximum number of inline helper expansions per analyzed function.
+/// Bounds the cost of analyzing helpers that call other helpers many times.
+static constexpr unsigned MaxInlineExpansions = 512;
+
 /// Class which implements the core thread safety analysis routines.
 /// The body of a trivial inline or constexpr function whose return value can
 /// be evaluated in terms of its parameters.
@@ -1437,6 +1443,8 @@ public:
 
   const CallExpr *getTrylockCallExpr(const Stmt *Cond, LocalVarContext C,
                                      bool &Negate);
+  const Expr *skipValuePreservingWrappers(const Expr *E, LocalVarContext *C,
+                                          bool IgnoreSideEffects = true) const;
   const CallExpr *unwrapTrylockValueExpr(const Expr *E, LocalVarContext C);
   bool isGuaranteedZeroOrOneExpr(const Expr *E, LocalVarContext C);
   TrylockRangeCondResult evaluateTrylockRangeCond(const Stmt *Cond,
@@ -1538,6 +1546,28 @@ public:
   mutable unsigned InlineDepth = 0;
   // The number of inline expansions performed for the current function.
   mutable unsigned InlineExpansionCount = 0;
+
+  /// Marks a function as being expanded inline for the lifetime of this
+  /// object, preventing recursive expansion and bounding the nesting depth.
+  class InlineExpansionScope {
+    const ThreadSafetyAnalyzer &Analyzer;
+    const FunctionDecl *FD;
+
+  public:
+    InlineExpansionScope(const ThreadSafetyAnalyzer &Analyzer,
+                         const FunctionDecl *FD)
+        : Analyzer(Analyzer), FD(FD) {
+      Analyzer.ActiveInlineCallees.insert(FD);
+      ++Analyzer.InlineDepth;
+    }
+    ~InlineExpansionScope() {
+      --Analyzer.InlineDepth;
+      Analyzer.ActiveInlineCallees.erase(FD);
+    }
+    InlineExpansionScope(const InlineExpansionScope &) = delete;
+    InlineExpansionScope &operator=(const InlineExpansionScope &) = delete;
+  };
+
   // Whether evaluatePureExprRange() may assume that dereferenced pointers
   // are not null. Only set while evaluating return values such that null
   // checks after a dereference remain feasible.
@@ -2419,107 +2449,88 @@ bool ThreadSafetyAnalyzer::IntRangeSet::isSingleValue(llvm::APSInt &Val) const {
   return true;
 }
 
-const CallExpr *
-ThreadSafetyAnalyzer::unwrapTrylockValueExpr(const Expr *E, LocalVarContext C) {
+static const Expr *stripNoOpExprWrappers(const Expr *E);
+
+static bool isBuiltinExpectCall(const CallExpr *CallExp) {
+  unsigned BuiltinID = CallExp->getBuiltinCallee();
+  return BuiltinID == Builtin::BI__builtin_expect ||
+         BuiltinID == Builtin::BI__builtin_expect_with_probability;
+}
+
+/// Skip the expressions that do not change the value of \p E: parentheses,
+/// full expressions, value-preserving casts, __builtin_expect() and
+/// statement expressions that consist of a single expression. If \p C is not
+/// null, also look through local variables to their known definitions and
+/// update \p C to the context of the definition. If \p IgnoreSideEffects is
+/// set, also look through assignments and statement expressions with
+/// multiple statements. That is only correct if the caller does not reason
+/// about the values of variables, e.g. if it only determines the call that
+/// produced a value. Returns the first expression that is not such a
+/// wrapper.
+const Expr *ThreadSafetyAnalyzer::skipValuePreservingWrappers(
+    const Expr *E, LocalVarContext *C, bool IgnoreSideEffects) const {
   while (E) {
-    if (const auto *PE = dyn_cast<ParenExpr>(E)) {
-      E = PE->getSubExpr();
-      continue;
-    }
-    if (const auto *FE = dyn_cast<FullExpr>(E)) {
-      E = FE->getSubExpr();
-      continue;
-    }
+    E = stripNoOpExprWrappers(E);
     if (const auto *CE = dyn_cast<CastExpr>(E)) {
-      if (isValuePreservingCast(CE, *ASTCtx)) {
-        E = CE->getSubExpr();
-        continue;
-      }
-      return nullptr;
+      if (!isValuePreservingCast(CE, *ASTCtx))
+        return E;
+      E = CE->getSubExpr();
+      continue;
     }
     if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
-      E = LocalVarMap.lookupExpr(DRE->getDecl(), C);
+      const Expr *Def =
+          C ? LocalVarMap.lookupExpr(DRE->getDecl(), *C) : nullptr;
+      if (!Def)
+        return E;
+      E = Def;
       continue;
     }
     if (const auto *BOP = dyn_cast<BinaryOperator>(E)) {
-      if (BOP->getOpcode() == BO_Assign && !BOP->getLHS()->refersToBitField()) {
-        E = BOP->getRHS();
-        continue;
-      }
-      return nullptr;
+      if (!IgnoreSideEffects || BOP->getOpcode() != BO_Assign ||
+          BOP->getLHS()->refersToBitField())
+        return E;
+      E = BOP->getRHS();
+      continue;
     }
     if (const auto *SE = dyn_cast<StmtExpr>(E)) {
-      if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
-        E = dyn_cast<Expr>(CS->body_back());
-        continue;
-      }
-      return nullptr;
+      const CompoundStmt *CS = SE->getSubStmt();
+      if (!CS || CS->body_empty() || (!IgnoreSideEffects && CS->size() != 1))
+        return E;
+      E = dyn_cast<Expr>(CS->body_back());
+      continue;
     }
     if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
-      unsigned BuiltinID = CallExp->getBuiltinCallee();
-      if (BuiltinID == Builtin::BI__builtin_expect ||
-          BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+      if (isBuiltinExpectCall(CallExp)) {
         E = CallExp->getArg(0);
         continue;
       }
-      return getRangeTrylockCallee(CallExp) ? CallExp : nullptr;
+      return E;
     }
-    return nullptr;
+    return E;
   }
   return nullptr;
 }
 
+const CallExpr *
+ThreadSafetyAnalyzer::unwrapTrylockValueExpr(const Expr *E, LocalVarContext C) {
+  const auto *CallExp =
+      dyn_cast_or_null<CallExpr>(skipValuePreservingWrappers(E, &C));
+  return getRangeTrylockCallee(CallExp) ? CallExp : nullptr;
+}
+
 bool ThreadSafetyAnalyzer::isGuaranteedZeroOrOneExpr(const Expr *E,
                                                      LocalVarContext C) {
-  while (E) {
-    if (E->getType()->isBooleanType())
-      return true;
-    if (const auto *PE = dyn_cast<ParenExpr>(E)) {
-      E = PE->getSubExpr();
-      continue;
-    }
-    if (const auto *FE = dyn_cast<FullExpr>(E)) {
-      E = FE->getSubExpr();
-      continue;
-    }
-    if (const auto *CE = dyn_cast<CastExpr>(E)) {
-      if (isValuePreservingCast(CE, *ASTCtx)) {
-        E = CE->getSubExpr();
-        continue;
-      }
-      return false;
-    }
-    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
-      E = LocalVarMap.lookupExpr(DRE->getDecl(), C);
-      continue;
-    }
-    if (const auto *SE = dyn_cast<StmtExpr>(E)) {
-      if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
-        E = dyn_cast<Expr>(CS->body_back());
-        continue;
-      }
-      return false;
-    }
-    if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
-      unsigned BuiltinID = CallExp->getBuiltinCallee();
-      if (BuiltinID == Builtin::BI__builtin_expect ||
-          BuiltinID == Builtin::BI__builtin_expect_with_probability) {
-        E = CallExp->getArg(0);
-        continue;
-      }
-      return false;
-    }
-    if (const auto *UOP = dyn_cast<UnaryOperator>(E))
-      return UOP->getOpcode() == UO_LNot;
-    if (const auto *BOP = dyn_cast<BinaryOperator>(E)) {
-      if (BOP->getOpcode() == BO_Assign && !BOP->getLHS()->refersToBitField()) {
-        E = BOP->getRHS();
-        continue;
-      }
-      return BOP->isComparisonOp() || BOP->isLogicalOp();
-    }
+  if (E && E->getType()->isBooleanType())
+    return true;
+  E = skipValuePreservingWrappers(E, &C);
+  if (!E)
     return false;
-  }
+  if (E->getType()->isBooleanType())
+    return true;
+  if (const auto *UOP = dyn_cast<UnaryOperator>(E))
+    return UOP->getOpcode() == UO_LNot;
+  if (const auto *BOP = dyn_cast<BinaryOperator>(E))
+    return BOP->isComparisonOp() || BOP->isLogicalOp();
   return false;
 }
 
@@ -2568,9 +2579,7 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
   }
 
   if (const auto *CallExp = dyn_cast<CallExpr>(Cond)) {
-    unsigned BuiltinID = CallExp->getBuiltinCallee();
-    if (BuiltinID == Builtin::BI__builtin_expect ||
-        BuiltinID == Builtin::BI__builtin_expect_with_probability)
+    if (isBuiltinExpectCall(CallExp))
       return evaluateTrylockRangeCond(CallExp->getArg(0), C);
 
     if (const NamedDecl *Callee = getRangeTrylockCallee(CallExp)) {
@@ -3413,12 +3422,6 @@ getTrivialInlineBody(const CallExpr *CallExp) {
   return std::nullopt;
 }
 
-/// The maximum nesting depth of inline helper expansion.
-static constexpr unsigned MaxInlineDepth = 4;
-/// The maximum number of inline helper expansions per analyzed function.
-/// Bounds the cost of analyzing helpers that call other helpers many times.
-static constexpr unsigned MaxInlineExpansions = 512;
-
 std::optional<TrivialInlineBody>
 ThreadSafetyAnalyzer::getCachedTrivialInlineBody(const CallExpr *CallExp) const {
   const FunctionDecl *FD = CallExp ? CallExp->getDirectCallee() : nullptr;
@@ -4131,12 +4134,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
                 evaluatePureExprRange(CallExp->getArg(I), State, Depth + 1))
           CalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgR, *PDom);
       }
-      ActiveInlineCallees.insert(InlineInfo->DefFD);
-      ++InlineDepth;
-      llvm::scope_exit PopInline([&] {
-        --InlineDepth;
-        ActiveInlineCallees.erase(InlineInfo->DefFD);
-      });
+      InlineExpansionScope Scope(*this, InlineInfo->DefFD);
       if (InlineInfo->SingleRet) {
         auto RetR = evaluatePureExprRange(InlineInfo->SingleRet, CalleeState,
                                           Depth + 1);
@@ -4492,6 +4490,24 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
     Dst.UnmaterializedVarDefs.erase(VD);
 }
 
+/// Intersect the range of \p VD in \p State with \p Constraint, marking
+/// \p State as infeasible if the intersection is empty.
+static void
+restrictVarRange(ThreadSafetyAnalyzer::TrylockValueState &State,
+                 const ValueDecl *VD,
+                 const ThreadSafetyAnalyzer::IntDomain &Dom,
+                 const ThreadSafetyAnalyzer::IntRangeSet &Constraint) {
+  ThreadSafetyAnalyzer::IntRangeSet Cur =
+      ThreadSafetyAnalyzer::IntRangeSet::full(Dom);
+  if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
+    Cur = It->second;
+  ThreadSafetyAnalyzer::IntRangeSet Restricted = Cur.intersect(Constraint);
+  if (Restricted.empty())
+    State.Infeasible = true;
+  else
+    State.VarRanges[VD] = std::move(Restricted);
+}
+
 void ThreadSafetyAnalyzer::constrainLeafCondition(
     TrylockValueState &State, const Expr *Cond, bool WantTrue,
     const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
@@ -4564,12 +4580,7 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
                 evaluatePureExprRange(CallExp->getArg(I), State, Depth + 1))
           CalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgR, *PDom);
       }
-      ActiveInlineCallees.insert(InlineInfo->DefFD);
-      ++InlineDepth;
-      llvm::scope_exit PopInline([&] {
-        --InlineDepth;
-        ActiveInlineCallees.erase(InlineInfo->DefFD);
-      });
+      InlineExpansionScope Scope(*this, InlineInfo->DefFD);
       if (InlineInfo->SingleRet) {
         constrainLeafCondition(CalleeState, InlineInfo->SingleRet, WantTrue,
                                InlineInfo->CalleeEscaped, Depth + 1);
@@ -4605,17 +4616,10 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
         auto PIt = CalleeState.VarRanges.find(PVD);
         if (PIt == CalleeState.VarRanges.end())
           continue;
-        IntRangeSet Mapped = reprojectRangeSet(PIt->second, *CallerDom);
-        IntRangeSet Cur = IntRangeSet::full(*CallerDom);
-        if (auto CIt = State.VarRanges.find(CallerVD);
-            CIt != State.VarRanges.end())
-          Cur = CIt->second;
-        IntRangeSet Restricted = Cur.intersect(Mapped);
-        if (Restricted.empty()) {
-          State.Infeasible = true;
+        restrictVarRange(State, CallerVD, *CallerDom,
+                         reprojectRangeSet(PIt->second, *CallerDom));
+        if (State.Infeasible)
           return;
-        }
-        State.VarRanges[CallerVD] = std::move(Restricted);
       }
     }
     return;
@@ -4814,15 +4818,7 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
             IntRangeSet::forComparison(*VarDom, CmpOp, *KVal);
         if (!WantTrue)
           Constraint = Constraint.complement(*VarDom);
-
-        IntRangeSet Cur = IntRangeSet::full(*VarDom);
-        if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
-          Cur = It->second;
-        IntRangeSet Restricted = Cur.intersect(Constraint);
-        if (Restricted.empty())
-          State.Infeasible = true;
-        else
-          State.VarRanges[VD] = std::move(Restricted);
+        restrictVarRange(State, VD, *VarDom, Constraint);
         return true;
       };
 
@@ -5005,64 +5001,31 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
       [&](const Expr *E, LocalVarContext Ctx, QualType VarTy,
           bool &PreservesExactInt) -> const CallExpr * {
     PreservesExactInt = true;
-    while (E) {
-      E = stripNoOpExprWrappers(E);
-      if (const auto *CE = dyn_cast<CastExpr>(E)) {
-        if (isValuePreservingCast(CE, *ASTCtx)) {
-          E = CE->getSubExpr();
-          continue;
-        }
-        switch (CE->getCastKind()) {
-        case CK_DerivedToBase:
-        case CK_UncheckedDerivedToBase:
-          if (CE->getType()->isAnyPointerType() &&
-              CE->getSubExpr()->getType()->isAnyPointerType()) {
-            PreservesExactInt = false;
-            E = CE->getSubExpr();
-            continue;
-          }
-          return nullptr;
-        case CK_IntegralToBoolean:
-        case CK_PointerToBoolean:
-        case CK_MemberPointerToBoolean:
-          if (VarTy->isBooleanType()) {
-            PreservesExactInt = false;
-            E = CE->getSubExpr();
-            continue;
-          }
-          return nullptr;
-        default:
-          return nullptr;
-        }
-      }
-      if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
-        E = LocalVarMap.lookupExpr(DRE->getDecl(), Ctx);
-        continue;
-      }
-      if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
-        if (BO->getOpcode() == BO_Assign) {
-          E = BO->getRHS();
-          continue;
-        }
-        return nullptr;
-      }
-      if (const auto *SE = dyn_cast<StmtExpr>(E)) {
-        if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
-          E = dyn_cast<Expr>(CS->body_back());
-          continue;
-        }
-        return nullptr;
-      }
-      if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
-        unsigned BuiltinID = CallExp->getBuiltinCallee();
-        if (BuiltinID == Builtin::BI__builtin_expect ||
-            BuiltinID == Builtin::BI__builtin_expect_with_probability) {
-          E = CallExp->getArg(0);
-          continue;
-        }
+    while ((E = skipValuePreservingWrappers(E, &Ctx))) {
+      if (const auto *CallExp = dyn_cast<CallExpr>(E))
         return CallExp;
+      const auto *CE = dyn_cast<CastExpr>(E);
+      if (!CE)
+        return nullptr;
+      // Casts that preserve whether the value is zero, but not the value.
+      switch (CE->getCastKind()) {
+      case CK_DerivedToBase:
+      case CK_UncheckedDerivedToBase:
+        if (!CE->getType()->isAnyPointerType() ||
+            !CE->getSubExpr()->getType()->isAnyPointerType())
+          return nullptr;
+        break;
+      case CK_IntegralToBoolean:
+      case CK_PointerToBoolean:
+      case CK_MemberPointerToBoolean:
+        if (!VarTy->isBooleanType())
+          return nullptr;
+        break;
+      default:
+        return nullptr;
       }
-      return nullptr;
+      PreservesExactInt = false;
+      E = CE->getSubExpr();
     }
     return nullptr;
   };
