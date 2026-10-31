@@ -1141,6 +1141,39 @@ int c_trylock_ptr_err_or_zero_valid(void)
   return 0;
 }
 
+// Branch conditions that call inline helpers with arguments that are
+// unrelated to the tracked values must not use up the inline expansion
+// budget of the analyzed function (MaxInlineExpansions).
+static inline int c_unrelated_helper(int v) { return v + 1; }
+int c_unrelated_data;
+#define C_REP4(x) x x x x
+#define C_REP16(x) C_REP4(C_REP4(x))
+#define C_REP256(x) C_REP16(C_REP16(x))
+#define C_REP1024(x) C_REP4(C_REP256(x))
+
+int c_budget_unrelated_calls_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  C_REP1024(if (c_unrelated_helper(c_unrelated_data)) c_unrelated_data = 0;)
+  void *obj = c_lookup_obj();
+  if (c_is_err(obj))
+    return c_ptr_err_or_zero(obj);
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
+// Arguments with a constant range that is not the full range, e.g. the address
+// of a global variable, must not use up the budget either.
+static inline int c_unrelated_ptr_helper(int *p) { return *p != 0; }
+int c_budget_unrelated_addrof_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  C_REP1024(if (c_unrelated_ptr_helper(&c_unrelated_data)) c_unrelated_data = 0;)
+  void *obj = c_lookup_obj();
+  if (c_is_err(obj))
+    return c_ptr_err_or_zero(obj);
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
 int c_trylock_ptr_err_unchecked_bad(void) // expected-note{{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   // Without c_is_err(obj), obj may be NULL, so c_ptr_err(obj) may return 0!

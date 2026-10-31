@@ -1546,6 +1546,21 @@ public:
   mutable unsigned InlineDepth = 0;
   // The number of inline expansions performed for the current function.
   mutable unsigned InlineExpansionCount = 0;
+  // Results of evaluatePureExprRange() for calls of inline helpers, keyed by
+  // makeInlineCallCacheKey(). The result of expanding a helper only depends
+  // on the callee and on the ranges of its arguments. Caching it keeps calls
+  // that are repeated many times, e.g. in conditions unrelated to the tracked
+  // values, from exhausting MaxInlineExpansions.
+  mutable llvm::StringMap<std::optional<IntRangeSet>> InlineCallRangeCache;
+  // The effect of constrainLeafCondition() on the parameters of an inline
+  // helper whose call is used as a condition.
+  struct InlineCondResult {
+    bool Infeasible = false;
+    SmallVector<std::optional<IntRangeSet>, 4> ParamRanges;
+  };
+  // Results of constrainLeafCondition() for calls of inline helpers, keyed by
+  // makeInlineCallCacheKey().
+  mutable llvm::StringMap<InlineCondResult> InlineCondCache;
 
   /// Marks a function as being expanded inline for the lifetime of this
   /// object, preventing recursive expansion and bounding the nesting depth.
@@ -3422,6 +3437,28 @@ getTrivialInlineBody(const CallExpr *CallExp) {
   return std::nullopt;
 }
 
+/// Returns a key that identifies an inline expansion of \p FD for arguments
+/// with the ranges \p ArgRanges. \p Kind distinguishes the kinds of results
+/// that are cached.
+static std::string makeInlineCallCacheKey(
+    const FunctionDecl *FD, unsigned Kind,
+    ArrayRef<std::optional<ThreadSafetyAnalyzer::IntRangeSet>> ArgRanges) {
+  std::string Key;
+  llvm::raw_string_ostream OS(Key);
+  OS << static_cast<const void *>(FD->getCanonicalDecl()) << ':' << Kind;
+  for (const auto &R : ArgRanges) {
+    OS << '|';
+    if (!R) {
+      OS << '?';
+      continue;
+    }
+    for (const auto &[Lo, Hi] : R->intervals())
+      OS << Lo.getBitWidth() << (Lo.isUnsigned() ? 'u' : 's') << Lo << ',' << Hi
+         << ';';
+  }
+  return Key;
+}
+
 std::optional<TrivialInlineBody>
 ThreadSafetyAnalyzer::getCachedTrivialInlineBody(const CallExpr *CallExp) const {
   const FunctionDecl *FD = CallExp ? CallExp->getDirectCallee() : nullptr;
@@ -4122,17 +4159,45 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
         return std::nullopt;
       return castIntegralRangeSet(*Sub, CallExp->getType(), *ASTCtx);
     }
-    if (auto InlineInfo = getCachedTrivialInlineBody(CallExp)) {
+    // Evaluate the arguments first. The result of the expansion only depends
+    // on the callee and on the argument ranges. Look it up in the cache
+    // before getCachedTrivialInlineBody() counts the expansion against the
+    // budget.
+    SmallVector<std::optional<IntRangeSet>, 4> ArgRanges;
+    for (const Expr *Arg : CallExp->arguments()) {
+      std::optional<IntRangeSet> ArgR;
+      if (auto ArgDom = getScalarDomain(Arg->getType())) {
+        ArgR = evaluatePureExprRange(Arg, State, Depth + 1);
+        if (ArgR && IntRangeSet::full(*ArgDom).subsetOfSet(*ArgR))
+          ArgR.reset();
+      }
+      ArgRanges.push_back(std::move(ArgR));
+    }
+    const FunctionDecl *CalleeFD = CallExp->getDirectCallee();
+    std::string CacheKey;
+    // Only cache results computed outside other expansions, which are not
+    // limited by MaxInlineDepth.
+    bool Cacheable = CalleeFD && InlineDepth == 0;
+    if (Cacheable) {
+      CacheKey = makeInlineCallCacheKey(CalleeFD, AssumeDerefNonNull ? 1 : 0,
+                                        ArgRanges);
+      if (auto It = InlineCallRangeCache.find(CacheKey);
+          It != InlineCallRangeCache.end())
+        return It->second ? std::optional<IntRangeSet>(
+                                reprojectRangeSet(*It->second, Dom))
+                          : std::nullopt;
+    }
+
+    auto InlineInfo = getCachedTrivialInlineBody(CallExp);
+    if (!InlineInfo)
+      return std::nullopt;
+    auto EvalInline = [&]() -> std::optional<IntRangeSet> {
       TrylockValueState CalleeState;
       for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
         const auto *PVD = cast<ValueDecl>(
             InlineInfo->DefFD->getParamDecl(I)->getCanonicalDecl());
-        auto PDom = getScalarDomain(PVD->getType());
-        if (!PDom)
-          continue;
-        if (auto ArgR =
-                evaluatePureExprRange(CallExp->getArg(I), State, Depth + 1))
-          CalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgR, *PDom);
+        if (auto PDom = getScalarDomain(PVD->getType()); PDom && ArgRanges[I])
+          CalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgRanges[I], *PDom);
       }
       InlineExpansionScope Scope(*this, InlineInfo->DefFD);
       if (InlineInfo->SingleRet) {
@@ -4161,8 +4226,11 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
         Res = Res.unionWith(reprojectRangeSet(*FR, Dom));
       }
       return Res;
-    }
-    return std::nullopt;
+    };
+    std::optional<IntRangeSet> Res = EvalInline();
+    if (Cacheable)
+      InlineCallRangeCache.try_emplace(CacheKey, Res);
+    return Res;
   }
 
   if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
@@ -4568,17 +4636,69 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
                              Depth + 1);
       return;
     }
+    // Expanding the helper only yields information if an argument is a
+    // tracked variable or has a known range. Check this first such that
+    // conditions that are unrelated to the tracked values do not use up the
+    // inline expansion budget.
+    SmallVector<std::optional<IntRangeSet>, 4> ArgRanges;
+    bool HasInformativeArg = false;
+    for (const Expr *Arg : CallExp->arguments()) {
+      std::optional<IntRangeSet> ArgR;
+      if (auto ArgDom = getScalarDomain(Arg->getType())) {
+        ArgR = evaluatePureExprRange(Arg, State, Depth + 1);
+        if (ArgR && !IntRangeSet::full(*ArgDom).subsetOfSet(*ArgR))
+          HasInformativeArg = true;
+        else
+          ArgR.reset();
+      }
+      if (extractTrackableVarExpr(Arg, EscapedVars))
+        HasInformativeArg = true;
+      ArgRanges.push_back(std::move(ArgR));
+    }
+    if (!HasInformativeArg)
+      return;
+    // The effect of the expansion on the parameters only depends on the
+    // callee, the argument ranges and WantTrue. Apply a cached effect without
+    // counting it against MaxInlineExpansions.
+    auto ApplyToCaller = [&](const InlineCondResult &R) {
+      if (R.Infeasible) {
+        State.Infeasible = true;
+        return;
+      }
+      for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
+        if (I >= R.ParamRanges.size() || !R.ParamRanges[I])
+          continue;
+        const ValueDecl *CallerVD =
+            extractTrackableVarExpr(CallExp->getArg(I), EscapedVars);
+        if (!CallerVD)
+          continue;
+        auto CallerDom = getScalarDomain(CallerVD->getType());
+        if (!CallerDom)
+          continue;
+        restrictVarRange(State, CallerVD, *CallerDom,
+                         reprojectRangeSet(*R.ParamRanges[I], *CallerDom));
+        if (State.Infeasible)
+          return;
+      }
+    };
+    const FunctionDecl *CalleeFD = CallExp->getDirectCallee();
+    std::string CacheKey;
+    bool Cacheable = CalleeFD && InlineDepth == 0;
+    if (Cacheable) {
+      CacheKey = makeInlineCallCacheKey(CalleeFD, WantTrue ? 3 : 2, ArgRanges);
+      if (auto It = InlineCondCache.find(CacheKey);
+          It != InlineCondCache.end()) {
+        ApplyToCaller(It->second);
+        return;
+      }
+    }
     if (auto InlineInfo = getCachedTrivialInlineBody(CallExp)) {
       TrylockValueState CalleeState;
       for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
         const auto *PVD = cast<ValueDecl>(
             InlineInfo->DefFD->getParamDecl(I)->getCanonicalDecl());
-        auto PDom = getScalarDomain(PVD->getType());
-        if (!PDom)
-          continue;
-        if (auto ArgR =
-                evaluatePureExprRange(CallExp->getArg(I), State, Depth + 1))
-          CalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgR, *PDom);
+        if (auto PDom = getScalarDomain(PVD->getType()); PDom && ArgRanges[I])
+          CalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgRanges[I], *PDom);
       }
       InlineExpansionScope Scope(*this, InlineInfo->DefFD);
       if (InlineInfo->SingleRet) {
@@ -4599,28 +4719,21 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
         unionIntoValueState(CalleeState, TState, *ASTCtx);
         unionIntoValueState(CalleeState, FState, *ASTCtx);
       }
-      if (CalleeState.Infeasible) {
-        State.Infeasible = true;
-        return;
+      InlineCondResult R;
+      R.Infeasible = CalleeState.Infeasible;
+      if (!R.Infeasible) {
+        for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
+          const auto *PVD = cast<ValueDecl>(
+              InlineInfo->DefFD->getParamDecl(I)->getCanonicalDecl());
+          auto PIt = CalleeState.VarRanges.find(PVD);
+          R.ParamRanges.push_back(PIt != CalleeState.VarRanges.end()
+                                      ? std::optional(PIt->second)
+                                      : std::nullopt);
+        }
       }
-      for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
-        const ValueDecl *CallerVD =
-            extractTrackableVarExpr(CallExp->getArg(I), EscapedVars);
-        if (!CallerVD)
-          continue;
-        auto CallerDom = getScalarDomain(CallerVD->getType());
-        if (!CallerDom)
-          continue;
-        const auto *PVD = cast<ValueDecl>(
-            InlineInfo->DefFD->getParamDecl(I)->getCanonicalDecl());
-        auto PIt = CalleeState.VarRanges.find(PVD);
-        if (PIt == CalleeState.VarRanges.end())
-          continue;
-        restrictVarRange(State, CallerVD, *CallerDom,
-                         reprojectRangeSet(PIt->second, *CallerDom));
-        if (State.Infeasible)
-          return;
-      }
+      ApplyToCaller(R);
+      if (Cacheable)
+        InlineCondCache.try_emplace(CacheKey, std::move(R));
     }
     return;
   }
@@ -7724,6 +7837,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   SwitchTables.clear();
   InlineBodyCache.clear();
   InlineExpansionCount = 0;
+  InlineCallRangeCache.clear();
+  InlineCondCache.clear();
   CurrentFunction = dyn_cast<FunctionDecl>(D);
 
   if (D->hasAttr<NoThreadSafetyAnalysisAttr>())
