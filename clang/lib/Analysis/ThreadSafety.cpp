@@ -1353,6 +1353,10 @@ public:
     llvm::SmallDenseMap<const Expr *, IntRangeSet, 4> ExprRanges;
     llvm::SmallDenseMap<const BinaryOperator *, bool, 2> ShortCircuitedOps;
     llvm::SmallDenseSet<AcquiredTrylockKey, 4> AcquiredTrylockAttrs;
+    // Trylock calls whose capabilities have been acquired on a path and are
+    // no longer held, e.g. because these have been released. Branching again
+    // on the result of such a call must not acquire the capabilities again.
+    llvm::SmallDenseSet<AcquiredTrylockKey, 4> ConsumedTrylockAttrs;
     llvm::SmallDenseMap<const ValueDecl *,
                         std::pair<const Expr *, LocalVarContext>, 2>
         UnmaterializedVarDefs;
@@ -1426,7 +1430,9 @@ public:
       RangeCondCache;
   void applyRangeTrylockEdge(
       FactSet &Result, const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
-      llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs = nullptr);
+      llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs = nullptr,
+      const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs =
+          nullptr);
   void getRangeTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
 
   using TerminatorTrylockCall =
@@ -1439,7 +1445,10 @@ public:
   void getEdgeLockset(
       FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
       const CFGBlock *CurrBlock,
-      llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs = nullptr);
+      llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs = nullptr,
+      const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs =
+          nullptr);
+  void getAcquiredTrylockCaps(const AcquiredTrylockKey &Key, CapExprSet &Caps);
 
   void getTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
 
@@ -1969,7 +1978,8 @@ ThreadSafetyAnalyzer::getTerminatorTrylockCall(const CFGBlock *Block,
 void ThreadSafetyAnalyzer::getEdgeLockset(
     FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
     const CFGBlock *CurrBlock,
-    llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs) {
+    llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs,
+    const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs) {
   Result = ExitSet;
 
   {
@@ -1983,6 +1993,8 @@ void ThreadSafetyAnalyzer::getEdgeLockset(
       // attributes
       for (const auto *Attr :
            FunDecl->specific_attrs<TryAcquireCapabilityAttr>()) {
+        if (ConsumedAttrs && ConsumedAttrs->contains({Exp, Attr}))
+          continue;
         CapExprSet AttrLocks;
         getMutexIDs(AttrLocks, Attr, Exp, FunDecl, PredBlock, CurrBlock,
                     Attr->getSuccessValue(), Negate);
@@ -2007,7 +2019,21 @@ void ThreadSafetyAnalyzer::getEdgeLockset(
     }
   }
 
-  applyRangeTrylockEdge(Result, PredBlock, CurrBlock, AcquiredAttrs);
+  applyRangeTrylockEdge(Result, PredBlock, CurrBlock, AcquiredAttrs,
+                        ConsumedAttrs);
+}
+
+/// Add the capabilities acquired by the trylock call and attribute \p Key to
+/// \p Caps.
+void ThreadSafetyAnalyzer::getAcquiredTrylockCaps(const AcquiredTrylockKey &Key,
+                                                  CapExprSet &Caps) {
+  const auto *Callee = dyn_cast_or_null<NamedDecl>(Key.first->getCalleeDecl());
+  if (!Callee)
+    return;
+  if (const auto *A = dyn_cast<TryAcquireCapabilityAttr>(Key.second))
+    getMutexIDs(Caps, A, Key.first, Callee);
+  else if (const auto *A = dyn_cast<TryAcquireCapabilityRangeAttr>(Key.second))
+    getMutexIDs(Caps, A, Key.first, Callee);
 }
 
 static const NamedDecl *getRangeTrylockCallee(const CallExpr *CallExp) {
@@ -2619,7 +2645,8 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
 
 void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
     FactSet &Result, const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
-    llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs) {
+    llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs,
+    const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs) {
   const Stmt *Term = PredBlock->getTerminatorStmt();
   if (!Term || isa<IndirectGotoStmt>(Term))
     return;
@@ -2699,6 +2726,8 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
     if (!First || !Last)
       continue;
     if (EdgeSet.subsetOf(*First, *Last)) {
+      if (ConsumedAttrs && ConsumedAttrs->contains({CallExp, Attr}))
+        continue;
       CapExprSet AttrLocks;
       getMutexIDs(AttrLocks, Attr, CallExp, Callee);
       if (!AttrLocks.empty()) {
@@ -3846,6 +3875,8 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
 
   for (const auto &Key : Src.AcquiredTrylockAttrs)
     Dst.AcquiredTrylockAttrs.insert(Key);
+  for (const auto &Key : Src.ConsumedTrylockAttrs)
+    Dst.ConsumedTrylockAttrs.insert(Key);
 
   SmallVector<const ValueDecl *, 2> DefsToErase;
   for (const auto &[VD, DefPair] : Dst.UnmaterializedVarDefs) {
@@ -4416,8 +4447,10 @@ void ThreadSafetyAnalyzer::updateValueStateForStmt(
       for (const auto &Key : State.AcquiredTrylockAttrs)
         if (Key.first == CE)
           ToErase.push_back(Key);
-      for (const auto &Key : ToErase)
+      for (const auto &Key : ToErase) {
         State.AcquiredTrylockAttrs.erase(Key);
+        State.ConsumedTrylockAttrs.erase(Key);
+      }
     }
   }
 
@@ -6930,6 +6963,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
           SameShortCircuits(Existing.ValState, Candidate.ValState) &&
           Existing.ValState.AcquiredTrylockAttrs ==
               Candidate.ValState.AcquiredTrylockAttrs &&
+          Existing.ValState.ConsumedTrylockAttrs ==
+              Candidate.ValState.ConsumedTrylockAttrs &&
           SameUnmaterializedDefs(Existing.ValState, Candidate.ValState)) {
         unionIntoValueState(Existing.ValState, Candidate.ValState, *ASTCtx);
         return;
@@ -7042,7 +7077,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       if (CheckingTrylockBody) {
         TrylockValueState EdgeValState = BlockExitValState[PrevBlockID];
         getEdgeLockset(PrevLockset, PrevBlockInfo->ExitSet, *PI, CurrBlock,
-                       &EdgeValState.AcquiredTrylockAttrs);
+                       &EdgeValState.AcquiredTrylockAttrs,
+                       &EdgeValState.ConsumedTrylockAttrs);
         constrainValueStateOnEdge(EdgeValState, *PI, CurrBlock, EscapedVars);
         materializeNarrowedTrylocks(PrevLockset, EdgeValState);
         unionIntoValueState(CurrValState, EdgeValState, *ASTCtx);
@@ -7207,6 +7243,22 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     }
     CurrBlockInfo->ExitSet = LocksetBuilder.FSet;
     if (CheckingTrylockBody) {
+      // A trylock call has been consumed if one of the capabilities that it
+      // acquired was held when entering this block and has been released by
+      // a statement in this block. Capabilities that are dropped while
+      // joining locksets, e.g. because the terminator of a block checks the
+      // trylock result again, have not been consumed.
+      for (const auto &Key : CurrValState.AcquiredTrylockAttrs) {
+        if (CurrValState.ConsumedTrylockAttrs.contains(Key))
+          continue;
+        CapExprSet Caps;
+        getAcquiredTrylockCaps(Key, Caps);
+        if (llvm::any_of(Caps, [&](const CapabilityExpr &Cap) {
+              return CurrBlockInfo->EntrySet.findLock(FactMan, Cap) &&
+                     !CurrBlockInfo->ExitSet.findLock(FactMan, Cap);
+            }))
+          CurrValState.ConsumedTrylockAttrs.insert(Key);
+      }
       BlockExitValState[CurrBlockID] = std::move(CurrValState);
       if (IsPureBlock && !BundleOverflow[CurrBlockID]) {
         for (auto &Bnd : PureBlockBundles[CurrBlockID])

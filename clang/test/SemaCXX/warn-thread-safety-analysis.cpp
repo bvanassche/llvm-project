@@ -9454,6 +9454,15 @@ class BodyCheckSuite {
     return ok;
   }
 
+  bool badRebranchAfterUnlock() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) { // expected-note {{mutex acquired here}}
+    bool ok = mu.TryLock();
+    if (ok)
+      mu.Unlock();
+    if (ok)
+      return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+    return false;
+  }
+
   // FIXME: the value of a trylock result that is carried around a loop is not
   // tracked.
   bool retryLoopCarriedResult() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) { // expected-note {{mutex acquired here}}
