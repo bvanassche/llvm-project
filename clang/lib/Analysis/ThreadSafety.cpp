@@ -6301,6 +6301,10 @@ bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
 /// produces for a single expression.
 static constexpr unsigned MaxReturnOutcomes = 64;
 
+/// The maximum number of edge bundles, i.e. distinct lock and value states,
+/// that are tracked per block on paths that lead to a function exit.
+static constexpr unsigned MaxBundlesPerBlock = 64;
+
 /// Evaluate the return value \p RetVal. Before doing that, split the outcomes
 /// on every trylock call that may have succeeded on the current path but
 /// whose result is not referenced by \p RetVal, either because the result has
@@ -9081,7 +9085,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         return;
       }
     }
-    if (Bundles.size() >= 64) {
+    if (Bundles.size() >= MaxBundlesPerBlock) {
       BundleOverflow[BlockID] = true;
       Bundles.clear();
       return;
@@ -9633,13 +9637,65 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
                                 DedupHandler);
       };
 
-      // If there are too many paths to track the lock state per path, the
-      // joined lock state is too imprecise to verify the postconditions
-      // without reporting false positives. Skip the verification instead.
-      if (BundleOverflow[PredID])
-        continue;
-
-      if (PureExitPathBlocks[PredID]) {
+      // If there are too many distinct lock and value states to track them
+      // per path, verify the states per predecessor edge instead. Their
+      // number is bounded by the number of CFG edges.
+      if (PureExitPathBlocks[PredID] && BundleOverflow[PredID]) {
+        LocalVarContext EvalCtx =
+            RS ? PreReturnVarCtx[PredID] : PredInfo.ExitContext;
+        auto VerifyEdgeState = [&](FactSet Lockset, TrylockValueState State) {
+          unsigned Idx = PredInfo.EntryIndex;
+          LocalVarContext Ctx = PredInfo.EntryContext;
+          for (const CFGElement &BI : *PredBlock) {
+            std::optional<CFGStmt> CS = BI.getAs<CFGStmt>();
+            if (!CS)
+              continue;
+            const Stmt *S = CS->getStmt();
+            if (S == RS)
+              break;
+            updateValueStateForStmt(State, S, Ctx, EscapedVars);
+            Ctx = LocalVarMap.getNextContext(Idx, S, Ctx);
+          }
+          if (!RS)
+            constrainValueStateOnEdge(State, PredBlock, ExitBlock, EscapedVars);
+          if (State.Infeasible)
+            return;
+          SmallVector<ReturnEvalOutcome, 2> Outcomes;
+          evaluateReturnWithPendingTrylocks(RetVal, Lockset, State, EvalCtx,
+                                            Outcomes);
+          for (ReturnEvalOutcome &Outcome : Outcomes)
+            VerifyExitOutcome(Outcome);
+        };
+        for (const CFGBlock *Q : PredBlock->preds()) {
+          if (!Q || !VisitedBlocks.alreadySet(Q) || neverReturns(Q) ||
+              !BlockInfo[Q->getBlockID()].Reachable)
+            continue;
+          unsigned QID = Q->getBlockID();
+          if (PureExitPathBlocks[QID] && !BundleOverflow[QID]) {
+            for (const TrylockEdgeBundle &Bnd : PureBlockBundles[QID]) {
+              TrylockEdgeBundle Next = Bnd;
+              constrainValueStateOnEdge(Next.ValState, Q, PredBlock,
+                                        EscapedVars);
+              if (Next.ValState.Infeasible)
+                continue;
+              materializeNarrowedTrylocks(Next.Lockset, Next.ValState);
+              VerifyEdgeState(std::move(Next.Lockset),
+                              std::move(Next.ValState));
+            }
+            continue;
+          }
+          FactSet EdgeLockset;
+          TrylockValueState EdgeState = BlockExitValState[QID];
+          getEdgeLockset(EdgeLockset, BlockInfo[QID].ExitSet, Q, PredBlock,
+                         &EdgeState.AcquiredTrylockAttrs,
+                         &EdgeState.ConsumedTrylockAttrs);
+          constrainValueStateOnEdge(EdgeState, Q, PredBlock, EscapedVars);
+          if (EdgeState.Infeasible)
+            continue;
+          materializeNarrowedTrylocks(EdgeLockset, EdgeState);
+          VerifyEdgeState(std::move(EdgeLockset), std::move(EdgeState));
+        }
+      } else if (PureExitPathBlocks[PredID]) {
         LocalVarContext EvalCtx =
             RS ? PreReturnVarCtx[PredID] : PredInfo.ExitContext;
         for (const TrylockEdgeBundle &Bnd : PureBlockBundles[PredID]) {

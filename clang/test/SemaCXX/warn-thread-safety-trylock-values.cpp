@@ -247,3 +247,37 @@ int discarded_in_for_init() TRY1 {
 int not_discarded_conditional(int c) TRY1 {
   return c ? trylock(&mu) : 0;
 }
+
+//===----------------------------------------------------------------------===//
+// More paths to a return statement than can be tracked separately.
+//===----------------------------------------------------------------------===//
+
+#define PATH_CASE(n)                                                           \
+  if (x == (n)) {                                                              \
+    if (trylock(&mu))                                                          \
+      goto out;                                                                \
+    return 0;                                                                  \
+  }
+#define PATH_CASE8(b)                                                          \
+  PATH_CASE(8 * (b) + 0) PATH_CASE(8 * (b) + 1) PATH_CASE(8 * (b) + 2)         \
+  PATH_CASE(8 * (b) + 3) PATH_CASE(8 * (b) + 4) PATH_CASE(8 * (b) + 5)         \
+  PATH_CASE(8 * (b) + 6) PATH_CASE(8 * (b) + 7)
+
+// Every path to 'out' holds mu, yet failure is returned.
+int too_many_paths(int x) TRY1 {
+  PATH_CASE8(0) PATH_CASE8(1) PATH_CASE8(2) PATH_CASE8(3)
+  PATH_CASE8(4) PATH_CASE8(5) PATH_CASE8(6) PATH_CASE8(7)
+  PATH_CASE(64) // expected-note{{mutex acquired here}}
+  return 0;
+out:
+  return 0; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int too_many_paths_valid(int x) TRY1 {
+  PATH_CASE8(0) PATH_CASE8(1) PATH_CASE8(2) PATH_CASE8(3)
+  PATH_CASE8(4) PATH_CASE8(5) PATH_CASE8(6) PATH_CASE8(7)
+  PATH_CASE(64)
+  return 0;
+out:
+  return 1;
+}
