@@ -965,6 +965,43 @@ int c_cleanup_releases_target_bad(void) // expected-note{{mutex acquired here}}
   return 0; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
 
+// Pointer values are tracked in the uintptr_t domain, also across
+// conversions between pointers and integers that preserve the value.
+void *c_find_obj(void);
+
+int c_trylock_open_coded_err_ptr_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret;
+  mutex_exclusive_lock(&mu1);
+  void *obj = c_find_obj();
+  if ((__UINTPTR_TYPE__)obj >= (__UINTPTR_TYPE__)-4095) {
+    ret = (int)(__INTPTR_TYPE__)obj;
+    goto fail_unlock;
+  }
+  return 0;
+
+fail_unlock:
+  mutex_unlock(&mu1);
+  return ret;
+}
+
+int c_trylock_open_coded_err_ptr_unchecked_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  void *obj = c_find_obj();
+  // obj may be NULL, so the return value may be 0.
+  return (int)(__INTPTR_TYPE__)obj; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_trylock_unsigned_roundtrip_valid(int err)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  if (err < 0) {
+    unsigned long u = (unsigned long)(long)err;
+    return (int)(long)u;
+  }
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

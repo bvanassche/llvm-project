@@ -3250,8 +3250,9 @@ getScalarDomainForType(QualType Ty, const ASTContext &Ctx) {
     return std::nullopt;
   if (Ty->isIntegralOrEnumerationType())
     return IntDomain::forType(Ty, Ctx);
-  if (Ty->isAnyPointerType() || Ty->isNullPtrType() ||
-      Ty->isMemberPointerType())
+  if (Ty->isAnyPointerType() || Ty->isNullPtrType())
+    return IntDomain::forType(Ctx.getUIntPtrType(), Ctx);
+  if (Ty->isMemberPointerType())
     return IntDomain::forType(Ctx.BoolTy, Ctx);
   return std::nullopt;
 }
@@ -3279,6 +3280,7 @@ bool ThreadSafetyAnalyzer::isTrackableLocalVar(
 const ValueDecl *ThreadSafetyAnalyzer::extractTrackableVarExpr(
     const Expr *E,
     const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const {
+  const unsigned PtrBits = ASTCtx->getIntWidth(ASTCtx->getUIntPtrType());
   while (E) {
     E = stripNoOpExprWrappers(E);
     if (const auto *CE = dyn_cast<CastExpr>(E)) {
@@ -3295,6 +3297,20 @@ const ValueDecl *ThreadSafetyAnalyzer::extractTrackableVarExpr(
       }
       if (CE->getCastKind() == CK_BitCast && DstTy->isAnyPointerType() &&
           SubTy->isAnyPointerType()) {
+        E = CE->getSubExpr();
+        continue;
+      }
+      if (CE->getCastKind() == CK_PointerToIntegral &&
+          SubTy->isAnyPointerType() &&
+          DstTy->isUnsignedIntegerOrEnumerationType() &&
+          !DstTy->isBooleanType() && ASTCtx->getIntWidth(DstTy) >= PtrBits) {
+        E = CE->getSubExpr();
+        continue;
+      }
+      if (CE->getCastKind() == CK_IntegralToPointer &&
+          DstTy->isAnyPointerType() &&
+          SubTy->isUnsignedIntegerOrEnumerationType() &&
+          !SubTy->isBooleanType() && ASTCtx->getIntWidth(SubTy) <= PtrBits) {
         E = CE->getSubExpr();
         continue;
       }
@@ -3393,6 +3409,22 @@ nonZeroRangeSet(const ThreadSafetyAnalyzer::IntDomain &Dom) {
 }
 
 static ThreadSafetyAnalyzer::IntRangeSet
+castDerivedToBaseRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                          const ThreadSafetyAnalyzer::IntDomain &Dom) {
+  if (Src.empty())
+    return {};
+  auto Zero =
+      ThreadSafetyAnalyzer::IntRangeSet::single(Dom, llvm::APSInt::get(0));
+  ThreadSafetyAnalyzer::IntRangeSet Mapped = reprojectRangeSet(Src, Dom);
+  ThreadSafetyAnalyzer::IntRangeSet Res;
+  if (Mapped.intersectsSet(Zero))
+    Res = Res.unionWith(Zero);
+  if (!Mapped.subsetOfSet(Zero))
+    Res = Res.unionWith(nonZeroRangeSet(Dom));
+  return Res;
+}
+
+static ThreadSafetyAnalyzer::IntRangeSet
 booleanizeRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
                    const ThreadSafetyAnalyzer::IntDomain &SrcDom,
                    const ThreadSafetyAnalyzer::IntDomain &DstDom) {
@@ -3438,12 +3470,60 @@ castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
   llvm::APSInt MaxSmallSpan(DstDom.BitWidth, /*isUnsigned=*/false);
   MaxSmallSpan = 16;
 
+  // The intervals of Src may be wider than the destination domain, e.g. for
+  // __int128 sources. Use a width that can represent all values involved.
+  unsigned WideW = std::max(DstDom.BitWidth + 2, DstBits + 3);
+  for (const auto &[Lo, Hi] : Src.intervals())
+    WideW = std::max({WideW, Lo.getBitWidth() + 1, Hi.getBitWidth() + 1});
+  llvm::APSInt ZeroW(llvm::APInt::getZero(WideW), /*isUnsigned=*/false);
+  llvm::APSInt OneW(llvm::APInt(WideW, 1), /*isUnsigned=*/false);
+  llvm::APSInt NegOneW(llvm::APInt::getAllOnes(WideW), /*isUnsigned=*/false);
+  llvm::APSInt TwoPowW(llvm::APInt::getOneBitSet(WideW, DstBits),
+                       /*isUnsigned=*/false);
+  llvm::APSInt SignBitVal(llvm::APInt::getOneBitSet(WideW, DstBits - 1),
+                          /*isUnsigned=*/false);
+  llvm::APSInt SignedMin = -SignBitVal;
+  llvm::APSInt SignedMax = SignBitVal - OneW;
+  llvm::APSInt MaxUnsigned = TwoPowW - OneW;
+
   ThreadSafetyAnalyzer::IntRangeSet Res;
   for (const auto &[Lo, Hi] : Src.intervals()) {
     if (llvm::APSInt::compareValues(Lo, DstDom.Lo) >= 0 &&
         llvm::APSInt::compareValues(Hi, DstDom.Hi) <= 0) {
       Res = Res.unionWith(
           ThreadSafetyAnalyzer::IntRangeSet::closedRange(DstDom, Lo, Hi));
+      continue;
+    }
+    if (!DstUnsigned && llvm::APSInt::compareValues(Lo, ZeroW) >= 0 &&
+        llvm::APSInt::compareValues(Hi, MaxUnsigned) <= 0) {
+      llvm::APSInt LoW = Lo.extend(WideW);
+      llvm::APSInt HiW = Hi.extend(WideW);
+      if (LoW < SignBitVal) {
+        llvm::APSInt SubHi = HiW < SignedMax ? HiW : SignedMax;
+        Res = Res.unionWith(
+            ThreadSafetyAnalyzer::IntRangeSet::closedRange(DstDom, LoW, SubHi));
+      }
+      if (HiW >= SignBitVal) {
+        llvm::APSInt SubLo = LoW > SignBitVal ? LoW : SignBitVal;
+        Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::closedRange(
+            DstDom, SubLo - TwoPowW, HiW - TwoPowW));
+      }
+      continue;
+    }
+    if (DstUnsigned && llvm::APSInt::compareValues(Lo, SignedMin) >= 0 &&
+        llvm::APSInt::compareValues(Hi, SignedMax) <= 0) {
+      llvm::APSInt LoW = Lo.extend(WideW);
+      llvm::APSInt HiW = Hi.extend(WideW);
+      if (LoW < ZeroW) {
+        llvm::APSInt SubHi = HiW < NegOneW ? HiW : NegOneW;
+        Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::closedRange(
+            DstDom, LoW + TwoPowW, SubHi + TwoPowW));
+      }
+      if (HiW >= ZeroW) {
+        llvm::APSInt SubLo = LoW > ZeroW ? LoW : ZeroW;
+        Res = Res.unionWith(
+            ThreadSafetyAnalyzer::IntRangeSet::closedRange(DstDom, SubLo, HiW));
+      }
       continue;
     }
     if (llvm::APSInt::compareValues(Hi - Lo, MaxSmallSpan) <= 0) {
@@ -3628,12 +3708,38 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
     case CK_FunctionToPointerDecay:
       return nonZeroRangeSet(Dom);
     case CK_BitCast:
+      if (CE->getType()->isAnyPointerType() &&
+          CE->getSubExpr()->getType()->isAnyPointerType()) {
+        auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+        return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
+                   : std::nullopt;
+      }
+      return std::nullopt;
     case CK_DerivedToBase:
     case CK_UncheckedDerivedToBase:
       if (CE->getType()->isAnyPointerType() &&
           CE->getSubExpr()->getType()->isAnyPointerType()) {
         auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-        return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
+        return Sub ? std::optional<IntRangeSet>(
+                         castDerivedToBaseRangeSet(*Sub, Dom))
+                   : std::nullopt;
+      }
+      return std::nullopt;
+    case CK_PointerToIntegral:
+      if (CE->getSubExpr()->getType()->isAnyPointerType() &&
+          CE->getType()->isIntegralOrEnumerationType()) {
+        auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+        return Sub ? std::optional<IntRangeSet>(
+                         castIntegralRangeSet(*Sub, CE->getType(), *ASTCtx))
+                   : std::nullopt;
+      }
+      return std::nullopt;
+    case CK_IntegralToPointer:
+      if (CE->getType()->isAnyPointerType() &&
+          CE->getSubExpr()->getType()->isIntegralOrEnumerationType()) {
+        auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+        return Sub ? std::optional<IntRangeSet>(castIntegralRangeSet(
+                         *Sub, ASTCtx->getUIntPtrType(), *ASTCtx))
                    : std::nullopt;
       }
       return std::nullopt;
@@ -3733,11 +3839,8 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
       auto R = evaluatePureExprRange(BO->getRHS(), State, Depth + 1);
       if (!L || !R)
         return std::nullopt;
-      bool IsPtrOrMemberPtrCmp =
-          BO->getLHS()->getType()->isAnyPointerType() ||
-          BO->getLHS()->getType()->isMemberPointerType();
-      return compareRangeSets(BO->getOpcode(), *L, *R, Dom,
-                              IsPtrOrMemberPtrCmp);
+      bool IsMemberPtrCmp = BO->getLHS()->getType()->isMemberPointerType();
+      return compareRangeSets(BO->getOpcode(), *L, *R, Dom, IsMemberPtrCmp);
     }
 
     if (BO->isLogicalOp()) {
@@ -4078,11 +4181,10 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
         if (!KVal)
           return false;
 
-        bool IsPtrOrMemberPtr = VarSide->getType()->isAnyPointerType() ||
-                                VarSide->getType()->isMemberPointerType();
-        if (IsPtrOrMemberPtr && CmpOp != BO_EQ && CmpOp != BO_NE)
+        bool IsMemberPtr = VarSide->getType()->isMemberPointerType();
+        if (IsMemberPtr && CmpOp != BO_EQ && CmpOp != BO_NE)
           return false;
-        if (IsPtrOrMemberPtr && *KVal != 0)
+        if (IsMemberPtr && *KVal != 0)
           return false;
 
         IntRangeSet Constraint =
@@ -4951,8 +5053,6 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       ApplyExprConstraint();
       return;
     case CK_BitCast:
-    case CK_DerivedToBase:
-    case CK_UncheckedDerivedToBase:
       if (CE->getType()->isAnyPointerType() &&
           CE->getSubExpr()->getType()->isAnyPointerType()) {
         evaluateReturnOutcomes(CE->getSubExpr(), TargetDom, InLockset,
@@ -4964,6 +5064,78 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       EmitDefault();
       ApplyExprConstraint();
       return;
+    case CK_DerivedToBase:
+    case CK_UncheckedDerivedToBase:
+      if (CE->getType()->isAnyPointerType() &&
+          CE->getSubExpr()->getType()->isAnyPointerType()) {
+        auto PtrDom = getScalarDomain(CE->getType());
+        if (!PtrDom) {
+          EmitDefault();
+          ApplyExprConstraint();
+          return;
+        }
+        SmallVector<ReturnEvalOutcome, 2> Sub;
+        evaluateReturnOutcomes(CE->getSubExpr(), *PtrDom, InLockset, InPending,
+                               State, Ctx, UseVarRanges, Sub, Depth + 1);
+        for (auto &SO : Sub) {
+          SO.Values = reprojectRangeSet(
+              castDerivedToBaseRangeSet(SO.Values, *PtrDom), TargetDom);
+          if (!SO.Values.empty())
+            Out.push_back(std::move(SO));
+        }
+        ApplyExprConstraint();
+        return;
+      }
+      EmitDefault();
+      ApplyExprConstraint();
+      return;
+    case CK_PointerToIntegral: {
+      if (!CE->getSubExpr()->getType()->isAnyPointerType() ||
+          !CE->getType()->isIntegralOrEnumerationType()) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
+      if (!SubDom) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      SmallVector<ReturnEvalOutcome, 2> Sub;
+      evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Sub, Depth + 1);
+      for (auto &SO : Sub) {
+        SO.Values = reprojectRangeSet(
+            castIntegralRangeSet(SO.Values, CE->getType(), *ASTCtx), TargetDom);
+        if (!SO.Values.empty())
+          Out.push_back(std::move(SO));
+      }
+      ApplyExprConstraint();
+      return;
+    }
+    case CK_IntegralToPointer: {
+      if (!CE->getType()->isAnyPointerType() ||
+          !CE->getSubExpr()->getType()->isIntegralOrEnumerationType()) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      IntDomain SubDom =
+          IntDomain::forType(CE->getSubExpr()->getType(), *ASTCtx);
+      SmallVector<ReturnEvalOutcome, 2> Sub;
+      evaluateReturnOutcomes(CE->getSubExpr(), SubDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Sub, Depth + 1);
+      for (auto &SO : Sub) {
+        SO.Values = reprojectRangeSet(
+            castIntegralRangeSet(SO.Values, ASTCtx->getUIntPtrType(), *ASTCtx),
+            TargetDom);
+        if (!SO.Values.empty())
+          Out.push_back(std::move(SO));
+      }
+      ApplyExprConstraint();
+      return;
+    }
     case CK_IntegralToBoolean:
     case CK_PointerToBoolean:
     case CK_MemberPointerToBoolean: {
@@ -5155,9 +5327,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         ApplyExprConstraint();
         return;
       }
-      bool IsPtrOrMemberPtrCmp =
-          BO->getLHS()->getType()->isAnyPointerType() ||
-          BO->getLHS()->getType()->isMemberPointerType();
+      bool IsMemberPtrCmp = BO->getLHS()->getType()->isMemberPointerType();
       SmallVector<ReturnEvalOutcome, 2> LHSOut;
       evaluateReturnOutcomes(BO->getLHS(), *LDom, InLockset, InPending, State,
                              Ctx, UseVarRanges, LHSOut, Depth + 1);
@@ -5168,7 +5338,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
                                RHSOut, Depth + 1);
         for (auto &RO : RHSOut) {
           auto Cmp = compareRangeSets(BO->getOpcode(), LO.Values, RO.Values,
-                                      TargetDom, IsPtrOrMemberPtrCmp);
+                                      TargetDom, IsMemberPtrCmp);
           if (!Cmp) {
             RO.Values = IntRangeSet::full(TargetDom);
             Out.push_back(std::move(RO));
