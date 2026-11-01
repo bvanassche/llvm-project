@@ -39,6 +39,32 @@ void name_of_alias(struct req *r) {
   spin_lock(&head->lock); // expected-note{{spinlock acquired here}}
 } // expected-warning{{spinlock 'head->lock' is still held at the end of function}}
 
+// The analysis cannot tell whether head->lock is r->head->lock.
+int trylock_through_alias(struct req *r)
+    __attribute__((try_acquire_capability(1, &r->head->lock))) {
+  struct wq *head = load_acquire_asm(&r->head);
+  if (head) {
+    spin_lock(&head->lock);
+    if (!busy(r))
+      return 1;
+    spin_unlock(&head->lock);
+  }
+  return 0;
+}
+
+// But a capability that is held on a failure path is still reported.
+int trylock_through_alias_bad(struct req *r)
+    __attribute__((try_acquire_capability(1, &r->head->lock))) {
+  struct wq *head = load_acquire_asm(&r->head);
+  if (head) {
+    spin_lock(&head->lock); // expected-note{{spinlock acquired here}}
+    if (!busy(r))
+      return 0; // expected-warning{{spinlock 'head->lock' is still held at the end of function}}
+    spin_unlock(&head->lock);
+  }
+  return 0;
+}
+
 // Statement expressions appearing as subexpressions of a local pointer
 // initializer must also fall back to the local variable name rather than
 // collapsing distinct capabilities onto '#undefined'.

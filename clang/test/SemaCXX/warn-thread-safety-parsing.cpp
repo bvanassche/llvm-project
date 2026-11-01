@@ -1967,6 +1967,10 @@ unsigned tacr_ret_unsigned_neg() TRY_ACQUIRE_RANGE(-2, -1, mu1); // \
 signed char tacr_ret_schar() TRY_ACQUIRE_SHARED_RANGE(128, 300, mu1); // \
   // expected-warning {{'try_acquire_shared_capability_range' attribute range [128, 300] does not contain any value of return type 'signed char'}}
 
+// The function bodies below only exist to allow explicit instantiation.
+// Clang does not run the thread safety analysis on them because this file
+// contains errors. See SemaTemplate/warn-thread-safety-analysis.cpp for
+// tests that verify the implementation of template trylock functions.
 template <typename T>
 T tacr_template_ret() TRY_ACQUIRE_RANGE(0, 0, mu1) { return T(); } // \
   // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer or unscoped enumeration type; type here is 'void *'}}

@@ -473,14 +473,20 @@ a function releases all associated capabilities in whatever mode they're held.
 *Previously:* `EXCLUSIVE_TRYLOCK_FUNCTION`, `SHARED_TRYLOCK_FUNCTION`
 
 These are attributes on a function or method that tries to acquire the given
-capability, and returns a boolean value indicating success or failure.
-The first argument must be `true` or `false`, to specify which return value
-indicates success, and the remaining arguments are interpreted in the same way
-as `ACQUIRE`. See {ref}`mutexheader`, below, for example uses.
+capability, and returns a boolean (or integer/pointer) value indicating success
+or failure.
+The first argument must be `true` or `false` (or `1` or `0`), to specify which
+return value indicates success, and the remaining arguments are interpreted in
+the same way as `ACQUIRE`. When capability arguments are explicitly provided,
+the analysis checks the definition of the function to verify that the
+capabilities are held on return paths indicating success and are not held on
+return paths indicating failure. If no capability argument is passed, the
+capability is assumed to be `this`, and the analysis will not check the body of
+the function. See {ref}`mutexheader`, below, for example uses.
 
-Because the analysis doesn't support conditional locking, a capability is
-treated as acquired after the first branch on the return value of a try-acquire
-function.
+Because the analysis doesn't support general conditional locking, a capability
+is treated by callers as acquired after branching on the return value of a
+try-acquire function.
 
 ```c++
 Mutex mu;
@@ -504,7 +510,12 @@ These are attributes on a function or method that tries to acquire the given
 capability and returns an integer indicating success or failure. The first two
 arguments must be integer constant expressions specifying the inclusive range
 `[low, high]` (with `low <= high`) of return values that indicate success, and
-the remaining arguments are interpreted in the same way as `ACQUIRE`.
+the remaining arguments are interpreted in the same way as `ACQUIRE`. As with
+`TRY_ACQUIRE`, when capability arguments are explicitly provided, the analysis
+verifies that the function body holds the specified capabilities on return paths
+whose value is within `[low, high]` and does not hold them on return paths
+outside `[low, high]`; if capability arguments are omitted, the capability is
+assumed to be `this` and the function body is not checked.
 
 ```c++
 Mutex mu;

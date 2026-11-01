@@ -5144,8 +5144,8 @@ void Foo::foo3() { }
 void Foo::lock() { mu1_.Lock();  mu2_.Lock(); }
 void Foo::readerlock() { mu1_.ReaderLock();  mu2_.ReaderLock(); }
 void Foo::unlock() { mu1_.Unlock();  mu2_.Unlock(); }
-bool Foo::trylock()       { return true; }
-bool Foo::readertrylock() { return true; }
+bool Foo::trylock()       { mu1_.Lock();  mu2_.Lock();  return true; }
+bool Foo::readertrylock() { mu1_.ReaderLock();  mu2_.ReaderLock();  return true; }
 
 
 void Foo::test() {
@@ -9129,3 +9129,524 @@ void testVariadicAndFuncPtr(RangeMutex &m1, RangeMutex &m2,
 }
 
 } // namespace TryAcquireRangeTest
+
+namespace TryAcquireBodyVerificationTest {
+
+class LOCKABLE OpaqueTryMutex {
+public:
+  // Zero capability arguments refer to 'this' and skip body verification,
+  // matching ACQUIRE() and RELEASE().
+  bool TryLock() EXCLUSIVE_TRYLOCK_FUNCTION(true) { return true; }
+  bool ReaderTryLock() SHARED_TRYLOCK_FUNCTION(true) { return true; }
+  int TryLockRange() TRY_ACQUIRE_RANGE(0, 0) { return 0; }
+  int ReaderTryLockRange() TRY_ACQUIRE_SHARED_RANGE(0, 0) { return 0; }
+  void Lock() EXCLUSIVE_LOCK_FUNCTION();
+  void ReaderLock() SHARED_LOCK_FUNCTION();
+  void Unlock() UNLOCK_FUNCTION();
+  void AssertHeld() ASSERT_EXCLUSIVE_LOCK();
+  void AssertReaderHeld() ASSERT_SHARED_LOCK();
+};
+
+class LOCKABLE REENTRANT_CAPABILITY ReentrantTryMutex {
+public:
+  void Lock() EXCLUSIVE_LOCK_FUNCTION();
+  void Unlock() UNLOCK_FUNCTION();
+  bool TryLock() EXCLUSIVE_TRYLOCK_FUNCTION(true);
+};
+
+class SCOPED_LOCKABLE TryMutexGuard {
+public:
+  TryMutexGuard(Mutex *mu) EXCLUSIVE_LOCK_FUNCTION(mu);
+  ~TryMutexGuard() UNLOCK_FUNCTION();
+};
+
+bool rawHwTryLock();
+void logAttempt(int code);
+int trylockWideZero(Mutex &m) TRY_ACQUIRE_RANGE(0, 0, m);
+
+class BodyCheckSuite {
+  Mutex mu;
+  Mutex mu2;
+  Mutex outer_mu;
+  OpaqueTryMutex omu;
+  ReentrantTryMutex rmu;
+  int a GUARDED_BY(mu);
+  int attempts;
+
+  int delegateZero() TRY_ACQUIRE_RANGE(0, 0, mu);
+  int delegateErrno() TRY_ACQUIRE_RANGE(0, __INT_MAX__, mu);
+
+  //===--------------------------------------------------------------------===//
+  // Valid implementations
+  //===--------------------------------------------------------------------===//
+
+  bool validTryAcquireIfElse(bool cond) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    if (cond) {
+      mu.Lock();
+      a = 1;
+      return true;
+    }
+    return false;
+  }
+
+  int validTryAcquireFalseOnZero(bool cond)
+      EXCLUSIVE_TRYLOCK_FUNCTION(false, mu) {
+    if (!cond)
+      return -16;
+    mu.Lock();
+    return 0;
+  }
+
+  bool validAlwaysFail() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) { return false; }
+
+  bool validRepeatedResultCheck() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = mu.TryLock();
+    if (ok)
+      a = 1;
+    if (ok)
+      return true;
+    return false;
+  }
+
+  bool validAlwaysSucceed() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu.Lock();
+    return true;
+  }
+
+  bool validSharedIfElse(bool cond) SHARED_TRYLOCK_FUNCTION(true, mu) {
+    if (!cond)
+      return false;
+    mu.ReaderLock();
+    int v = a;
+    (void)v;
+    return true;
+  }
+
+  bool validDelegate() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    return mu.TryLock();
+  }
+
+  bool validSharedDelegate() SHARED_TRYLOCK_FUNCTION(true, mu) {
+    return mu.ReaderTryLock();
+  }
+
+  bool validInvertedDelegate() EXCLUSIVE_TRYLOCK_FUNCTION(false, mu) {
+    return !mu.TryLock();
+  }
+
+  int validRangeDelegate() TRY_ACQUIRE_RANGE(0, 0, mu) {
+    return delegateZero();
+  }
+
+  int validRangeTernary(bool cond) TRY_ACQUIRE_RANGE(0, 0, mu) {
+    return mu.TryLock() ? 0 : -16;
+  }
+
+  int validRangeCommaTernary(bool cond) TRY_ACQUIRE_RANGE(0, 0, mu) {
+    return cond ? (mu.Lock(), 0) : -16;
+  }
+
+  bool validShortCircuitAnd(bool ready) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    return ready && mu.TryLock();
+  }
+
+  bool validShortCircuitAndViaVar(bool ready)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = ready && mu.TryLock();
+    return ok;
+  }
+
+  bool validRetryOr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    return mu.TryLock() || mu.TryLock();
+  }
+
+  bool validRetryOrViaVar() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = mu.TryLock() || mu.TryLock();
+    return ok;
+  }
+
+  // Copying a trylock result must not crash.
+  bool validCopiedResult() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = mu.TryLock();
+    bool ok2 = ok;
+    return ok2;
+  }
+
+  bool validSingleReturnLocalVar(bool cond)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = false;
+    if (cond) {
+      mu.Lock();
+      a = 1;
+      ok = true;
+    }
+    ++attempts;
+    if (ok) {
+      a = 2;
+    }
+    return ok;
+  }
+
+  bool validConditionalTrylockAssign(bool cond)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = false;
+    if (cond)
+      ok = mu.TryLock();
+    return ok;
+  }
+
+  int validSplitSignChecks() TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int err = delegateZero();
+    if (err < 0)
+      return err;
+    if (err > 0)
+      return -err;
+    a = 3;
+    return 0;
+  }
+
+  bool validOuterGuardSingleReturn(bool cond)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    TryMutexGuard outer(&outer_mu);
+    bool ok = false;
+    if (cond) {
+      mu.Lock();
+      ok = true;
+    }
+    return ok;
+  }
+
+  bool validOuterGuardDelegate() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    TryMutexGuard outer(&outer_mu);
+    return mu.TryLock();
+  }
+
+  int *validPtrTryAcquire(bool cond) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    if (!cond)
+      return nullptr;
+    mu.Lock();
+    return &a;
+  }
+
+  const int *validSharedPtrTryAcquire(bool cond)
+      SHARED_TRYLOCK_FUNCTION(true, mu) {
+    if (!cond)
+      return nullptr;
+    mu.ReaderLock();
+    return &a;
+  }
+
+  bool validMultiLockRollback() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu, mu2) {
+    if (!mu.TryLock())
+      return false;
+    if (!mu2.TryLock()) {
+      mu.Unlock();
+      return false;
+    }
+    return true;
+  }
+
+  int validStackedModeSingleReturn(int req)
+      TRY_ACQUIRE_RANGE(1, 1, mu) TRY_ACQUIRE_SHARED_RANGE(2, 2, mu) {
+    int mode = 0;
+    if (req == 1) {
+      mu.Lock();
+      a = 10;
+      mode = 1;
+    } else if (req == 2) {
+      mu.ReaderLock();
+      mode = 2;
+    }
+    if (mode != 0) {
+      int v = a;
+      (void)v;
+    }
+    logAttempt(mode);
+    return mode;
+  }
+
+  int validDisjointRanges(int kind)
+      TRY_ACQUIRE_RANGE(0, 0, mu) TRY_ACQUIRE_RANGE(2, 5, mu) {
+    if (kind == 0) {
+      mu.Lock();
+      return 0;
+    }
+    if (kind == 2) {
+      mu.Lock();
+      return 4;
+    }
+    return 1;
+  }
+
+  bool validAssertHeldImpl() EXCLUSIVE_TRYLOCK_FUNCTION(true, omu) {
+    if (rawHwTryLock()) {
+      omu.AssertHeld();
+      return true;
+    }
+    return false;
+  }
+
+  bool validAssertSharedHeldImpl() SHARED_TRYLOCK_FUNCTION(true, omu) {
+    if (rawHwTryLock()) {
+      omu.AssertReaderHeld();
+      return true;
+    }
+    return false;
+  }
+
+  bool validReentrantTryAcquire(bool cond)
+      EXCLUSIVE_LOCKS_REQUIRED(rmu) EXCLUSIVE_TRYLOCK_FUNCTION(true, rmu) {
+    bool ok = false;
+    if (cond) {
+      rmu.Lock();
+      ok = true;
+    }
+    return ok;
+  }
+
+  enum SwitchMode { SM_Fail, SM_Lock };
+
+  int validExhaustiveEnumSwitch(SwitchMode m) TRY_ACQUIRE_RANGE(1, 1, mu) {
+    switch (m) {
+    case SM_Fail:
+      return 0;
+    case SM_Lock:
+      mu.Lock();
+      return 1;
+    }
+  }
+
+  int validBoundedSwitch(bool cond) TRY_ACQUIRE_RANGE(1, 1, mu) {
+    int m = cond ? 1 : 0;
+    switch (m) {
+    case 0:
+      return 0;
+    case 1:
+      mu.Lock();
+      return 1;
+    default:
+      // Infeasible because m is bounded to {0, 1}.
+      return 1;
+    }
+  }
+
+  int validRetryLoop() TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int fail = -16;
+    for (int i = 0; i < 3; ++i) {
+      if (mu.TryLock())
+        return 0;
+    }
+    return fail;
+  }
+
+  struct LogMsg {
+    LogMsg(const char *);
+    ~LogMsg();
+  };
+  static void logMessage(const LogMsg &);
+  int logAttempts;
+
+  bool validTemporaryInJoinBlock() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = mu.TryLock();
+    if (!ok)
+      ++logAttempts;
+    logMessage(LogMsg("trylock"));
+    return ok;
+  }
+
+  // FIXME: the value of a trylock result that is carried around a loop is not
+  // tracked.
+  bool retryLoopCarriedResult() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) { // expected-note {{mutex acquired here}}
+    bool ok = false;
+    for (int i = 0; i < 3 && !ok; ++i)
+      ok = mu.TryLock();
+    return ok; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Invalid implementations
+  //===--------------------------------------------------------------------===//
+
+  bool badSuccessWithoutLock() // expected-note {{mutex acquired here}}
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  bool badFailureStillLocked() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu.Lock(); // expected-note {{mutex acquired here}}
+    return false; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  int badInvertedTryAcquire(bool cond) // expected-note {{mutex acquired here}}
+      EXCLUSIVE_TRYLOCK_FUNCTION(false, mu) {
+    if (cond) {
+      mu.Lock(); // expected-note {{mutex acquired here}}
+      return 1; // expected-warning {{mutex 'mu' is still held at the end of function}}
+    }
+    return 0; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  bool badSharedWithoutLock() // expected-note {{mutex acquired here}}
+      SHARED_TRYLOCK_FUNCTION(true, mu) {
+    return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  bool badWrongLockKindSharedInsteadOfExcl() // expected-note {{the other acquisition of mutex 'mu' is here}}
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu.ReaderLock(); // expected-warning {{mutex 'mu' is acquired exclusively and shared in the same scope}}
+    return true;
+  }
+
+  bool badWrongLockKindExclInsteadOfShared() // expected-note {{the other acquisition of mutex 'mu' is here}}
+      SHARED_TRYLOCK_FUNCTION(true, mu) {
+    mu.Lock(); // expected-warning {{mutex 'mu' is acquired exclusively and shared in the same scope}}
+    return true;
+  }
+
+  int badRangeSuccessWithoutLock() // expected-note {{mutex acquired here}}
+      TRY_ACQUIRE_RANGE(0, 0, mu) {
+    return 0; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int badRangeFailureStillLocked() TRY_ACQUIRE_RANGE(0, 0, mu) {
+    mu.Lock(); // expected-note {{mutex acquired here}}
+    return -1; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  int badRangeWiderThanDeclared(bool cond) TRY_ACQUIRE_RANGE(0, 0, mu) {
+    mu.Lock(); // expected-note {{mutex acquired here}}
+    return cond ? 0 : 1; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  int badSharedRangeWithoutLock() // expected-note {{mutex acquired here}}
+      TRY_ACQUIRE_SHARED_RANGE(1, 10, mu) {
+    return 5; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int badSharedRangeOutOfBounds(bool low) TRY_ACQUIRE_SHARED_RANGE(1, 10, mu) {
+    mu.ReaderLock(); // expected-note {{mutex acquired here}}
+    return low ? 0 : 11; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  int badStackedModeSwapped(bool excl) // expected-note 2 {{the other acquisition of mutex 'mu' is here}}
+      TRY_ACQUIRE_RANGE(1, 1, mu)
+      TRY_ACQUIRE_SHARED_RANGE(2, 2, mu) {
+    if (excl) {
+      mu.Lock(); // expected-warning {{mutex 'mu' is acquired exclusively and shared in the same scope}}
+      return 2;
+    }
+    mu.ReaderLock(); // expected-warning {{mutex 'mu' is acquired exclusively and shared in the same scope}}
+    return 1;
+  }
+
+  bool badPartialMultiLockAnd() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu, mu2) {
+    return mu.TryLock() && mu2.TryLock(); // expected-warning {{mutex 'mu' is still held at the end of function}} \
+                                          // expected-note {{mutex acquired here}}
+  }
+
+  bool badMultiLockMissingRollback() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu, mu2) {
+    if (!mu.TryLock()) // expected-note {{mutex acquired here}}
+      return false;
+    if (!mu2.TryLock())
+      return false; // expected-warning {{mutex 'mu' is still held at the end of function}}
+    return true;
+  }
+
+  bool badScopedGuardReleasesTarget() // expected-note {{mutex acquired here}}
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    TryMutexGuard guard(&mu);
+    return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int badUnlockedAfterSuccess() // expected-note {{mutex acquired here}}
+      TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int err = delegateZero();
+    if (err == 0)
+      mu.Unlock();
+    return err; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int badUnknownReturnUnlocked(int unknown) // expected-note {{mutex acquired here}}
+      TRY_ACQUIRE_RANGE(0, 0, mu) {
+    return unknown; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int badUnknownReturnLocked(int unknown) TRY_ACQUIRE_RANGE(0, 0, mu) {
+    mu.Lock(); // expected-note {{mutex acquired here}}
+    return unknown; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  bool badShortCircuitOr(bool shortcut) // expected-note {{mutex acquired here}}
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    return shortcut || mu.TryLock(); // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  bool badShortCircuitOrViaVar(bool shortcut) // expected-note {{mutex acquired here}}
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = shortcut || mu.TryLock();
+    return ok; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int badNarrowingTruncation() // expected-note {{mutex acquired here}}
+      TRY_ACQUIRE_RANGE(0, 0, mu) {
+    // A non-zero failure value such as 256 truncates to 0!
+    return (signed char)trylockWideZero(mu); // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int badIncompleteRangeCheck() // expected-note {{mutex acquired here}}
+      TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int err = delegateZero();
+    if (err < 0)
+      return err;
+    // Misses err > 0 where delegateZero() failed!
+    return 0; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int badMutatedSourceVar() // expected-note {{mutex acquired here}}
+      TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int x = -1;
+    int y = x + 1; // y is 0, while mu is not locked!
+    x = -2;
+    return y; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int badLoopMutation(int n) // expected-note {{mutex acquired here}}
+      TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int err = -16;
+    for (int i = 0; i < n; ++i) {
+      err = 0;
+    }
+    return err; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  int *badMutablePtrFromShared(bool cond) SHARED_TRYLOCK_FUNCTION(true, mu) {
+    if (!cond)
+      return nullptr;
+    mu.ReaderLock();
+    return &a; // expected-warning {{returning pointer to variable 'a' requires holding mutex 'mu' exclusively}}
+  }
+
+  bool badUnguardedAccessInBody(bool cond)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    bool ok = false;
+    if (cond) {
+      mu.Lock();
+      ok = true;
+    }
+    a = 42; // expected-warning {{writing variable 'a' requires holding mutex 'mu' exclusively}}
+    return ok;
+  }
+
+  bool badReentrantMissingAcquire()
+      EXCLUSIVE_LOCKS_REQUIRED(rmu) EXCLUSIVE_TRYLOCK_FUNCTION(true, rmu) { // expected-note {{mutex acquired here}}
+    return true; // expected-warning {{expecting mutex 'rmu' to be held at the end of function}}
+  }
+
+  bool badReentrantLeakedOnFailure()
+      EXCLUSIVE_LOCKS_REQUIRED(rmu) EXCLUSIVE_TRYLOCK_FUNCTION(true, rmu) { // expected-note {{mutex acquired here}}
+    rmu.Lock();
+    return false; // expected-warning {{mutex 'rmu' is still held at the end of function}}
+  }
+};
+
+} // namespace TryAcquireBodyVerificationTest

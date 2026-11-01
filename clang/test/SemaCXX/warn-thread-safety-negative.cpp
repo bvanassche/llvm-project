@@ -237,6 +237,33 @@ public:
       needNotHeld();
     }
   }
+
+  bool implTryAcquireMissingNeg(bool ok) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    if (ok) {
+      mu.Lock(); // expected-warning {{acquiring mutex 'mu' requires negative capability '!mu'}}
+      return true;
+    }
+    return false;
+  }
+
+  int implDelegateMissingNeg() TRY_ACQUIRE_RANGE(0, __INT_MAX__, mu) {
+    return tryLockErrno(); // expected-warning {{acquiring mutex 'mu' requires negative capability '!mu'}}
+  }
+
+  bool implTryAcquireWithNeg(bool ok)
+      EXCLUSIVE_LOCKS_REQUIRED(!mu) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    if (ok) {
+      mu.Lock();
+      return true;
+    }
+    needNotHeld();
+    return false;
+  }
+
+  int implDelegateWithNeg()
+      EXCLUSIVE_LOCKS_REQUIRED(!mu) TRY_ACQUIRE_RANGE(0, __INT_MAX__, mu) {
+    return tryLockErrno();
+  }
 };
 
 }  // end namespace TryAcquireRangeNegative

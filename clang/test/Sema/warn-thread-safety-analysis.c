@@ -826,6 +826,145 @@ void test_trylock_range_c(void) {
   }
 }
 
+// Compile-time verification of trylock function implementations in C.
+int check_hw_ready(void);
+
+int c_trylock_goto_valid(int cond)
+    __attribute__((try_acquire_capability_range(0, 0, mu1, mu2))) {
+  int err;
+  if ((err = check_hw_ready()) < 0)
+    return err;
+  if (!mutex_exclusive_trylock(&mu1)) {
+    err = -16;
+    goto out;
+  }
+  if (!mutex_exclusive_trylock(&mu2)) {
+    err = -16;
+    goto unlock_mu1;
+  }
+  work_data = 10;
+  return 0;
+
+unlock_mu1:
+  mutex_unlock(&mu1);
+out:
+  return err;
+}
+
+// Incrementing a _Bool sets it to 1.
+int c_trylock_bool_increment_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  _Bool ok = 1;
+  ok++;
+  if (ok)
+    return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+  mutex_exclusive_lock(&mu1);
+  return 1;
+}
+
+// More paths than the per-path tracking limit must not cause false positives.
+#define C_TRYLOCK_CASE(n)                                                      \
+  case n:                                                                      \
+    r = mutex_exclusive_trylock(&mu1);                                         \
+    break;
+#define C_TRYLOCK_CASE8(b)                                                     \
+  C_TRYLOCK_CASE(8 * (b) + 0) \
+  C_TRYLOCK_CASE(8 * (b) + 1) \
+  C_TRYLOCK_CASE(8 * (b) + 2) \
+  C_TRYLOCK_CASE(8 * (b) + 3) \
+  C_TRYLOCK_CASE(8 * (b) + 4) \
+  C_TRYLOCK_CASE(8 * (b) + 5) \
+  C_TRYLOCK_CASE(8 * (b) + 6) \
+  C_TRYLOCK_CASE(8 * (b) + 7)
+
+int c_trylock_many_paths_valid(int x)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int r = 0;
+  switch (x) {
+    C_TRYLOCK_CASE8(0) C_TRYLOCK_CASE8(1) C_TRYLOCK_CASE8(2) C_TRYLOCK_CASE8(3)
+    C_TRYLOCK_CASE8(4) C_TRYLOCK_CASE8(5) C_TRYLOCK_CASE8(6) C_TRYLOCK_CASE8(7)
+  }
+  return r;
+}
+
+int c_trylock_goto_missing_unlock(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1, mu2))) {
+  int err = 0;
+  if (!mutex_exclusive_trylock(&mu1)) // expected-note{{mutex acquired here}}
+    return -16;
+  if (!mutex_exclusive_trylock(&mu2)) {
+    err = -16;
+    goto out;
+  }
+  return 0;
+
+out:
+  return err; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int c_shared_trylock_valid(int cond)
+    __attribute__((try_acquire_shared_capability(1, mu1))) {
+  if (!cond)
+    return 0;
+  mutex_shared_lock(&mu1);
+  return 1;
+}
+
+int c_shared_trylock_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_shared_capability(1, mu1))) {
+  return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_shared_trylock_range_bad(void)
+    __attribute__((try_acquire_shared_capability_range(0, 0, mu1))) {
+  mutex_shared_lock(&mu1); // expected-note{{mutex acquired here}}
+  return -1; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_ptr_trylock_valid(int cond)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  if (!cond)
+    return (void *)0;
+  mutex_exclusive_lock(&mu1);
+  return &work_data;
+}
+
+int *c_ptr_trylock_bad(int cond) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  if (!cond)
+    return (void *)0;
+  return &work_data; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+#ifdef __SIZEOF_INT128__
+// Range arithmetic on __int128 values uses wider integers than on other types.
+int c_int128_narrowing_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  __int128 big = (__int128)1 << 40;
+  int x = 0;
+  x += (__int128)1;
+  (void)x;
+  return (int)big; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+#endif
+
+int c_cleanup_outer_guard_valid(int cond)
+    __attribute__((try_acquire_capability_range(0, 0, mu2))) {
+  mutex_exclusive_lock(&mu1);
+  struct Mutex *const __attribute__((unused, cleanup(unlock_scope))) scope = &mu1;
+  if (!cond)
+    return -16;
+  mutex_exclusive_lock(&mu2);
+  return 0;
+}
+
+int c_cleanup_releases_target_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  struct Mutex *const __attribute__((unused, cleanup(unlock_scope))) scope = &mu1;
+  return 0; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

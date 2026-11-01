@@ -485,6 +485,15 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   two arguments specify the inclusive integer range `[low, high]` of return
   values indicating that the capability was successfully acquired.
 
+- `-Wthread-safety-analysis` now checks the bodies of functions annotated with
+  `try_acquire_capability`, `try_acquire_shared_capability`,
+  `try_acquire_capability_range`, or `try_acquire_shared_capability_range`
+  (when explicit capability arguments are provided) to verify that the
+  specified capabilities are held on return paths indicating success and are
+  not held on return paths indicating failure.
+  Existing implementations of such functions that do not match their
+  annotations now trigger warnings.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed missing `-Wuninitialized-explicit-init` warnings for C file-scope

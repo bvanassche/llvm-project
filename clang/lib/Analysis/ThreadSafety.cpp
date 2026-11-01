@@ -40,8 +40,11 @@
 #include "llvm/ADT/ImmutableMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -339,7 +342,8 @@ public:
 
   void checkBeforeAfter(const ValueDecl *Vd, const FactSet &FSet,
                         ThreadSafetyAnalyzer &Analyzer, SourceLocation Loc,
-                        StringRef CapKind);
+                        StringRef CapKind,
+                        ThreadSafetyHandler *DiagHandler = nullptr);
 
 private:
   BeforeMap BMap;
@@ -1326,7 +1330,53 @@ public:
 
     bool subsetOf(const llvm::APSInt &First, const llvm::APSInt &Last) const;
     bool intersects(const llvm::APSInt &First, const llvm::APSInt &Last) const;
+    bool subsetOfSet(const IntRangeSet &Other) const;
+    bool intersectsSet(const IntRangeSet &Other) const;
+    bool isSingleValue(llvm::APSInt &Val) const;
+    ArrayRef<std::pair<llvm::APSInt, llvm::APSInt>> intervals() const {
+      return Intervals;
+    }
   };
+
+  using AcquiredTrylockKey = std::pair<const CallExpr *, const Attr *>;
+
+  struct TrylockExitSpec {
+    CapabilityExpr Cap;
+    LockKind LK;
+    IntRangeSet SuccessSet;
+    SourceLocation Loc;
+  };
+
+  struct TrylockValueState {
+    bool Infeasible = false;
+    llvm::SmallDenseMap<const ValueDecl *, IntRangeSet, 4> VarRanges;
+    llvm::SmallDenseMap<const Expr *, IntRangeSet, 4> ExprRanges;
+    llvm::SmallDenseMap<const BinaryOperator *, bool, 2> ShortCircuitedOps;
+    llvm::SmallDenseSet<AcquiredTrylockKey, 4> AcquiredTrylockAttrs;
+    llvm::SmallDenseMap<const ValueDecl *,
+                        std::pair<const Expr *, LocalVarContext>, 2>
+        UnmaterializedVarDefs;
+  };
+
+  struct TrylockEdgeBundle {
+    FactSet Lockset;
+    TrylockValueState ValState;
+  };
+
+  struct PendingTrylockAcquire {
+    CapabilityExpr Cap;
+    LockKind LK;
+    SourceLocation Loc;
+  };
+
+  struct ReturnEvalOutcome {
+    IntRangeSet Values;
+    FactSet Lockset;
+    SmallVector<PendingTrylockAcquire, 2> PendingAcquires;
+  };
+
+  SmallVector<TrylockExitSpec, 2> CurrentTrylockExitSpecs;
+  IntDomain CurrentTrylockRetDom;
 
   /// The values that select each case label of a switch statement and the
   /// values that select the default label (or skip the switch body).
@@ -1374,8 +1424,9 @@ public:
   // chains of logical operators on variables linear instead of exponential.
   llvm::DenseMap<std::pair<const Stmt *, const void *>, TrylockRangeCondResult>
       RangeCondCache;
-  void applyRangeTrylockEdge(FactSet &Result, const CFGBlock *PredBlock,
-                             const CFGBlock *CurrBlock);
+  void applyRangeTrylockEdge(
+      FactSet &Result, const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
+      llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs = nullptr);
   void getRangeTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
 
   using TerminatorTrylockCall =
@@ -1385,10 +1436,57 @@ public:
   TerminatorTrylockCall getTerminatorTrylockCall(const CFGBlock *Block,
                                                  bool &Negate);
 
-  void getEdgeLockset(FactSet &Result, const FactSet &ExitSet,
-                      const CFGBlock *PredBlock, const CFGBlock *CurrBlock);
+  void getEdgeLockset(
+      FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
+      const CFGBlock *CurrBlock,
+      llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs = nullptr);
 
   void getTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
+
+  std::optional<IntDomain> getScalarDomain(QualType Ty) const;
+  bool isTrackableLocalVar(
+      const ValueDecl *VD,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
+  const ValueDecl *extractTrackableVarExpr(
+      const Expr *E,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
+  void addLockToExpectedSet(FactSet &Set, const CapabilityExpr &Lock,
+                            LockKind LK, SourceLocation Loc);
+  bool factSetsEquivalent(const FactSet &A, const FactSet &B) const;
+  std::optional<IntRangeSet>
+  evaluatePureExprRange(const Expr *E, const TrylockValueState &State,
+                        unsigned Depth = 0) const;
+  void constrainLeafCondition(
+      TrylockValueState &State, const Expr *Cond, bool WantTrue,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
+      unsigned Depth = 0) const;
+  void constrainValueStateOnEdge(
+      TrylockValueState &State, const CFGBlock *PredBlock,
+      const CFGBlock *CurrBlock,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
+  void materializeNarrowedTrylocks(FactSet &Lockset, TrylockValueState &State);
+  void updateValueStateForStmt(
+      TrylockValueState &State, const Stmt *S, LocalVarContext StmtCtx,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars);
+  bool exprHasUnmaterializedTrylock(const Expr *E, LocalVarContext Ctx,
+                                    const TrylockValueState &State,
+                                    bool UseStateDefs, unsigned Depth = 0);
+  void evaluateReturnOutcomes(
+      const Expr *E, const IntDomain &TargetDom, const FactSet &InLockset,
+      const SmallVectorImpl<PendingTrylockAcquire> &InPending,
+      const TrylockValueState &State, LocalVarContext Ctx, bool UseVarRanges,
+      SmallVectorImpl<ReturnEvalOutcome> &Out, unsigned Depth = 0);
+  void evaluateReturnOutcomesImpl(
+      const Expr *E, const IntDomain &TargetDom, const FactSet &InLockset,
+      const SmallVectorImpl<PendingTrylockAcquire> &InPending,
+      const TrylockValueState &State, LocalVarContext Ctx, bool UseVarRanges,
+      SmallVectorImpl<ReturnEvalOutcome> &Out, unsigned Depth);
+  void applyScopeExitCleanups(FactSet &StateSet, const CFGBlock *B,
+                              bool OnlyAfterReturn = false);
+  void checkTrylockExitOutcome(const FactSet &BaseExpectedExitSet,
+                               const ReturnEvalOutcome &Outcome,
+                               SourceLocation DiagLoc,
+                               ThreadSafetyHandler &ExitHandler);
 
   bool join(const FactEntry &A, const FactEntry &B, SourceLocation JoinLoc,
             LockErrorKind EntryLEK);
@@ -1396,7 +1494,8 @@ public:
   void intersectAndWarn(FactSet &EntrySet, const FactSet &ExitSet,
                         SourceLocation JoinLoc, LockErrorKind EntryLEK,
                         LockErrorKind ExitLEK,
-                        const CapExprSet *TrylockRebranchCaps = nullptr);
+                        const CapExprSet *TrylockRebranchCaps = nullptr,
+                        bool RebranchIgnoresDepth = false);
 
   void intersectAndWarn(FactSet &EntrySet, const FactSet &ExitSet,
                         SourceLocation JoinLoc, LockErrorKind LEK) {
@@ -1496,7 +1595,10 @@ BeforeSet::getBeforeInfoForDecl(const ValueDecl *Vd,
 /// Return true if any mutexes in FSet are in the acquired_before set of Vd.
 void BeforeSet::checkBeforeAfter(const ValueDecl *StartVd, const FactSet &FSet,
                                  ThreadSafetyAnalyzer &Analyzer,
-                                 SourceLocation Loc, StringRef CapKind) {
+                                 SourceLocation Loc, StringRef CapKind,
+                                 ThreadSafetyHandler *DiagHandler) {
+  ThreadSafetyHandler &OutHandler =
+      DiagHandler ? *DiagHandler : Analyzer.Handler;
   SmallVector<BeforeInfo*, 8> InfoVect;
 
   // Do a depth-first traversal of Vd.
@@ -1523,13 +1625,13 @@ void BeforeSet::checkBeforeAfter(const ValueDecl *StartVd, const FactSet &FSet,
       if (FSet.containsMutexDecl(Analyzer.FactMan, Vdb)) {
         StringRef L1 = StartVd->getName();
         StringRef L2 = Vdb->getName();
-        Analyzer.Handler.handleLockAcquiredBefore(CapKind, L1, L2, Loc);
+        OutHandler.handleLockAcquiredBefore(CapKind, L1, L2, Loc);
       }
       // Transitively search other before sets, and warn on cycles.
       if (traverse(Vdb)) {
         if (CycMap.try_emplace(Vd, true).second) {
           StringRef L1 = Vd->getName();
-          Analyzer.Handler.handleBeforeAfterCycle(L1, Vd->getLocation());
+          OutHandler.handleBeforeAfterCycle(L1, Vd->getLocation());
         }
       }
     }
@@ -1864,10 +1966,10 @@ ThreadSafetyAnalyzer::getTerminatorTrylockCall(const CFGBlock *Block,
 /// Find the lockset that holds on the edge between PredBlock
 /// and CurrBlock.  The edge set is the exit set of PredBlock (passed
 /// as the ExitSet parameter) plus any trylocks, which are conditionally held.
-void ThreadSafetyAnalyzer::getEdgeLockset(FactSet &Result,
-                                          const FactSet &ExitSet,
-                                          const CFGBlock *PredBlock,
-                                          const CFGBlock *CurrBlock) {
+void ThreadSafetyAnalyzer::getEdgeLockset(
+    FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
+    const CFGBlock *CurrBlock,
+    llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs) {
   Result = ExitSet;
 
   {
@@ -1885,6 +1987,8 @@ void ThreadSafetyAnalyzer::getEdgeLockset(FactSet &Result,
         getMutexIDs(AttrLocks, Attr, Exp, FunDecl, PredBlock, CurrBlock,
                     Attr->getSuccessValue(), Negate);
         if (!AttrLocks.empty()) {
+          if (AcquiredAttrs)
+            AcquiredAttrs->insert({Exp, Attr});
           CapExprSet &Dest =
               Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd;
           for (const auto &Cap : AttrLocks)
@@ -1903,7 +2007,7 @@ void ThreadSafetyAnalyzer::getEdgeLockset(FactSet &Result,
     }
   }
 
-  applyRangeTrylockEdge(Result, PredBlock, CurrBlock);
+  applyRangeTrylockEdge(Result, PredBlock, CurrBlock, AcquiredAttrs);
 }
 
 static const NamedDecl *getRangeTrylockCallee(const CallExpr *CallExp) {
@@ -2166,6 +2270,44 @@ bool ThreadSafetyAnalyzer::IntRangeSet::intersects(
     return llvm::APSInt::compareValues(Iv.second, First) >= 0 &&
            llvm::APSInt::compareValues(Iv.first, Last) <= 0;
   });
+}
+
+bool ThreadSafetyAnalyzer::IntRangeSet::subsetOfSet(
+    const IntRangeSet &Other) const {
+  if (Intervals.empty())
+    return true;
+  if (Other.Intervals.empty())
+    return false;
+  size_t J = 0;
+  for (const auto &[Lo, Hi] : Intervals) {
+    while (J < Other.Intervals.size() && Other.Intervals[J].second < Lo)
+      ++J;
+    if (J == Other.Intervals.size() || Other.Intervals[J].first > Lo ||
+        Other.Intervals[J].second < Hi)
+      return false;
+  }
+  return true;
+}
+
+bool ThreadSafetyAnalyzer::IntRangeSet::intersectsSet(
+    const IntRangeSet &Other) const {
+  size_t I = 0, J = 0;
+  while (I < Intervals.size() && J < Other.Intervals.size()) {
+    if (Intervals[I].second < Other.Intervals[J].first)
+      ++I;
+    else if (Other.Intervals[J].second < Intervals[I].first)
+      ++J;
+    else
+      return true;
+  }
+  return false;
+}
+
+bool ThreadSafetyAnalyzer::IntRangeSet::isSingleValue(llvm::APSInt &Val) const {
+  if (Intervals.size() != 1 || Intervals[0].first != Intervals[0].second)
+    return false;
+  Val = Intervals[0].first;
+  return true;
 }
 
 const CallExpr *
@@ -2475,9 +2617,9 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
   return {};
 }
 
-void ThreadSafetyAnalyzer::applyRangeTrylockEdge(FactSet &Result,
-                                                 const CFGBlock *PredBlock,
-                                                 const CFGBlock *CurrBlock) {
+void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
+    FactSet &Result, const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
+    llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs) {
   const Stmt *Term = PredBlock->getTerminatorStmt();
   if (!Term || isa<IndirectGotoStmt>(Term))
     return;
@@ -2557,8 +2699,16 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(FactSet &Result,
     if (!First || !Last)
       continue;
     if (EdgeSet.subsetOf(*First, *Last)) {
-      getMutexIDs(Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd,
-                  Attr, CallExp, Callee);
+      CapExprSet AttrLocks;
+      getMutexIDs(AttrLocks, Attr, CallExp, Callee);
+      if (!AttrLocks.empty()) {
+        if (AcquiredAttrs)
+          AcquiredAttrs->insert({CallExp, Attr});
+        CapExprSet &Dest =
+            Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd;
+        for (const auto &Cap : AttrLocks)
+          Dest.push_back_nodup(Cap);
+      }
     }
   }
 
@@ -2670,6 +2820,2652 @@ void ThreadSafetyAnalyzer::getTerminatorTrylockCaps(const CFGBlock *Block,
     }
   }
   getRangeTerminatorTrylockCaps(Block, Caps);
+}
+
+namespace {
+
+/// Wrapper around ThreadSafetyHandler that deduplicates diagnostics emitted
+/// while verifying multiple return outcomes/partitions at function exit. Every
+/// callback is forwarded to the wrapped handler unless an identical callback
+/// has already been forwarded.
+class DedupThreadSafetyHandler final : public ThreadSafetyHandler {
+  ThreadSafetyHandler &Inner;
+  llvm::StringSet<> Emitted;
+
+  // Append a length-prefixed encoding of each argument to Key such that
+  // different argument lists never produce the same key.
+  static void encode(std::string &Key, StringRef Str) {
+    Key += std::to_string(Str.size());
+    Key += ':';
+    Key += Str;
+  }
+  static void encode(std::string &Key, SourceLocation Loc) {
+    encode(Key, std::to_string(Loc.getRawEncoding()));
+  }
+  static void encode(std::string &Key, const void *Ptr) {
+    encode(Key, std::to_string(reinterpret_cast<uintptr_t>(Ptr)));
+  }
+  static void encode(std::string &Key, unsigned long long Val) {
+    encode(Key, std::to_string(Val));
+  }
+  static void encode(std::string &Key, const Name *N) {
+    encode(Key, N ? StringRef(*N) : StringRef("<null>"));
+  }
+  static void encode(std::string &Key, ArrayRef<StringRef> Names) {
+    encode(Key, static_cast<unsigned long long>(Names.size()));
+    for (StringRef N : Names)
+      encode(Key, N);
+  }
+
+  template <typename... Ts>
+  bool shouldEmit(StringRef Callback, const Ts &...Args) {
+    std::string Key;
+    encode(Key, Callback);
+    (encode(Key, Args), ...);
+    return Emitted.insert(Key).second;
+  }
+
+  template <typename E> static unsigned long long val(E V) {
+    return static_cast<unsigned long long>(V);
+  }
+
+public:
+  explicit DedupThreadSafetyHandler(ThreadSafetyHandler &Inner) : Inner(Inner) {
+    setIssueBetaWarnings(Inner.issueBetaWarnings());
+  }
+
+  void handleInvalidLockExp(SourceLocation Loc) override {
+    if (shouldEmit("InvalidLockExp", Loc))
+      Inner.handleInvalidLockExp(Loc);
+  }
+
+  void handleUnmatchedUnlock(StringRef Kind, Name LockName, SourceLocation Loc,
+                             SourceLocation LocPreviousUnlock) override {
+    if (shouldEmit("UnmatchedUnlock", Kind, LockName, Loc, LocPreviousUnlock))
+      Inner.handleUnmatchedUnlock(Kind, LockName, Loc, LocPreviousUnlock);
+  }
+
+  void handleIncorrectUnlockKind(StringRef Kind, Name LockName,
+                                 LockKind Expected, LockKind Received,
+                                 SourceLocation LocLocked,
+                                 SourceLocation LocUnlock) override {
+    if (shouldEmit("IncorrectUnlockKind", Kind, LockName, val(Expected),
+                   val(Received), LocLocked, LocUnlock))
+      Inner.handleIncorrectUnlockKind(Kind, LockName, Expected, Received,
+                                      LocLocked, LocUnlock);
+  }
+
+  void handleDoubleLock(StringRef Kind, Name LockName, SourceLocation LocLocked,
+                        SourceLocation LocDoubleLock) override {
+    if (shouldEmit("DoubleLock", Kind, LockName, LocLocked, LocDoubleLock))
+      Inner.handleDoubleLock(Kind, LockName, LocLocked, LocDoubleLock);
+  }
+
+  void handleMutexHeldEndOfScope(StringRef Kind, Name LockName,
+                                 SourceLocation LocLocked,
+                                 SourceLocation LocEndOfScope,
+                                 LockErrorKind LEK,
+                                 bool ReentrancyMismatch = false) override {
+    // Different return outcomes may report the same problem with a different
+    // acquisition location. Report each problem once.
+    if (shouldEmit("MutexHeldEndOfScope", Kind, LockName, LocEndOfScope,
+                   val(LEK), val(ReentrancyMismatch)))
+      Inner.handleMutexHeldEndOfScope(Kind, LockName, LocLocked, LocEndOfScope,
+                                      LEK, ReentrancyMismatch);
+  }
+
+  void handleExclusiveAndShared(StringRef Kind, Name LockName,
+                                SourceLocation Loc1,
+                                SourceLocation Loc2) override {
+    if (shouldEmit("ExclusiveAndShared", Kind, LockName, Loc1, Loc2))
+      Inner.handleExclusiveAndShared(Kind, LockName, Loc1, Loc2);
+  }
+
+  void handleNoMutexHeld(const NamedDecl *D, ProtectedOperationKind POK,
+                         AccessKind AK, SourceLocation Loc) override {
+    if (shouldEmit("NoMutexHeld", static_cast<const void *>(D), val(POK),
+                   val(AK), Loc))
+      Inner.handleNoMutexHeld(D, POK, AK, Loc);
+  }
+
+  void handleGuardedByAnyReadNotHeld(const NamedDecl *D,
+                                     ProtectedOperationKind POK,
+                                     ArrayRef<StringRef> LockNames,
+                                     SourceLocation Loc) override {
+    if (shouldEmit("GuardedByAnyReadNotHeld", static_cast<const void *>(D),
+                   val(POK), LockNames, Loc))
+      Inner.handleGuardedByAnyReadNotHeld(D, POK, LockNames, Loc);
+  }
+
+  void handleMutexNotHeld(StringRef Kind, const NamedDecl *D,
+                          ProtectedOperationKind POK, Name LockName,
+                          LockKind LK, SourceLocation Loc,
+                          Name *PossibleMatch = nullptr) override {
+    if (shouldEmit("MutexNotHeld", Kind, static_cast<const void *>(D),
+                   val(POK), LockName, val(LK), Loc,
+                   static_cast<const Name *>(PossibleMatch)))
+      Inner.handleMutexNotHeld(Kind, D, POK, LockName, LK, Loc, PossibleMatch);
+  }
+
+  void handleNegativeNotHeld(StringRef Kind, Name LockName, Name Neg,
+                             SourceLocation Loc) override {
+    if (shouldEmit("NegativeNotHeld", Kind, LockName, Neg, Loc))
+      Inner.handleNegativeNotHeld(Kind, LockName, Neg, Loc);
+  }
+
+  void handleNegativeNotHeld(const NamedDecl *D, Name LockName,
+                             SourceLocation Loc) override {
+    if (shouldEmit("NegativeNotHeldDecl", static_cast<const void *>(D),
+                   LockName, Loc))
+      Inner.handleNegativeNotHeld(D, LockName, Loc);
+  }
+
+  void handleFunExcludesLock(StringRef Kind, Name FunName, Name LockName,
+                             SourceLocation Loc) override {
+    if (shouldEmit("FunExcludesLock", Kind, FunName, LockName, Loc))
+      Inner.handleFunExcludesLock(Kind, FunName, LockName, Loc);
+  }
+
+  void handleUnmatchedUnderlyingMutexes(SourceLocation Loc, SourceLocation DLoc,
+                                        Name ScopeName, StringRef Kind,
+                                        Name Expected, Name Actual) override {
+    if (shouldEmit("UnmatchedUnderlyingMutexes", Loc, DLoc, ScopeName, Kind,
+                   Expected, Actual))
+      Inner.handleUnmatchedUnderlyingMutexes(Loc, DLoc, ScopeName, Kind,
+                                             Expected, Actual);
+  }
+
+  void handleExpectMoreUnderlyingMutexes(SourceLocation Loc,
+                                         SourceLocation DLoc, Name ScopeName,
+                                         StringRef Kind,
+                                         Name Expected) override {
+    if (shouldEmit("ExpectMoreUnderlyingMutexes", Loc, DLoc, ScopeName, Kind,
+                   Expected))
+      Inner.handleExpectMoreUnderlyingMutexes(Loc, DLoc, ScopeName, Kind,
+                                              Expected);
+  }
+
+  void handleExpectFewerUnderlyingMutexes(SourceLocation Loc,
+                                          SourceLocation DLoc, Name ScopeName,
+                                          StringRef Kind,
+                                          Name Actual) override {
+    if (shouldEmit("ExpectFewerUnderlyingMutexes", Loc, DLoc, ScopeName, Kind,
+                   Actual))
+      Inner.handleExpectFewerUnderlyingMutexes(Loc, DLoc, ScopeName, Kind,
+                                               Actual);
+  }
+
+  void handleLockAcquiredBefore(StringRef Kind, Name L1Name, Name L2Name,
+                                SourceLocation Loc) override {
+    if (shouldEmit("LockAcquiredBefore", Kind, L1Name, L2Name, Loc))
+      Inner.handleLockAcquiredBefore(Kind, L1Name, L2Name, Loc);
+  }
+
+  void handleBeforeAfterCycle(Name L1Name, SourceLocation Loc) override {
+    if (shouldEmit("BeforeAfterCycle", L1Name, Loc))
+      Inner.handleBeforeAfterCycle(L1Name, Loc);
+  }
+
+  void enterFunction(const FunctionDecl *FD) override {
+    Inner.enterFunction(FD);
+  }
+
+  void leaveFunction(const FunctionDecl *FD) override {
+    Inner.leaveFunction(FD);
+  }
+};
+
+} // namespace
+
+static const Expr *stripNoOpExprWrappers(const Expr *E) {
+  while (E) {
+    if (const auto *PE = dyn_cast<ParenExpr>(E)) {
+      E = PE->getSubExpr();
+      continue;
+    }
+    if (const auto *FE = dyn_cast<FullExpr>(E)) {
+      E = FE->getSubExpr();
+      continue;
+    }
+    if (const auto *OVE = dyn_cast<OpaqueValueExpr>(E)) {
+      if (const Expr *Src = OVE->getSourceExpr()) {
+        E = Src;
+        continue;
+      }
+      break;
+    }
+    if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      if (CE->getCastKind() == CK_NoOp) {
+        E = CE->getSubExpr();
+        continue;
+      }
+    }
+    break;
+  }
+  return E;
+}
+
+static const DeclRefExpr *unwrapDirectLValueDRE(const Expr *E) {
+  while (E) {
+    if (const auto *PE = dyn_cast<ParenExpr>(E)) {
+      E = PE->getSubExpr();
+      continue;
+    }
+    if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      if (CE->getCastKind() == CK_NoOp) {
+        E = CE->getSubExpr();
+        continue;
+      }
+    }
+    break;
+  }
+  return dyn_cast_or_null<DeclRefExpr>(E);
+}
+
+static void
+scanTrylockVars(const Stmt *Root,
+                llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
+                llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars) {
+  if (!Root)
+    return;
+
+  llvm::SmallPtrSet<const DeclRefExpr *, 16> SafeDREs;
+  auto VisitNode = [&](auto &Self, const Stmt *S,
+                       bool InNestedClosure) -> void {
+    if (!S)
+      return;
+
+    if (const auto *LE = dyn_cast<LambdaExpr>(S)) {
+      for (const LambdaCapture &Cap : LE->captures()) {
+        if (Cap.capturesVariable() && Cap.getCaptureKind() == LCK_ByRef) {
+          const ValueDecl *VD =
+              cast<ValueDecl>(Cap.getCapturedVar()->getCanonicalDecl());
+          EscapedVars.insert(VD);
+          ModifiedVars.insert(VD);
+        }
+      }
+      InNestedClosure = true;
+    } else if (const auto *BE = dyn_cast<BlockExpr>(S)) {
+      // The body of a block is not a child of the BlockExpr. Variables
+      // captured by reference (__block variables) may be modified whenever
+      // the block runs.
+      for (const BlockDecl::Capture &Cap : BE->getBlockDecl()->captures()) {
+        if (Cap.isByRef()) {
+          const ValueDecl *VD =
+              cast<ValueDecl>(Cap.getVariable()->getCanonicalDecl());
+          EscapedVars.insert(VD);
+          ModifiedVars.insert(VD);
+        }
+      }
+      InNestedClosure = true;
+    } else if (isa<CapturedStmt>(S)) {
+      InNestedClosure = true;
+    }
+
+    if (!InNestedClosure) {
+      if (const auto *CE = dyn_cast<CastExpr>(S)) {
+        if (CE->getCastKind() == CK_LValueToRValue)
+          if (const auto *DRE = unwrapDirectLValueDRE(CE->getSubExpr()))
+            SafeDREs.insert(DRE);
+      } else if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
+        if (BO->isAssignmentOp()) {
+          if (const auto *DRE = unwrapDirectLValueDRE(BO->getLHS())) {
+            SafeDREs.insert(DRE);
+            ModifiedVars.insert(
+                cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+          }
+        }
+      } else if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
+        if (UO->isIncrementDecrementOp()) {
+          if (const auto *DRE = unwrapDirectLValueDRE(UO->getSubExpr())) {
+            SafeDREs.insert(DRE);
+            ModifiedVars.insert(
+                cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+          }
+        }
+      }
+    }
+
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {
+      if (InNestedClosure || !SafeDREs.contains(DRE)) {
+        const ValueDecl *VD =
+            cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+        EscapedVars.insert(VD);
+        ModifiedVars.insert(VD);
+      }
+    }
+
+    // Note: DeclStmt::children() includes the variable initializers.
+    for (const Stmt *Child : S->children())
+      if (Child)
+        Self(Self, Child, InNestedClosure);
+  };
+
+  VisitNode(VisitNode, Root, /*InNestedClosure=*/false);
+}
+
+static bool hasThreadSafetyCallEffects(const NamedDecl *Callee,
+                                       const Expr *CallOrCtor) {
+  if (CallOrCtor) {
+    if (const auto *TagT = CallOrCtor->getType()->getAs<TagType>())
+      if (TagT->getDecl()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>())
+        return true;
+  }
+  if (!Callee)
+    return false;
+  if (Callee->hasAttr<AcquireCapabilityAttr>() ||
+      Callee->hasAttr<ReleaseCapabilityAttr>() ||
+      Callee->hasAttr<AssertCapabilityAttr>() ||
+      Callee->hasAttr<TryAcquireCapabilityAttr>() ||
+      Callee->hasAttr<TryAcquireCapabilityRangeAttr>() ||
+      Callee->hasAttr<LocksExcludedAttr>() ||
+      Callee->hasAttr<RequiresCapabilityAttr>())
+    return true;
+  if (const auto *FD = dyn_cast<FunctionDecl>(Callee)) {
+    for (const ParmVarDecl *P : FD->parameters())
+      if (P->hasAttrs())
+        return true;
+  }
+  return false;
+}
+
+static bool isPureExitBlockElement(const CFGElement &BI) {
+  switch (BI.getKind()) {
+  case CFGElement::Statement: {
+    const Stmt *S = BI.castAs<CFGStmt>().getStmt();
+    if (const auto *CE = dyn_cast<CallExpr>(S)) {
+      unsigned BuiltinID = CE->getBuiltinCallee();
+      if (BuiltinID == Builtin::BI__builtin_expect ||
+          BuiltinID == Builtin::BI__builtin_expect_with_probability)
+        return true;
+      const auto *Callee = dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl());
+      if (hasThreadSafetyCallEffects(Callee, CE))
+        return false;
+    } else if (const auto *CCE = dyn_cast<CXXConstructExpr>(S)) {
+      if (hasThreadSafetyCallEffects(CCE->getConstructor(), CCE))
+        return false;
+    }
+    return true;
+  }
+  case CFGElement::AutomaticObjectDtor:
+  case CFGElement::CleanupFunction:
+    return true;
+  case CFGElement::TemporaryDtor: {
+    // Destroying a temporary does not affect the lockset unless its
+    // destructor has thread safety attributes.
+    const CXXBindTemporaryExpr *BTE =
+        BI.castAs<CFGTemporaryDtor>().getBindTemporaryExpr();
+    const CXXDestructorDecl *DD = BTE->getTemporary()->getDestructor();
+    return DD &&
+           !DD->getParent()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>() &&
+           !hasThreadSafetyCallEffects(DD, /*CallOrCtor=*/nullptr);
+  }
+  default:
+    return false;
+  }
+}
+
+static std::optional<ThreadSafetyAnalyzer::IntDomain>
+getScalarDomainForType(QualType Ty, const ASTContext &Ctx) {
+  using IntDomain = ThreadSafetyAnalyzer::IntDomain;
+  if (Ty.isNull() || Ty->isDependentType())
+    return std::nullopt;
+  if (Ty->isIntegralOrEnumerationType())
+    return IntDomain::forType(Ty, Ctx);
+  if (Ty->isAnyPointerType() || Ty->isNullPtrType() ||
+      Ty->isMemberPointerType())
+    return IntDomain::forType(Ctx.BoolTy, Ctx);
+  return std::nullopt;
+}
+
+std::optional<ThreadSafetyAnalyzer::IntDomain>
+ThreadSafetyAnalyzer::getScalarDomain(QualType Ty) const {
+  return getScalarDomainForType(Ty, *ASTCtx);
+}
+
+bool ThreadSafetyAnalyzer::isTrackableLocalVar(
+    const ValueDecl *VD,
+    const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const {
+  const auto *Var = dyn_cast_or_null<VarDecl>(VD);
+  if (!Var || !Var->hasLocalStorage())
+    return false;
+  QualType Ty = Var->getType();
+  if (Ty.isNull() || Ty->isReferenceType() || Ty.isVolatileQualified() ||
+      Var->hasAttr<BlocksAttr>())
+    return false;
+  if (EscapedVars.contains(cast<ValueDecl>(Var->getCanonicalDecl())))
+    return false;
+  return getScalarDomain(Ty).has_value();
+}
+
+const ValueDecl *ThreadSafetyAnalyzer::extractTrackableVarExpr(
+    const Expr *E,
+    const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const {
+  while (E) {
+    E = stripNoOpExprWrappers(E);
+    if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      QualType SubTy = CE->getSubExpr()->getType();
+      QualType DstTy = CE->getType();
+      if (CE->getCastKind() == CK_LValueToRValue) {
+        E = CE->getSubExpr();
+        continue;
+      }
+      if (CE->getCastKind() == CK_IntegralCast &&
+          isValuePreservingIntegralCast(SubTy, DstTy, *ASTCtx)) {
+        E = CE->getSubExpr();
+        continue;
+      }
+      if (CE->getCastKind() == CK_BitCast && DstTy->isAnyPointerType() &&
+          SubTy->isAnyPointerType()) {
+        E = CE->getSubExpr();
+        continue;
+      }
+      return nullptr;
+    }
+    if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+      unsigned BuiltinID = CallExp->getBuiltinCallee();
+      if (BuiltinID == Builtin::BI__builtin_expect ||
+          BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+        E = CallExp->getArg(0);
+        continue;
+      }
+      return nullptr;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+      if (BO->getOpcode() == BO_Assign) {
+        E = BO->getLHS();
+        continue;
+      }
+      return nullptr;
+    }
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+      return isTrackableLocalVar(VD, EscapedVars) ? VD : nullptr;
+    }
+    return nullptr;
+  }
+  return nullptr;
+}
+
+void ThreadSafetyAnalyzer::addLockToExpectedSet(FactSet &Set,
+                                                const CapabilityExpr &Lock,
+                                                LockKind LK,
+                                                SourceLocation Loc) {
+  if (Lock.shouldIgnore())
+    return;
+  if (auto It = Set.findLockIter(FactMan, Lock); It != Set.end()) {
+    const auto &Existing = FactMan[*It];
+    if (const auto *LFE = dyn_cast<LockableFactEntry>(&Existing)) {
+      if (const FactEntry *RFact = LFE->tryReenter(FactMan, LK)) {
+        Set.replaceLock(FactMan, It, RFact);
+        return;
+      }
+    }
+    if (Existing.kind() == LK_Shared && LK == LK_Exclusive)
+      Set.replaceLock(
+          FactMan, It,
+          FactMan.createFact<LockableFactEntry>(Lock, LK_Exclusive, Loc));
+    return;
+  }
+  Set.removeLock(FactMan, !Lock);
+  Set.addLock(FactMan, FactMan.createFact<LockableFactEntry>(Lock, LK, Loc));
+}
+
+bool ThreadSafetyAnalyzer::factSetsEquivalent(const FactSet &A,
+                                              const FactSet &B) const {
+  auto FactMatchesIn = [&](const FactEntry &FA, const FactSet &Other) -> bool {
+    const FactEntry *FB =
+        Other.findLock(const_cast<FactManager &>(FactMan), FA);
+    if (!FB)
+      return false;
+    if (FA.getFactEntryKind() != FB->getFactEntryKind() ||
+        FA.kind() != FB->kind() || FA.negative() != FB->negative() ||
+        FA.asserted() != FB->asserted())
+      return false;
+    if (const auto *LA = dyn_cast<LockableFactEntry>(&FA)) {
+      const auto *LB = cast<LockableFactEntry>(FB);
+      if (LA->getReentrancyDepth() != LB->getReentrancyDepth())
+        return false;
+    }
+    return true;
+  };
+  for (FactID ID : A)
+    if (!FactMatchesIn(FactMan[ID], B))
+      return false;
+  for (FactID ID : B)
+    if (!FactMatchesIn(FactMan[ID], A))
+      return false;
+  return true;
+}
+
+static ThreadSafetyAnalyzer::IntRangeSet
+reprojectRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                  const ThreadSafetyAnalyzer::IntDomain &Dom) {
+  ThreadSafetyAnalyzer::IntRangeSet Res;
+  for (const auto &[Lo, Hi] : Src.intervals())
+    Res = Res.unionWith(
+        ThreadSafetyAnalyzer::IntRangeSet::closedRange(Dom, Lo, Hi));
+  return Res;
+}
+
+static ThreadSafetyAnalyzer::IntRangeSet
+nonZeroRangeSet(const ThreadSafetyAnalyzer::IntDomain &Dom) {
+  return ThreadSafetyAnalyzer::IntRangeSet::single(Dom, llvm::APSInt::get(0))
+      .complement(Dom);
+}
+
+static ThreadSafetyAnalyzer::IntRangeSet
+booleanizeRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                   const ThreadSafetyAnalyzer::IntDomain &SrcDom,
+                   const ThreadSafetyAnalyzer::IntDomain &DstDom) {
+  if (Src.empty())
+    return {};
+  auto Zero =
+      ThreadSafetyAnalyzer::IntRangeSet::single(SrcDom, llvm::APSInt::get(0));
+  ThreadSafetyAnalyzer::IntRangeSet Res;
+  if (Src.intersectsSet(Zero))
+    Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
+        DstDom, llvm::APSInt::get(0)));
+  if (!Src.subsetOfSet(Zero))
+    Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
+        DstDom, llvm::APSInt::get(1)));
+  return Res;
+}
+
+static ThreadSafetyAnalyzer::IntRangeSet
+castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                     QualType DstTy, const ASTContext &Ctx) {
+  if (Src.empty())
+    return {};
+  auto DstDom = ThreadSafetyAnalyzer::IntDomain::forType(DstTy, Ctx);
+  if (DstTy->isBooleanType()) {
+    // Boolean conversion is != 0, handled via booleanizeRangeSet by callers.
+    auto Zero =
+        ThreadSafetyAnalyzer::IntRangeSet::single(DstDom, llvm::APSInt::get(0));
+    ThreadSafetyAnalyzer::IntRangeSet Res;
+    for (const auto &[Lo, Hi] : Src.intervals()) {
+      if (llvm::APSInt::compareValues(Lo, llvm::APSInt::get(0)) <= 0 &&
+          llvm::APSInt::compareValues(Hi, llvm::APSInt::get(0)) >= 0)
+        Res = Res.unionWith(Zero);
+      if (llvm::APSInt::compareValues(Lo, llvm::APSInt::get(0)) != 0 ||
+          llvm::APSInt::compareValues(Hi, llvm::APSInt::get(0)) != 0)
+        Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
+            DstDom, llvm::APSInt::get(1)));
+    }
+    return Res;
+  }
+
+  unsigned DstBits = Ctx.getIntWidth(DstTy);
+  bool DstUnsigned = DstTy->isUnsignedIntegerOrEnumerationType();
+  llvm::APSInt MaxSmallSpan(DstDom.BitWidth, /*isUnsigned=*/false);
+  MaxSmallSpan = 16;
+
+  ThreadSafetyAnalyzer::IntRangeSet Res;
+  for (const auto &[Lo, Hi] : Src.intervals()) {
+    if (llvm::APSInt::compareValues(Lo, DstDom.Lo) >= 0 &&
+        llvm::APSInt::compareValues(Hi, DstDom.Hi) <= 0) {
+      Res = Res.unionWith(
+          ThreadSafetyAnalyzer::IntRangeSet::closedRange(DstDom, Lo, Hi));
+      continue;
+    }
+    if (llvm::APSInt::compareValues(Hi - Lo, MaxSmallSpan) <= 0) {
+      for (llvm::APSInt V = Lo; V <= Hi; ++V) {
+        llvm::APSInt Trunc = V.extOrTrunc(DstBits);
+        Trunc.setIsUnsigned(DstUnsigned);
+        Res = Res.unionWith(
+            ThreadSafetyAnalyzer::IntRangeSet::single(DstDom, Trunc));
+      }
+      continue;
+    }
+    return ThreadSafetyAnalyzer::IntRangeSet::full(DstDom);
+  }
+  return Res;
+}
+
+static ThreadSafetyAnalyzer::IntRangeSet
+negateRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src, QualType ResTy,
+               const ASTContext &Ctx) {
+  if (Src.empty())
+    return {};
+  auto Dom = ThreadSafetyAnalyzer::IntDomain::forType(ResTy, Ctx);
+  unsigned Bits = Ctx.getIntWidth(ResTy);
+  bool IsUnsigned = ResTy->isUnsignedIntegerOrEnumerationType();
+  llvm::APSInt MaxSmallSpan(Dom.BitWidth, /*isUnsigned=*/false);
+  MaxSmallSpan = 16;
+
+  ThreadSafetyAnalyzer::IntRangeSet Res;
+  for (const auto &[Lo, Hi] : Src.intervals()) {
+    llvm::APSInt NegHi = -Hi;
+    llvm::APSInt NegLo = -Lo;
+    if (!IsUnsigned && llvm::APSInt::compareValues(NegHi, Dom.Lo) >= 0 &&
+        llvm::APSInt::compareValues(NegLo, Dom.Hi) <= 0) {
+      Res = Res.unionWith(
+          ThreadSafetyAnalyzer::IntRangeSet::closedRange(Dom, NegHi, NegLo));
+      continue;
+    }
+    if (llvm::APSInt::compareValues(Hi - Lo, MaxSmallSpan) <= 0) {
+      for (llvm::APSInt V = Lo; V <= Hi; ++V) {
+        llvm::APSInt NegV = (-V).extOrTrunc(Bits);
+        NegV.setIsUnsigned(IsUnsigned);
+        Res =
+            Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(Dom, NegV));
+      }
+      continue;
+    }
+    return ThreadSafetyAnalyzer::IntRangeSet::full(Dom);
+  }
+  return Res;
+}
+
+static std::optional<ThreadSafetyAnalyzer::IntRangeSet> compareRangeSets(
+    BinaryOperator::Opcode Opc, const ThreadSafetyAnalyzer::IntRangeSet &L,
+    const ThreadSafetyAnalyzer::IntRangeSet &R,
+    const ThreadSafetyAnalyzer::IntDomain &ResDom, bool IsMemberPtrComparison) {
+  if (L.empty() || R.empty())
+    return ThreadSafetyAnalyzer::IntRangeSet{};
+
+  bool CanBeTrue = false;
+  bool CanBeFalse = false;
+
+  if (IsMemberPtrComparison) {
+    if (Opc != BO_EQ && Opc != BO_NE)
+      return std::nullopt;
+    llvm::APSInt Z = llvm::APSInt::get(0);
+    bool LNull = L.intersects(Z, Z);
+    bool LNonNull = !L.subsetOf(Z, Z);
+    bool RNull = R.intersects(Z, Z);
+    bool RNonNull = !R.subsetOf(Z, Z);
+    bool CanEq = (LNull && RNull) || (LNonNull && RNonNull);
+    bool CanNe =
+        (LNull && RNonNull) || (LNonNull && RNull) || (LNonNull && RNonNull);
+    CanBeTrue = (Opc == BO_EQ) ? CanEq : CanNe;
+    CanBeFalse = (Opc == BO_EQ) ? CanNe : CanEq;
+  } else {
+    const llvm::APSInt &LMin = L.intervals().front().first;
+    const llvm::APSInt &LMax = L.intervals().back().second;
+    const llvm::APSInt &RMin = R.intervals().front().first;
+    const llvm::APSInt &RMax = R.intervals().back().second;
+
+    switch (Opc) {
+    case BO_EQ: {
+      CanBeTrue = L.intersectsSet(R);
+      llvm::APSInt LV, RV;
+      CanBeFalse = !(L.isSingleValue(LV) && R.isSingleValue(RV) &&
+                     llvm::APSInt::compareValues(LV, RV) == 0);
+      break;
+    }
+    case BO_NE: {
+      llvm::APSInt LV, RV;
+      CanBeTrue = !(L.isSingleValue(LV) && R.isSingleValue(RV) &&
+                    llvm::APSInt::compareValues(LV, RV) == 0);
+      CanBeFalse = L.intersectsSet(R);
+      break;
+    }
+    case BO_LT:
+      CanBeTrue = llvm::APSInt::compareValues(LMin, RMax) < 0;
+      CanBeFalse = llvm::APSInt::compareValues(LMax, RMin) >= 0;
+      break;
+    case BO_LE:
+      CanBeTrue = llvm::APSInt::compareValues(LMin, RMax) <= 0;
+      CanBeFalse = llvm::APSInt::compareValues(LMax, RMin) > 0;
+      break;
+    case BO_GT:
+      CanBeTrue = llvm::APSInt::compareValues(LMax, RMin) > 0;
+      CanBeFalse = llvm::APSInt::compareValues(LMin, RMax) <= 0;
+      break;
+    case BO_GE:
+      CanBeTrue = llvm::APSInt::compareValues(LMax, RMin) >= 0;
+      CanBeFalse = llvm::APSInt::compareValues(LMin, RMax) < 0;
+      break;
+    default:
+      return std::nullopt;
+    }
+  }
+
+  ThreadSafetyAnalyzer::IntRangeSet Res;
+  if (CanBeFalse)
+    Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
+        ResDom, llvm::APSInt::get(0)));
+  if (CanBeTrue)
+    Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
+        ResDom, llvm::APSInt::get(1)));
+  return Res;
+}
+
+std::optional<ThreadSafetyAnalyzer::IntRangeSet>
+ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
+                                            const TrylockValueState &State,
+                                            unsigned Depth) const {
+  if (!E || Depth > 24 || E->isTypeDependent() || E->isValueDependent())
+    return std::nullopt;
+
+  E = stripNoOpExprWrappers(E);
+  auto DomOpt = getScalarDomain(E->getType());
+  if (!DomOpt)
+    return std::nullopt;
+  const IntDomain &Dom = *DomOpt;
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->isLogicalOp()) {
+      if (auto It = State.ShortCircuitedOps.find(BO);
+          It != State.ShortCircuitedOps.end())
+        return IntRangeSet::single(Dom, llvm::APSInt::get(It->second ? 1 : 0));
+    }
+  }
+
+  if (auto It = State.ExprRanges.find(E); It != State.ExprRanges.end())
+    return reprojectRangeSet(It->second, Dom);
+
+  if (E->getType()->isIntegralOrEnumerationType()) {
+    if (auto ICE = E->getIntegerConstantExpr(*ASTCtx))
+      return IntRangeSet::single(Dom, *ICE);
+  }
+
+  if (isa<CXXNullPtrLiteralExpr, GNUNullExpr>(E))
+    return IntRangeSet::single(Dom, llvm::APSInt::get(0));
+  if (isa<CXXThisExpr>(E))
+    return nonZeroRangeSet(Dom);
+
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+    if (VD) {
+      if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
+        return reprojectRangeSet(It->second, Dom);
+    }
+    return std::nullopt;
+  }
+
+  if (const auto *CE = dyn_cast<CastExpr>(E)) {
+    switch (CE->getCastKind()) {
+    case CK_LValueToRValue:
+    case CK_NoOp: {
+      auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+      return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
+                 : std::nullopt;
+    }
+    case CK_NullToPointer:
+    case CK_NullToMemberPointer:
+      return IntRangeSet::single(Dom, llvm::APSInt::get(0));
+    case CK_ArrayToPointerDecay:
+    case CK_FunctionToPointerDecay:
+      return nonZeroRangeSet(Dom);
+    case CK_BitCast:
+    case CK_DerivedToBase:
+    case CK_UncheckedDerivedToBase:
+      if (CE->getType()->isAnyPointerType() &&
+          CE->getSubExpr()->getType()->isAnyPointerType()) {
+        auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+        return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
+                   : std::nullopt;
+      }
+      return std::nullopt;
+    case CK_IntegralToBoolean:
+    case CK_PointerToBoolean:
+    case CK_MemberPointerToBoolean: {
+      auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
+      auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+      if (!SubDom || !Sub)
+        return std::nullopt;
+      return booleanizeRangeSet(*Sub, *SubDom, Dom);
+    }
+    case CK_BooleanToSignedIntegral: {
+      auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+      return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
+                 : std::nullopt;
+    }
+    case CK_IntegralCast: {
+      if (!CE->getSubExpr()->getType()->isIntegralOrEnumerationType() ||
+          !CE->getType()->isIntegralOrEnumerationType())
+        return std::nullopt;
+      auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+      if (!Sub)
+        return std::nullopt;
+      return castIntegralRangeSet(*Sub, CE->getType(), *ASTCtx);
+    }
+    default:
+      return std::nullopt;
+    }
+  }
+
+  if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+    unsigned BuiltinID = CallExp->getBuiltinCallee();
+    if (BuiltinID == Builtin::BI__builtin_expect ||
+        BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+      auto Sub = evaluatePureExprRange(CallExp->getArg(0), State, Depth + 1);
+      if (!Sub)
+        return std::nullopt;
+      return castIntegralRangeSet(*Sub, CallExp->getType(), *ASTCtx);
+    }
+    return std::nullopt;
+  }
+
+  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+    switch (UO->getOpcode()) {
+    case UO_AddrOf:
+      return nonZeroRangeSet(Dom);
+    case UO_Plus:
+      return evaluatePureExprRange(UO->getSubExpr(), State, Depth + 1);
+    case UO_Minus: {
+      if (!UO->getType()->isIntegralOrEnumerationType())
+        return std::nullopt;
+      auto Sub = evaluatePureExprRange(UO->getSubExpr(), State, Depth + 1);
+      if (!Sub)
+        return std::nullopt;
+      return negateRangeSet(*Sub, UO->getType(), *ASTCtx);
+    }
+    case UO_Not: {
+      if (!UO->getType()->isIntegralOrEnumerationType())
+        return std::nullopt;
+      auto Sub = evaluatePureExprRange(UO->getSubExpr(), State, Depth + 1);
+      llvm::APSInt V;
+      if (!Sub || !Sub->isSingleValue(V))
+        return std::nullopt;
+      unsigned Bits = ASTCtx->getIntWidth(UO->getType());
+      bool IsUnsigned = UO->getType()->isUnsignedIntegerOrEnumerationType();
+      llvm::APSInt NotV = (~V).extOrTrunc(Bits);
+      NotV.setIsUnsigned(IsUnsigned);
+      return IntRangeSet::single(Dom, NotV);
+    }
+    case UO_LNot: {
+      auto SubDom = getScalarDomain(UO->getSubExpr()->getType());
+      auto Sub = evaluatePureExprRange(UO->getSubExpr(), State, Depth + 1);
+      if (!SubDom || !Sub)
+        return std::nullopt;
+      IntRangeSet B = booleanizeRangeSet(*Sub, *SubDom, Dom);
+      llvm::APSInt Z = llvm::APSInt::get(0);
+      llvm::APSInt One = llvm::APSInt::get(1);
+      IntRangeSet Res;
+      if (B.intersects(One, One))
+        Res = Res.unionWith(IntRangeSet::single(Dom, Z));
+      if (B.intersects(Z, Z))
+        Res = Res.unionWith(IntRangeSet::single(Dom, One));
+      return Res;
+    }
+    default:
+      return std::nullopt;
+    }
+  }
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign)
+      return evaluatePureExprRange(BO->getRHS(), State, Depth + 1);
+
+    if (BO->isComparisonOp()) {
+      auto L = evaluatePureExprRange(BO->getLHS(), State, Depth + 1);
+      auto R = evaluatePureExprRange(BO->getRHS(), State, Depth + 1);
+      if (!L || !R)
+        return std::nullopt;
+      bool IsPtrOrMemberPtrCmp =
+          BO->getLHS()->getType()->isAnyPointerType() ||
+          BO->getLHS()->getType()->isMemberPointerType();
+      return compareRangeSets(BO->getOpcode(), *L, *R, Dom,
+                              IsPtrOrMemberPtrCmp);
+    }
+
+    if (BO->isLogicalOp()) {
+      if (auto It = State.ShortCircuitedOps.find(BO);
+          It != State.ShortCircuitedOps.end())
+        return IntRangeSet::single(Dom, llvm::APSInt::get(It->second ? 1 : 0));
+      auto BoolDom = IntDomain::forType(ASTCtx->BoolTy, *ASTCtx);
+      auto EvalBool = [&](const Expr *Op) -> IntRangeSet {
+        auto OpDom = getScalarDomain(Op->getType());
+        auto OpR = evaluatePureExprRange(Op, State, Depth + 1);
+        if (!OpDom || !OpR)
+          return IntRangeSet::full(BoolDom);
+        return booleanizeRangeSet(*OpR, *OpDom, BoolDom);
+      };
+      IntRangeSet LB = EvalBool(BO->getLHS());
+      IntRangeSet RB = EvalBool(BO->getRHS());
+      llvm::APSInt Z = llvm::APSInt::get(0);
+      llvm::APSInt One = llvm::APSInt::get(1);
+      bool L0 = LB.intersects(Z, Z), L1 = LB.intersects(One, One);
+      bool R0 = RB.intersects(Z, Z), R1 = RB.intersects(One, One);
+      bool Can0 = (BO->getOpcode() == BO_LAnd) ? (L0 || R0) : (L0 && R0);
+      bool Can1 = (BO->getOpcode() == BO_LAnd) ? (L1 && R1) : (L1 || R1);
+      IntRangeSet Res;
+      if (Can0)
+        Res = Res.unionWith(IntRangeSet::single(Dom, Z));
+      if (Can1)
+        Res = Res.unionWith(IntRangeSet::single(Dom, One));
+      return Res;
+    }
+
+    if (E->getType()->isIntegralOrEnumerationType()) {
+      auto L = evaluatePureExprRange(BO->getLHS(), State, Depth + 1);
+      auto R = evaluatePureExprRange(BO->getRHS(), State, Depth + 1);
+      llvm::APSInt LV, RV;
+      if (L && R && L->isSingleValue(LV) && R->isSingleValue(RV)) {
+        std::optional<llvm::APSInt> ResV;
+        switch (BO->getOpcode()) {
+        case BO_Add:
+          ResV = LV + RV;
+          break;
+        case BO_Sub:
+          ResV = LV - RV;
+          break;
+        case BO_And:
+          ResV = LV & RV;
+          break;
+        case BO_Or:
+          ResV = LV | RV;
+          break;
+        case BO_Xor:
+          ResV = LV ^ RV;
+          break;
+        default:
+          break;
+        }
+        if (ResV) {
+          unsigned Bits = ASTCtx->getIntWidth(E->getType());
+          bool IsUnsigned = E->getType()->isUnsignedIntegerOrEnumerationType();
+          llvm::APSInt Trunc = ResV->extOrTrunc(Bits);
+          Trunc.setIsUnsigned(IsUnsigned);
+          return IntRangeSet::single(Dom, Trunc);
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  if (const auto *COP = dyn_cast<AbstractConditionalOperator>(E)) {
+    auto CondDom = getScalarDomain(COP->getCond()->getType());
+    if (!CondDom)
+      return std::nullopt;
+    auto BoolDom = IntDomain::forType(ASTCtx->BoolTy, *ASTCtx);
+    IntRangeSet CondB = IntRangeSet::full(BoolDom);
+    if (auto CR = evaluatePureExprRange(COP->getCond(), State, Depth + 1))
+      CondB = booleanizeRangeSet(*CR, *CondDom, BoolDom);
+    llvm::APSInt Z = llvm::APSInt::get(0);
+    llvm::APSInt One = llvm::APSInt::get(1);
+    IntRangeSet Res;
+    if (CondB.intersects(One, One)) {
+      auto TR = evaluatePureExprRange(COP->getTrueExpr(), State, Depth + 1);
+      if (!TR)
+        return std::nullopt;
+      Res = Res.unionWith(reprojectRangeSet(*TR, Dom));
+    }
+    if (CondB.intersects(Z, Z)) {
+      auto FR = evaluatePureExprRange(COP->getFalseExpr(), State, Depth + 1);
+      if (!FR)
+        return std::nullopt;
+      Res = Res.unionWith(reprojectRangeSet(*FR, Dom));
+    }
+    return Res;
+  }
+
+  if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+    const CompoundStmt *CS = SE->getSubStmt();
+    if (CS && CS->size() == 1)
+      if (const auto *SubE = dyn_cast<Expr>(CS->body_back()))
+        return evaluatePureExprRange(SubE, State, Depth + 1);
+    return std::nullopt;
+  }
+
+  return std::nullopt;
+}
+
+static void
+unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
+                    const ThreadSafetyAnalyzer::TrylockValueState &Src,
+                    const ASTContext &Ctx) {
+  if (Src.Infeasible)
+    return;
+  if (Dst.Infeasible) {
+    Dst = Src;
+    return;
+  }
+
+  SmallVector<const ValueDecl *, 4> VarsToErase;
+  for (auto &[VD, R] : Dst.VarRanges) {
+    if (auto It = Src.VarRanges.find(VD); It != Src.VarRanges.end())
+      R = R.unionWith(It->second);
+    else
+      VarsToErase.push_back(VD);
+  }
+  for (const ValueDecl *VD : VarsToErase)
+    Dst.VarRanges.erase(VD);
+
+  SmallVector<const Expr *, 4> ExprsToErase;
+  for (auto &[E, R] : Dst.ExprRanges) {
+    if (auto It = Src.ExprRanges.find(E); It != Src.ExprRanges.end())
+      R = R.unionWith(It->second);
+    else
+      ExprsToErase.push_back(E);
+  }
+  for (const Expr *E : ExprsToErase)
+    Dst.ExprRanges.erase(E);
+
+  SmallVector<const BinaryOperator *, 2> OpsToErase;
+  for (const auto &[BO, Val] : Dst.ShortCircuitedOps) {
+    auto It = Src.ShortCircuitedOps.find(BO);
+    if (It == Src.ShortCircuitedOps.end() || It->second != Val)
+      OpsToErase.push_back(BO);
+  }
+  for (const BinaryOperator *BO : OpsToErase)
+    Dst.ShortCircuitedOps.erase(BO);
+
+  for (const auto &Key : Src.AcquiredTrylockAttrs)
+    Dst.AcquiredTrylockAttrs.insert(Key);
+
+  SmallVector<const ValueDecl *, 2> DefsToErase;
+  for (const auto &[VD, DefPair] : Dst.UnmaterializedVarDefs) {
+    auto It = Src.UnmaterializedVarDefs.find(VD);
+    if (It == Src.UnmaterializedVarDefs.end() ||
+        It->second.first != DefPair.first)
+      DefsToErase.push_back(VD);
+  }
+  for (const ValueDecl *VD : DefsToErase)
+    Dst.UnmaterializedVarDefs.erase(VD);
+}
+
+void ThreadSafetyAnalyzer::constrainLeafCondition(
+    TrylockValueState &State, const Expr *Cond, bool WantTrue,
+    const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
+    unsigned Depth) const {
+  if (State.Infeasible || !Cond || Depth > 24)
+    return;
+
+  Cond = stripNoOpExprWrappers(Cond);
+
+  if (auto CondDom = getScalarDomain(Cond->getType())) {
+    IntRangeSet Zero = IntRangeSet::single(*CondDom, llvm::APSInt::get(0));
+    IntRangeSet Allowed = WantTrue ? Zero.complement(*CondDom) : Zero;
+    if (auto Cur = evaluatePureExprRange(Cond, State, Depth + 1)) {
+      Allowed = Allowed.intersect(*Cur);
+      if (Allowed.empty()) {
+        State.Infeasible = true;
+        return;
+      }
+    }
+    State.ExprRanges[Cond] = std::move(Allowed);
+  }
+
+  if (const auto *CE = dyn_cast<CastExpr>(Cond)) {
+    switch (CE->getCastKind()) {
+    case CK_LValueToRValue:
+    case CK_NoOp:
+    case CK_IntegralToBoolean:
+    case CK_PointerToBoolean:
+    case CK_MemberPointerToBoolean:
+    case CK_BooleanToSignedIntegral:
+      constrainLeafCondition(State, CE->getSubExpr(), WantTrue, EscapedVars,
+                             Depth + 1);
+      return;
+    case CK_IntegralCast:
+      if (isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
+                                        CE->getType(), *ASTCtx))
+        constrainLeafCondition(State, CE->getSubExpr(), WantTrue, EscapedVars,
+                               Depth + 1);
+      return;
+    case CK_BitCast:
+    case CK_DerivedToBase:
+    case CK_UncheckedDerivedToBase:
+      if (CE->getType()->isAnyPointerType() &&
+          CE->getSubExpr()->getType()->isAnyPointerType())
+        constrainLeafCondition(State, CE->getSubExpr(), WantTrue, EscapedVars,
+                               Depth + 1);
+      return;
+    default:
+      return;
+    }
+  }
+
+  if (const auto *CallExp = dyn_cast<CallExpr>(Cond)) {
+    unsigned BuiltinID = CallExp->getBuiltinCallee();
+    if (BuiltinID == Builtin::BI__builtin_expect ||
+        BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+      constrainLeafCondition(State, CallExp->getArg(0), WantTrue, EscapedVars,
+                             Depth + 1);
+      return;
+    }
+    return;
+  }
+
+  if (const auto *SE = dyn_cast<StmtExpr>(Cond)) {
+    const CompoundStmt *CS = SE->getSubStmt();
+    if (CS && CS->size() == 1)
+      if (const auto *SubE = dyn_cast<Expr>(CS->body_back()))
+        constrainLeafCondition(State, SubE, WantTrue, EscapedVars, Depth + 1);
+    return;
+  }
+
+  if (const auto *UO = dyn_cast<UnaryOperator>(Cond)) {
+    if (UO->getOpcode() == UO_LNot)
+      constrainLeafCondition(State, UO->getSubExpr(), !WantTrue, EscapedVars,
+                             Depth + 1);
+    return;
+  }
+
+  if (const ValueDecl *VD = extractTrackableVarExpr(Cond, EscapedVars)) {
+    auto VarDom = getScalarDomain(VD->getType());
+    if (!VarDom)
+      return;
+    IntRangeSet Zero = IntRangeSet::single(*VarDom, llvm::APSInt::get(0));
+    IntRangeSet Constraint = WantTrue ? Zero.complement(*VarDom) : Zero;
+    IntRangeSet Cur = IntRangeSet::full(*VarDom);
+    if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
+      Cur = It->second;
+    IntRangeSet Restricted = Cur.intersect(Constraint);
+    if (Restricted.empty()) {
+      State.Infeasible = true;
+      return;
+    }
+    State.VarRanges[VD] = std::move(Restricted);
+    return;
+  }
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(Cond)) {
+    if (BO->getOpcode() == BO_Comma) {
+      constrainLeafCondition(State, BO->getRHS(), WantTrue, EscapedVars,
+                             Depth + 1);
+      return;
+    }
+    if (BO->getOpcode() == BO_LAnd) {
+      if (WantTrue) {
+        constrainLeafCondition(State, BO->getLHS(), true, EscapedVars,
+                               Depth + 1);
+        constrainLeafCondition(State, BO->getRHS(), true, EscapedVars,
+                               Depth + 1);
+      } else {
+        TrylockValueState LState = State;
+        TrylockValueState RState = State;
+        constrainLeafCondition(LState, BO->getLHS(), false, EscapedVars,
+                               Depth + 1);
+        constrainLeafCondition(RState, BO->getRHS(), false, EscapedVars,
+                               Depth + 1);
+        State.Infeasible = true;
+        unionIntoValueState(State, LState, *ASTCtx);
+        unionIntoValueState(State, RState, *ASTCtx);
+      }
+      return;
+    }
+    if (BO->getOpcode() == BO_LOr) {
+      if (!WantTrue) {
+        constrainLeafCondition(State, BO->getLHS(), false, EscapedVars,
+                               Depth + 1);
+        constrainLeafCondition(State, BO->getRHS(), false, EscapedVars,
+                               Depth + 1);
+      } else {
+        TrylockValueState LState = State;
+        TrylockValueState RState = State;
+        constrainLeafCondition(LState, BO->getLHS(), true, EscapedVars,
+                               Depth + 1);
+        constrainLeafCondition(RState, BO->getRHS(), true, EscapedVars,
+                               Depth + 1);
+        State.Infeasible = true;
+        unionIntoValueState(State, LState, *ASTCtx);
+        unionIntoValueState(State, RState, *ASTCtx);
+      }
+      return;
+    }
+
+    if (BO->isComparisonOp()) {
+      auto TryConstrainVarCmp = [&](const Expr *VarSide, const Expr *ConstSide,
+                                    BinaryOperator::Opcode CmpOp) -> bool {
+        const ValueDecl *VD = extractTrackableVarExpr(VarSide, EscapedVars);
+        if (!VD)
+          return false;
+        auto VarDom = getScalarDomain(VD->getType());
+        if (!VarDom)
+          return false;
+
+        std::optional<llvm::APSInt> KVal;
+        if (auto R = evaluatePureExprRange(ConstSide, State, Depth + 1)) {
+          llvm::APSInt SingleK;
+          if (R->isSingleValue(SingleK))
+            KVal = SingleK;
+        }
+        if (!KVal)
+          return false;
+
+        bool IsPtrOrMemberPtr = VarSide->getType()->isAnyPointerType() ||
+                                VarSide->getType()->isMemberPointerType();
+        if (IsPtrOrMemberPtr && CmpOp != BO_EQ && CmpOp != BO_NE)
+          return false;
+        if (IsPtrOrMemberPtr && *KVal != 0)
+          return false;
+
+        IntRangeSet Constraint =
+            IntRangeSet::forComparison(*VarDom, CmpOp, *KVal);
+        if (!WantTrue)
+          Constraint = Constraint.complement(*VarDom);
+
+        IntRangeSet Cur = IntRangeSet::full(*VarDom);
+        if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
+          Cur = It->second;
+        IntRangeSet Restricted = Cur.intersect(Constraint);
+        if (Restricted.empty())
+          State.Infeasible = true;
+        else
+          State.VarRanges[VD] = std::move(Restricted);
+        return true;
+      };
+
+      if (TryConstrainVarCmp(BO->getLHS(), BO->getRHS(), BO->getOpcode()))
+        return;
+      if (TryConstrainVarCmp(
+              BO->getRHS(), BO->getLHS(),
+              BinaryOperator::reverseComparisonOp(BO->getOpcode())))
+        return;
+
+      if (BO->getOpcode() == BO_EQ || BO->getOpcode() == BO_NE) {
+        auto TryBoolOrZeroEq = [&](const Expr *SubSide,
+                                   const Expr *ConstSide) -> bool {
+          auto R = evaluatePureExprRange(ConstSide, State, Depth + 1);
+          llvm::APSInt K;
+          if (!R || !R->isSingleValue(K))
+            return false;
+          bool Eq = (BO->getOpcode() == BO_EQ) == WantTrue;
+          if (K == 0) {
+            constrainLeafCondition(State, SubSide, !Eq, EscapedVars, Depth + 1);
+            return true;
+          }
+          QualType SubTy = SubSide->getType();
+          const Expr *StrippedSub = stripNoOpExprWrappers(SubSide);
+          bool IsZeroOrOne =
+              SubTy->isBooleanType() ||
+              (isa<UnaryOperator>(StrippedSub) &&
+               cast<UnaryOperator>(StrippedSub)->getOpcode() == UO_LNot) ||
+              (isa<BinaryOperator>(StrippedSub) &&
+               (cast<BinaryOperator>(StrippedSub)->isComparisonOp() ||
+                cast<BinaryOperator>(StrippedSub)->isLogicalOp()));
+          if (!IsZeroOrOne)
+            return false;
+          if (K == 1) {
+            constrainLeafCondition(State, SubSide, Eq, EscapedVars, Depth + 1);
+            return true;
+          }
+          if (Eq)
+            State.Infeasible = true;
+          return true;
+        };
+        if (TryBoolOrZeroEq(BO->getLHS(), BO->getRHS()))
+          return;
+        if (TryBoolOrZeroEq(BO->getRHS(), BO->getLHS()))
+          return;
+      }
+    }
+  }
+}
+
+void ThreadSafetyAnalyzer::constrainValueStateOnEdge(
+    TrylockValueState &State, const CFGBlock *PredBlock,
+    const CFGBlock *CurrBlock,
+    const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const {
+  if (State.Infeasible)
+    return;
+
+  const Stmt *Term = PredBlock->getTerminatorStmt();
+  if (!Term || isa<IndirectGotoStmt>(Term))
+    return;
+
+  if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
+    const Expr *Cond = SS->getCond();
+    if (!Cond)
+      return;
+    const ValueDecl *VD = extractTrackableVarExpr(Cond, EscapedVars);
+    auto DomOpt =
+        VD ? getScalarDomain(VD->getType()) : getScalarDomain(Cond->getType());
+    if (!DomOpt)
+      return;
+    const IntDomain &Dom = *DomOpt;
+    const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
+    if (!Table.Valid)
+      return;
+    const auto *TargetCS = dyn_cast_if_present<CaseStmt>(CurrBlock->getLabel());
+    IntRangeSet EdgeSet;
+    if (auto It = Table.CaseSets.find(TargetCS); It != Table.CaseSets.end()) {
+      EdgeSet = It->second;
+    } else {
+      if (!isa_and_nonnull<DefaultStmt>(CurrBlock->getLabel()) &&
+          SS->isAllEnumCasesCovered()) {
+        State.Infeasible = true;
+        return;
+      }
+      EdgeSet = Table.DefaultSet;
+    }
+
+    if (VD) {
+      IntRangeSet Cur = IntRangeSet::full(Dom);
+      if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
+        Cur = It->second;
+      IntRangeSet Restricted = Cur.intersect(EdgeSet);
+      if (Restricted.empty()) {
+        State.Infeasible = true;
+        return;
+      }
+      State.VarRanges[VD] = std::move(Restricted);
+    }
+    if (auto CondDom = getScalarDomain(Cond->getType())) {
+      const Expr *StrippedCond = stripNoOpExprWrappers(Cond);
+      IntRangeSet CondEdge = reprojectRangeSet(EdgeSet, *CondDom);
+      if (auto Cur = evaluatePureExprRange(StrippedCond, State))
+        CondEdge = CondEdge.intersect(*Cur);
+      if (CondEdge.empty()) {
+        State.Infeasible = true;
+        return;
+      }
+      State.ExprRanges[StrippedCond] = std::move(CondEdge);
+    }
+    return;
+  }
+
+  const auto *RawCond =
+      dyn_cast_or_null<Expr>(PredBlock->getTerminatorCondition());
+  if (!RawCond)
+    return;
+
+  bool MatchesTrue = false;
+  bool MatchesFalse = false;
+  int BranchIdx = 0;
+  for (auto SI = PredBlock->succ_begin(), SE = PredBlock->succ_end();
+       SI != SE && BranchIdx < 2; ++SI, ++BranchIdx) {
+    if (*SI == CurrBlock) {
+      if (BranchIdx == 0)
+        MatchesTrue = true;
+      else
+        MatchesFalse = true;
+    }
+  }
+  if (MatchesTrue == MatchesFalse)
+    return;
+
+  bool TakeTrue = MatchesTrue;
+  if (const auto *TermBO = dyn_cast<BinaryOperator>(Term)) {
+    if (TermBO->getOpcode() == BO_LAnd && !TakeTrue)
+      State.ShortCircuitedOps[TermBO] = false;
+    else if (TermBO->getOpcode() == BO_LOr && TakeTrue)
+      State.ShortCircuitedOps[TermBO] = true;
+  }
+
+  // In Clang's linearized CFG, PredBlock evaluated the rightmost leaf of any
+  // top-level && / || chain in RawCond.
+  const Expr *LeafCond = stripNoOpExprWrappers(RawCond);
+  while (const auto *BO = dyn_cast<BinaryOperator>(LeafCond)) {
+    if (!BO->isLogicalOp())
+      break;
+    LeafCond = stripNoOpExprWrappers(BO->getRHS());
+  }
+
+  constrainLeafCondition(State, LeafCond, TakeTrue, EscapedVars);
+  if (State.Infeasible)
+    return;
+
+  const Expr *StrippedRaw = stripNoOpExprWrappers(RawCond);
+  if (StrippedRaw != LeafCond) {
+    if (auto RawDom = getScalarDomain(StrippedRaw->getType())) {
+      IntRangeSet Zero = IntRangeSet::single(*RawDom, llvm::APSInt::get(0));
+      IntRangeSet Allowed = TakeTrue ? Zero.complement(*RawDom) : Zero;
+      if (auto Cur = evaluatePureExprRange(StrippedRaw, State))
+        Allowed = Allowed.intersect(*Cur);
+      if (Allowed.empty()) {
+        State.Infeasible = true;
+        return;
+      }
+      State.ExprRanges[StrippedRaw] = std::move(Allowed);
+    }
+    if (const auto *RawBO = dyn_cast<BinaryOperator>(StrippedRaw)) {
+      if (RawBO->isLogicalOp())
+        constrainLeafCondition(State, StrippedRaw, TakeTrue, EscapedVars);
+    }
+  }
+}
+
+void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
+    FactSet &Lockset, TrylockValueState &State) {
+  if (State.Infeasible || State.UnmaterializedVarDefs.empty())
+    return;
+
+  auto UnwrapDirectTrylockCall =
+      [&](const Expr *E, LocalVarContext Ctx, QualType VarTy,
+          bool &PreservesExactInt) -> const CallExpr * {
+    PreservesExactInt = true;
+    while (E) {
+      E = stripNoOpExprWrappers(E);
+      if (const auto *CE = dyn_cast<CastExpr>(E)) {
+        switch (CE->getCastKind()) {
+        case CK_LValueToRValue:
+        case CK_NoOp:
+          E = CE->getSubExpr();
+          continue;
+        case CK_IntegralCast:
+          if (isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
+                                            CE->getType(), *ASTCtx)) {
+            E = CE->getSubExpr();
+            continue;
+          }
+          return nullptr;
+        case CK_BitCast:
+        case CK_DerivedToBase:
+        case CK_UncheckedDerivedToBase:
+          if (CE->getType()->isAnyPointerType() &&
+              CE->getSubExpr()->getType()->isAnyPointerType()) {
+            PreservesExactInt = false;
+            E = CE->getSubExpr();
+            continue;
+          }
+          return nullptr;
+        case CK_IntegralToBoolean:
+        case CK_PointerToBoolean:
+        case CK_MemberPointerToBoolean:
+          if (VarTy->isBooleanType()) {
+            PreservesExactInt = false;
+            E = CE->getSubExpr();
+            continue;
+          }
+          return nullptr;
+        default:
+          return nullptr;
+        }
+      }
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+        E = LocalVarMap.lookupExpr(DRE->getDecl(), Ctx);
+        continue;
+      }
+      if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+        if (BO->getOpcode() == BO_Assign) {
+          E = BO->getRHS();
+          continue;
+        }
+        return nullptr;
+      }
+      if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+        if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
+          E = dyn_cast<Expr>(CS->body_back());
+          continue;
+        }
+        return nullptr;
+      }
+      if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+        unsigned BuiltinID = CallExp->getBuiltinCallee();
+        if (BuiltinID == Builtin::BI__builtin_expect ||
+            BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+          E = CallExp->getArg(0);
+          continue;
+        }
+        return CallExp;
+      }
+      return nullptr;
+    }
+    return nullptr;
+  };
+
+  auto AddTrylockFact = [&](const CapabilityExpr &Cap, LockKind LK,
+                            SourceLocation Loc) {
+    const FactEntry *Existing = Lockset.findLock(FactMan, Cap);
+    if (Existing && Existing->loc() == Loc && !Existing->asserted()) {
+      // The fact comes from the same trylock call, e.g. because a join kept
+      // the shared fact of a call that acquires the capability exclusively
+      // for other return values. Refine the lock kind instead of reporting a
+      // double acquisition.
+      if (Existing->kind() != LK)
+        Lockset.replaceLock(FactMan, Cap,
+                           FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
+      return;
+    }
+    addLock(Lockset, FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
+  };
+
+  for (const auto &[VD, DefPair] : State.UnmaterializedVarDefs) {
+    auto VR = State.VarRanges.find(VD);
+    if (VR == State.VarRanges.end() || VR->second.empty())
+      continue;
+    auto VarDom = getScalarDomain(VD->getType());
+    if (!VarDom)
+      continue;
+    bool PreservesExactInt = false;
+    const CallExpr *CallExp = UnwrapDirectTrylockCall(
+        DefPair.first, DefPair.second, VD->getType(), PreservesExactInt);
+    if (!CallExp)
+      continue;
+    const auto *Callee = dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl());
+    if (!Callee)
+      continue;
+
+    std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
+    if (Handler.issueBetaWarnings()) {
+      SxBuilder.setLookupLocalVarExpr(
+          [this, LookupCtx = DefPair.second](const NamedDecl *D) mutable
+              -> const Expr * { return LocalVarMap.lookupExpr(D, LookupCtx); });
+      Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
+    }
+
+    CapExprSet ExclusiveLocksToAdd;
+    CapExprSet SharedLocksToAdd;
+
+    for (const auto *Attr :
+         Callee->specific_attrs<TryAcquireCapabilityAttr>()) {
+      if (State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
+        continue;
+      bool SuccBool = false;
+      if (!evalTrylockSuccessBool(Attr->getSuccessValue(), *ASTCtx, SuccBool))
+        continue;
+      IntRangeSet SuccSet = IntRangeSet::single(*VarDom, llvm::APSInt::get(0));
+      if (SuccBool)
+        SuccSet = SuccSet.complement(*VarDom);
+      if (VR->second.subsetOfSet(SuccSet)) {
+        CapExprSet AttrLocks;
+        getMutexIDs(AttrLocks, Attr, CallExp, Callee);
+        if (!AttrLocks.empty()) {
+          State.AcquiredTrylockAttrs.insert({CallExp, Attr});
+          CapExprSet &Dest =
+              Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd;
+          for (const auto &Cap : AttrLocks)
+            Dest.push_back_nodup(Cap);
+        }
+      }
+    }
+
+    if (PreservesExactInt &&
+        CallExp->getType()->isIntegralOrEnumerationType() &&
+        VD->getType()->isIntegralOrEnumerationType()) {
+      for (const auto *Attr :
+           Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
+        if (State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
+          continue;
+        if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue())
+          continue;
+        auto First =
+            Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+        auto Last =
+            Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+        if (!First || !Last)
+          continue;
+        IntRangeSet SuccSet = IntRangeSet::closedRange(*VarDom, *First, *Last);
+        if (VR->second.subsetOfSet(SuccSet)) {
+          CapExprSet AttrLocks;
+          getMutexIDs(AttrLocks, Attr, CallExp, Callee);
+          if (!AttrLocks.empty()) {
+            State.AcquiredTrylockAttrs.insert({CallExp, Attr});
+            CapExprSet &Dest =
+                Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd;
+            for (const auto &Cap : AttrLocks)
+              Dest.push_back_nodup(Cap);
+          }
+        }
+      }
+    }
+
+    SourceLocation Loc = CallExp->getExprLoc();
+    for (const auto &Cap : ExclusiveLocksToAdd)
+      AddTrylockFact(Cap, LK_Exclusive, Loc);
+    for (const auto &Cap : SharedLocksToAdd)
+      AddTrylockFact(Cap, LK_Shared, Loc);
+  }
+}
+
+void ThreadSafetyAnalyzer::updateValueStateForStmt(
+    TrylockValueState &State, const Stmt *S, LocalVarContext StmtCtx,
+    const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) {
+  if (State.Infeasible || !S)
+    return;
+
+  if (const auto *E = dyn_cast<Expr>(S)) {
+    State.ExprRanges.erase(stripNoOpExprWrappers(E));
+    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+      if (BO->isLogicalOp()) {
+        if (auto It = State.ShortCircuitedOps.find(BO);
+            It != State.ShortCircuitedOps.end()) {
+          // Preserve ShortCircuitedOps[BO] so the enclosing statement can read
+          // the short-circuited value.
+        }
+      }
+    }
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+      SmallVector<AcquiredTrylockKey, 2> ToErase;
+      for (const auto &Key : State.AcquiredTrylockAttrs)
+        if (Key.first == CE)
+          ToErase.push_back(Key);
+      for (const auto &Key : ToErase)
+        State.AcquiredTrylockAttrs.erase(Key);
+    }
+  }
+
+  auto UpdateVarFromExpr = [&](const ValueDecl *VD, const Expr *RHS) {
+    VD = cast<ValueDecl>(VD->getCanonicalDecl());
+    if (!isTrackableLocalVar(VD, EscapedVars)) {
+      State.VarRanges.erase(VD);
+      State.UnmaterializedVarDefs.erase(VD);
+      return;
+    }
+    if (!RHS) {
+      State.VarRanges.erase(VD);
+      State.UnmaterializedVarDefs.erase(VD);
+      return;
+    }
+    if (const ValueDecl *SrcVD = extractTrackableVarExpr(RHS, EscapedVars)) {
+      if (auto DefIt = State.UnmaterializedVarDefs.find(SrcVD);
+          DefIt != State.UnmaterializedVarDefs.end()) {
+        // Copy the definition first: inserting VD may grow the map and
+        // invalidate DefIt.
+        auto Def = DefIt->second;
+        State.UnmaterializedVarDefs.insert_or_assign(VD, Def);
+      } else if (exprHasUnmaterializedTrylock(RHS, StmtCtx, State,
+                                              /*UseStateDefs=*/true))
+        State.UnmaterializedVarDefs.insert_or_assign(
+            VD, std::make_pair(RHS, StmtCtx));
+      else
+        State.UnmaterializedVarDefs.erase(VD);
+    } else if (exprHasUnmaterializedTrylock(RHS, StmtCtx, State,
+                                            /*UseStateDefs=*/true)) {
+      State.UnmaterializedVarDefs.insert_or_assign(
+          VD, std::make_pair(RHS, StmtCtx));
+    } else {
+      State.UnmaterializedVarDefs.erase(VD);
+    }
+
+    auto VarDom = getScalarDomain(VD->getType());
+    auto R = evaluatePureExprRange(RHS, State);
+    if (VarDom && R)
+      State.VarRanges[VD] = reprojectRangeSet(*R, *VarDom);
+    else
+      State.VarRanges.erase(VD);
+  };
+
+  if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+    for (const Decl *D : DS->decls())
+      if (const auto *VD = dyn_cast<VarDecl>(D))
+        UpdateVarFromExpr(VD, VD->getInit());
+    return;
+  }
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
+    if (!BO->isAssignmentOp())
+      return;
+    const auto *DRE = unwrapDirectLValueDRE(BO->getLHS());
+    if (!DRE)
+      return;
+    const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+    if (!VD)
+      return;
+    if (BO->getOpcode() == BO_Assign) {
+      UpdateVarFromExpr(VD, BO->getRHS());
+      if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
+        State.ExprRanges[stripNoOpExprWrappers(BO)] = It->second;
+    } else {
+      State.UnmaterializedVarDefs.erase(VD);
+      // Arithmetic on a bool converts the result back to bool instead of
+      // wrapping it. Do not model that.
+      if (isTrackableLocalVar(VD, EscapedVars) &&
+          VD->getType()->isIntegralOrEnumerationType() &&
+          !VD->getType()->isBooleanType()) {
+        auto L = evaluatePureExprRange(BO->getLHS(), State);
+        auto R = evaluatePureExprRange(BO->getRHS(), State);
+        llvm::APSInt LV, RV;
+        if (L && R && L->isSingleValue(LV) && R->isSingleValue(RV) &&
+            (BO->getOpcode() == BO_AddAssign ||
+             BO->getOpcode() == BO_SubAssign)) {
+          unsigned W = std::max(LV.getBitWidth(), RV.getBitWidth()) + 1;
+          LV = LV.extend(W);
+          RV = RV.extend(W);
+          llvm::APSInt ResV =
+              (BO->getOpcode() == BO_AddAssign) ? (LV + RV) : (LV - RV);
+          unsigned Bits = ASTCtx->getIntWidth(VD->getType());
+          bool IsUnsigned = VD->getType()->isUnsignedIntegerOrEnumerationType();
+          llvm::APSInt Trunc = ResV.extOrTrunc(Bits);
+          Trunc.setIsUnsigned(IsUnsigned);
+          auto VarDom = *getScalarDomain(VD->getType());
+          State.VarRanges[VD] = IntRangeSet::single(VarDom, Trunc);
+          return;
+        }
+      }
+      State.VarRanges.erase(VD);
+    }
+    return;
+  }
+
+  if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
+    if (!UO->isIncrementDecrementOp())
+      return;
+    const auto *DRE = unwrapDirectLValueDRE(UO->getSubExpr());
+    if (!DRE)
+      return;
+    const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+    if (!VD)
+      return;
+    State.UnmaterializedVarDefs.erase(VD);
+    if (isTrackableLocalVar(VD, EscapedVars) &&
+        VD->getType()->isIntegralOrEnumerationType() &&
+        !VD->getType()->isBooleanType()) {
+      if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end()) {
+        llvm::APSInt V;
+        if (It->second.isSingleValue(V)) {
+          llvm::APInt NextV = UO->isIncrementOp() ? (V + 1) : (V - 1);
+          unsigned Bits = ASTCtx->getIntWidth(VD->getType());
+          bool IsUnsigned = VD->getType()->isUnsignedIntegerOrEnumerationType();
+          llvm::APSInt Trunc(NextV.sextOrTrunc(Bits), IsUnsigned);
+          auto VarDom = *getScalarDomain(VD->getType());
+          if (UO->isPrefix())
+            State.ExprRanges[stripNoOpExprWrappers(UO)] =
+                IntRangeSet::single(VarDom, Trunc);
+          else
+            State.ExprRanges[stripNoOpExprWrappers(UO)] = It->second;
+          State.VarRanges[VD] = IntRangeSet::single(VarDom, Trunc);
+          return;
+        }
+      }
+    }
+    State.VarRanges.erase(VD);
+  }
+}
+
+bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
+    const Expr *E, LocalVarContext Ctx, const TrylockValueState &State,
+    bool UseStateDefs, unsigned Depth) {
+  if (!E || Depth > 24)
+    return false;
+  E = stripNoOpExprWrappers(E);
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->isLogicalOp() && UseStateDefs &&
+        State.ShortCircuitedOps.contains(BO))
+      return false;
+  }
+
+  if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+    unsigned BuiltinID = CallExp->getBuiltinCallee();
+    if (BuiltinID == Builtin::BI__builtin_expect ||
+        BuiltinID == Builtin::BI__builtin_expect_with_probability)
+      return exprHasUnmaterializedTrylock(CallExp->getArg(0), Ctx, State,
+                                          UseStateDefs, Depth + 1);
+    if (const auto *Callee =
+            dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl())) {
+      for (const auto *Attr :
+           Callee->specific_attrs<TryAcquireCapabilityAttr>())
+        if (!State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
+          return true;
+      if (CallExp->getType()->isIntegralOrEnumerationType()) {
+        for (const auto *Attr :
+             Callee->specific_attrs<TryAcquireCapabilityRangeAttr>())
+          if (!State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
+            return true;
+      }
+    }
+    return false;
+  }
+
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+    if (UseStateDefs && VD) {
+      if (auto It = State.UnmaterializedVarDefs.find(VD);
+          It != State.UnmaterializedVarDefs.end())
+        return exprHasUnmaterializedTrylock(It->second.first, It->second.second,
+                                            State, /*UseStateDefs=*/false,
+                                            Depth + 1);
+    }
+    LocalVarContext SubCtx = Ctx;
+    if (const Expr *DefE = LocalVarMap.lookupExpr(DRE->getDecl(), SubCtx))
+      return exprHasUnmaterializedTrylock(DefE, SubCtx, State,
+                                          /*UseStateDefs=*/false, Depth + 1);
+    return false;
+  }
+
+  if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+    if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty())
+      if (const auto *Last = dyn_cast<Expr>(CS->body_back()))
+        return exprHasUnmaterializedTrylock(Last, Ctx, State, UseStateDefs,
+                                            Depth + 1);
+    return false;
+  }
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign)
+      return exprHasUnmaterializedTrylock(BO->getRHS(), Ctx, State,
+                                          UseStateDefs, Depth + 1);
+  }
+
+  for (const Stmt *Child : E->children())
+    if (const auto *ChildE = dyn_cast_or_null<Expr>(Child))
+      if (exprHasUnmaterializedTrylock(ChildE, Ctx, State, UseStateDefs,
+                                       Depth + 1))
+        return true;
+  return false;
+}
+
+void ThreadSafetyAnalyzer::evaluateReturnOutcomes(
+    const Expr *E, const IntDomain &TargetDom, const FactSet &InLockset,
+    const SmallVectorImpl<PendingTrylockAcquire> &InPending,
+    const TrylockValueState &State, LocalVarContext Ctx, bool UseVarRanges,
+    SmallVectorImpl<ReturnEvalOutcome> &Out, unsigned Depth) {
+  evaluateReturnOutcomesImpl(E, TargetDom, InLockset, InPending, State, Ctx,
+                             UseVarRanges, Out, Depth);
+}
+
+void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
+    const Expr *E, const IntDomain &TargetDom, const FactSet &InLockset,
+    const SmallVectorImpl<PendingTrylockAcquire> &InPending,
+    const TrylockValueState &State, LocalVarContext Ctx, bool UseVarRanges,
+    SmallVectorImpl<ReturnEvalOutcome> &Out, unsigned Depth) {
+  if (State.Infeasible)
+    return;
+
+  auto EmitDefault = [&]() {
+    ReturnEvalOutcome O;
+    O.Values = IntRangeSet::full(TargetDom);
+    O.Lockset = InLockset;
+    O.PendingAcquires.assign(InPending.begin(), InPending.end());
+    Out.push_back(std::move(O));
+  };
+
+  if (!E || Depth > 24 || E->isTypeDependent() || E->isValueDependent()) {
+    EmitDefault();
+    return;
+  }
+
+  E = stripNoOpExprWrappers(E);
+  size_t StartIdx = Out.size();
+  auto ApplyExprConstraint = [&]() {
+    if (!UseVarRanges && !isa<CallExpr>(E))
+      return;
+    auto It = State.ExprRanges.find(E);
+    if (It == State.ExprRanges.end())
+      return;
+    IntRangeSet Allowed = reprojectRangeSet(It->second, TargetDom);
+    size_t WriteIdx = StartIdx;
+    for (size_t I = StartIdx; I < Out.size(); ++I) {
+      Out[I].Values = Out[I].Values.intersect(Allowed);
+      if (!Out[I].Values.empty()) {
+        if (WriteIdx != I)
+          Out[WriteIdx] = std::move(Out[I]);
+        ++WriteIdx;
+      }
+    }
+    Out.truncate(WriteIdx);
+  };
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->isLogicalOp() && UseVarRanges) {
+      if (auto It = State.ShortCircuitedOps.find(BO);
+          It != State.ShortCircuitedOps.end()) {
+        ReturnEvalOutcome O;
+        O.Values = IntRangeSet::single(TargetDom,
+                                       llvm::APSInt::get(It->second ? 1 : 0));
+        O.Lockset = InLockset;
+        O.PendingAcquires.assign(InPending.begin(), InPending.end());
+        Out.push_back(std::move(O));
+        ApplyExprConstraint();
+        return;
+      }
+    }
+  }
+
+  if (!exprHasUnmaterializedTrylock(E, Ctx, State, UseVarRanges)) {
+    TrylockValueState EmptyState;
+    const TrylockValueState &EvalState = UseVarRanges ? State : EmptyState;
+    if (auto R = evaluatePureExprRange(E, EvalState)) {
+      IntRangeSet Mapped = reprojectRangeSet(*R, TargetDom);
+      if (!Mapped.empty()) {
+        ReturnEvalOutcome O;
+        O.Values = std::move(Mapped);
+        O.Lockset = InLockset;
+        O.PendingAcquires.assign(InPending.begin(), InPending.end());
+        Out.push_back(std::move(O));
+      }
+      ApplyExprConstraint();
+      return;
+    }
+    EmitDefault();
+    ApplyExprConstraint();
+    return;
+  }
+
+  if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+    if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
+      if (const auto *Last = dyn_cast<Expr>(CS->body_back())) {
+        evaluateReturnOutcomes(Last, TargetDom, InLockset, InPending, State,
+                               Ctx, UseVarRanges, Out, Depth + 1);
+        ApplyExprConstraint();
+        return;
+      }
+    }
+    EmitDefault();
+    ApplyExprConstraint();
+    return;
+  }
+
+  if (const auto *CE = dyn_cast<CastExpr>(E)) {
+    switch (CE->getCastKind()) {
+    case CK_LValueToRValue:
+    case CK_NoOp:
+      evaluateReturnOutcomes(CE->getSubExpr(), TargetDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Out, Depth + 1);
+      ApplyExprConstraint();
+      return;
+    case CK_BitCast:
+    case CK_DerivedToBase:
+    case CK_UncheckedDerivedToBase:
+      if (CE->getType()->isAnyPointerType() &&
+          CE->getSubExpr()->getType()->isAnyPointerType()) {
+        evaluateReturnOutcomes(CE->getSubExpr(), TargetDom, InLockset,
+                               InPending, State, Ctx, UseVarRanges, Out,
+                               Depth + 1);
+        ApplyExprConstraint();
+        return;
+      }
+      EmitDefault();
+      ApplyExprConstraint();
+      return;
+    case CK_IntegralToBoolean:
+    case CK_PointerToBoolean:
+    case CK_MemberPointerToBoolean: {
+      auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
+      if (!SubDom) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      SmallVector<ReturnEvalOutcome, 2> Sub;
+      evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Sub, Depth + 1);
+      IntRangeSet Zero = IntRangeSet::single(*SubDom, llvm::APSInt::get(0));
+      IntRangeSet NonZero = Zero.complement(*SubDom);
+      for (auto &SO : Sub) {
+        if (!SO.Values.intersect(Zero).empty()) {
+          ReturnEvalOutcome O = SO;
+          O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
+          Out.push_back(std::move(O));
+        }
+        if (!SO.Values.intersect(NonZero).empty()) {
+          ReturnEvalOutcome O = std::move(SO);
+          O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
+          Out.push_back(std::move(O));
+        }
+      }
+      ApplyExprConstraint();
+      return;
+    }
+    case CK_BooleanToSignedIntegral: {
+      auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
+      if (!SubDom) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      SmallVector<ReturnEvalOutcome, 2> Sub;
+      evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Sub, Depth + 1);
+      for (auto &SO : Sub) {
+        SO.Values = reprojectRangeSet(SO.Values, TargetDom);
+        if (!SO.Values.empty())
+          Out.push_back(std::move(SO));
+      }
+      ApplyExprConstraint();
+      return;
+    }
+    case CK_IntegralCast: {
+      if (!CE->getSubExpr()->getType()->isIntegralOrEnumerationType() ||
+          !CE->getType()->isIntegralOrEnumerationType()) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      IntDomain SubDom =
+          IntDomain::forType(CE->getSubExpr()->getType(), *ASTCtx);
+      SmallVector<ReturnEvalOutcome, 2> Sub;
+      evaluateReturnOutcomes(CE->getSubExpr(), SubDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Sub, Depth + 1);
+      for (auto &SO : Sub) {
+        SO.Values = reprojectRangeSet(
+            castIntegralRangeSet(SO.Values, CE->getType(), *ASTCtx), TargetDom);
+        if (!SO.Values.empty())
+          Out.push_back(std::move(SO));
+      }
+      ApplyExprConstraint();
+      return;
+    }
+    default:
+      EmitDefault();
+      ApplyExprConstraint();
+      return;
+    }
+  }
+
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+    const Expr *DefE = nullptr;
+    LocalVarContext DefCtx = Ctx;
+    if (UseVarRanges && VD) {
+      if (auto It = State.UnmaterializedVarDefs.find(VD);
+          It != State.UnmaterializedVarDefs.end()) {
+        DefE = It->second.first;
+        DefCtx = It->second.second;
+      }
+    }
+    if (!DefE) {
+      DefCtx = Ctx;
+      DefE = LocalVarMap.lookupExpr(DRE->getDecl(), DefCtx);
+    }
+    if (DefE) {
+      if (auto SubDom = getScalarDomain(DefE->getType())) {
+        SmallVector<ReturnEvalOutcome, 2> Sub;
+        evaluateReturnOutcomes(DefE, *SubDom, InLockset, InPending, State,
+                               DefCtx, /*UseVarRanges=*/false, Sub, Depth + 1);
+        std::optional<IntRangeSet> VarConstraint;
+        if (UseVarRanges && VD) {
+          if (auto VR = State.VarRanges.find(VD); VR != State.VarRanges.end())
+            VarConstraint = reprojectRangeSet(VR->second, TargetDom);
+        }
+        for (auto &SO : Sub) {
+          SO.Values = reprojectRangeSet(SO.Values, TargetDom);
+          if (VarConstraint)
+            SO.Values = SO.Values.intersect(*VarConstraint);
+          if (!SO.Values.empty())
+            Out.push_back(std::move(SO));
+        }
+        ApplyExprConstraint();
+        return;
+      }
+    }
+    EmitDefault();
+    ApplyExprConstraint();
+    return;
+  }
+
+  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+    switch (UO->getOpcode()) {
+    case UO_Plus:
+      evaluateReturnOutcomes(UO->getSubExpr(), TargetDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Out, Depth + 1);
+      ApplyExprConstraint();
+      return;
+    case UO_Minus: {
+      if (!UO->getType()->isIntegralOrEnumerationType()) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      SmallVector<ReturnEvalOutcome, 2> Sub;
+      evaluateReturnOutcomes(UO->getSubExpr(), TargetDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Sub, Depth + 1);
+      for (auto &SO : Sub) {
+        SO.Values = reprojectRangeSet(
+            negateRangeSet(SO.Values, UO->getType(), *ASTCtx), TargetDom);
+        if (!SO.Values.empty())
+          Out.push_back(std::move(SO));
+      }
+      ApplyExprConstraint();
+      return;
+    }
+    case UO_LNot: {
+      auto SubDom = getScalarDomain(UO->getSubExpr()->getType());
+      if (!SubDom) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      SmallVector<ReturnEvalOutcome, 2> Sub;
+      evaluateReturnOutcomes(UO->getSubExpr(), *SubDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Sub, Depth + 1);
+      IntRangeSet Zero = IntRangeSet::single(*SubDom, llvm::APSInt::get(0));
+      IntRangeSet NonZero = Zero.complement(*SubDom);
+      for (auto &SO : Sub) {
+        if (!SO.Values.intersect(Zero).empty()) {
+          ReturnEvalOutcome O = SO;
+          O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
+          Out.push_back(std::move(O));
+        }
+        if (!SO.Values.intersect(NonZero).empty()) {
+          ReturnEvalOutcome O = std::move(SO);
+          O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
+          Out.push_back(std::move(O));
+        }
+      }
+      ApplyExprConstraint();
+      return;
+    }
+    default:
+      EmitDefault();
+      ApplyExprConstraint();
+      return;
+    }
+  }
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign) {
+      evaluateReturnOutcomes(BO->getRHS(), TargetDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Out, Depth + 1);
+      ApplyExprConstraint();
+      return;
+    }
+
+    if (BO->isComparisonOp()) {
+      auto LDom = getScalarDomain(BO->getLHS()->getType());
+      auto RDom = getScalarDomain(BO->getRHS()->getType());
+      if (!LDom || !RDom) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      bool IsPtrOrMemberPtrCmp =
+          BO->getLHS()->getType()->isAnyPointerType() ||
+          BO->getLHS()->getType()->isMemberPointerType();
+      SmallVector<ReturnEvalOutcome, 2> LHSOut;
+      evaluateReturnOutcomes(BO->getLHS(), *LDom, InLockset, InPending, State,
+                             Ctx, UseVarRanges, LHSOut, Depth + 1);
+      for (const auto &LO : LHSOut) {
+        SmallVector<ReturnEvalOutcome, 2> RHSOut;
+        evaluateReturnOutcomes(BO->getRHS(), *RDom, LO.Lockset,
+                               LO.PendingAcquires, State, Ctx, UseVarRanges,
+                               RHSOut, Depth + 1);
+        for (auto &RO : RHSOut) {
+          auto Cmp = compareRangeSets(BO->getOpcode(), LO.Values, RO.Values,
+                                      TargetDom, IsPtrOrMemberPtrCmp);
+          if (!Cmp) {
+            RO.Values = IntRangeSet::full(TargetDom);
+            Out.push_back(std::move(RO));
+            continue;
+          }
+          llvm::APSInt Z = llvm::APSInt::get(0);
+          llvm::APSInt One = llvm::APSInt::get(1);
+          if (Cmp->intersects(Z, Z)) {
+            ReturnEvalOutcome O = RO;
+            O.Values = IntRangeSet::single(TargetDom, Z);
+            Out.push_back(std::move(O));
+          }
+          if (Cmp->intersects(One, One)) {
+            ReturnEvalOutcome O = std::move(RO);
+            O.Values = IntRangeSet::single(TargetDom, One);
+            Out.push_back(std::move(O));
+          }
+        }
+      }
+      ApplyExprConstraint();
+      return;
+    }
+
+    if (BO->isLogicalOp()) {
+      auto LDom = getScalarDomain(BO->getLHS()->getType());
+      auto RDom = getScalarDomain(BO->getRHS()->getType());
+      if (!LDom || !RDom) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      SmallVector<ReturnEvalOutcome, 2> LHSOut;
+      evaluateReturnOutcomes(BO->getLHS(), *LDom, InLockset, InPending, State,
+                             Ctx, UseVarRanges, LHSOut, Depth + 1);
+      IntRangeSet ZeroL = IntRangeSet::single(*LDom, llvm::APSInt::get(0));
+      IntRangeSet NonZeroL = ZeroL.complement(*LDom);
+      IntRangeSet ZeroR = IntRangeSet::single(*RDom, llvm::APSInt::get(0));
+      IntRangeSet NonZeroR = ZeroR.complement(*RDom);
+
+      for (const auto &LO : LHSOut) {
+        if (BO->getOpcode() == BO_LAnd) {
+          if (!LO.Values.intersect(ZeroL).empty()) {
+            ReturnEvalOutcome O = LO;
+            O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
+            Out.push_back(std::move(O));
+          }
+          if (!LO.Values.intersect(NonZeroL).empty()) {
+            SmallVector<ReturnEvalOutcome, 2> RHSOut;
+            evaluateReturnOutcomes(BO->getRHS(), *RDom, LO.Lockset,
+                                   LO.PendingAcquires, State, Ctx, UseVarRanges,
+                                   RHSOut, Depth + 1);
+            for (auto &RO : RHSOut) {
+              if (!RO.Values.intersect(ZeroR).empty()) {
+                ReturnEvalOutcome O = RO;
+                O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
+                Out.push_back(std::move(O));
+              }
+              if (!RO.Values.intersect(NonZeroR).empty()) {
+                ReturnEvalOutcome O = std::move(RO);
+                O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
+                Out.push_back(std::move(O));
+              }
+            }
+          }
+        } else {
+          if (!LO.Values.intersect(NonZeroL).empty()) {
+            ReturnEvalOutcome O = LO;
+            O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
+            Out.push_back(std::move(O));
+          }
+          if (!LO.Values.intersect(ZeroL).empty()) {
+            SmallVector<ReturnEvalOutcome, 2> RHSOut;
+            evaluateReturnOutcomes(BO->getRHS(), *RDom, LO.Lockset,
+                                   LO.PendingAcquires, State, Ctx, UseVarRanges,
+                                   RHSOut, Depth + 1);
+            for (auto &RO : RHSOut) {
+              if (!RO.Values.intersect(ZeroR).empty()) {
+                ReturnEvalOutcome O = RO;
+                O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
+                Out.push_back(std::move(O));
+              }
+              if (!RO.Values.intersect(NonZeroR).empty()) {
+                ReturnEvalOutcome O = std::move(RO);
+                O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
+                Out.push_back(std::move(O));
+              }
+            }
+          }
+        }
+      }
+      ApplyExprConstraint();
+      return;
+    }
+
+    EmitDefault();
+    ApplyExprConstraint();
+    return;
+  }
+
+  if (const auto *COP = dyn_cast<AbstractConditionalOperator>(E)) {
+    auto CondDom = getScalarDomain(COP->getCond()->getType());
+    if (!CondDom) {
+      EmitDefault();
+      ApplyExprConstraint();
+      return;
+    }
+    SmallVector<ReturnEvalOutcome, 2> CondOut;
+    evaluateReturnOutcomes(COP->getCond(), *CondDom, InLockset, InPending,
+                           State, Ctx, UseVarRanges, CondOut, Depth + 1);
+    IntRangeSet ZeroC = IntRangeSet::single(*CondDom, llvm::APSInt::get(0));
+    IntRangeSet NonZeroC = ZeroC.complement(*CondDom);
+    for (const auto &CO : CondOut) {
+      if (!CO.Values.intersect(NonZeroC).empty())
+        evaluateReturnOutcomes(COP->getTrueExpr(), TargetDom, CO.Lockset,
+                               CO.PendingAcquires, State, Ctx, UseVarRanges,
+                               Out, Depth + 1);
+      if (!CO.Values.intersect(ZeroC).empty())
+        evaluateReturnOutcomes(COP->getFalseExpr(), TargetDom, CO.Lockset,
+                               CO.PendingAcquires, State, Ctx, UseVarRanges,
+                               Out, Depth + 1);
+    }
+    ApplyExprConstraint();
+    return;
+  }
+
+  if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+    unsigned BuiltinID = CallExp->getBuiltinCallee();
+    if (BuiltinID == Builtin::BI__builtin_expect ||
+        BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+      auto ArgDom = getScalarDomain(CallExp->getArg(0)->getType());
+      if (!ArgDom) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      SmallVector<ReturnEvalOutcome, 2> Sub;
+      evaluateReturnOutcomes(CallExp->getArg(0), *ArgDom, InLockset, InPending,
+                             State, Ctx, UseVarRanges, Sub, Depth + 1);
+      for (auto &SO : Sub) {
+        SO.Values = reprojectRangeSet(
+            castIntegralRangeSet(SO.Values, CallExp->getType(), *ASTCtx),
+            TargetDom);
+        if (!SO.Values.empty())
+          Out.push_back(std::move(SO));
+      }
+      ApplyExprConstraint();
+      return;
+    }
+
+    const auto *Callee = dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl());
+    if (!Callee) {
+      EmitDefault();
+      ApplyExprConstraint();
+      return;
+    }
+
+    std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
+    if (Handler.issueBetaWarnings()) {
+      SxBuilder.setLookupLocalVarExpr(
+          [this, LookupCtx = Ctx](const NamedDecl *D) mutable -> const Expr * {
+            return LocalVarMap.lookupExpr(D, LookupCtx);
+          });
+      Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
+    }
+
+    SmallVector<ReturnEvalOutcome, 2> CallOutcomes;
+    ReturnEvalOutcome InitO;
+    InitO.Values = IntRangeSet::full(TargetDom);
+    InitO.Lockset = InLockset;
+    InitO.PendingAcquires.assign(InPending.begin(), InPending.end());
+    CallOutcomes.push_back(std::move(InitO));
+
+    auto SplitOutcomes = [&](const IntRangeSet &SuccSet, const CapExprSet &Caps,
+                             LockKind LK) {
+      if (Caps.empty())
+        return;
+      IntRangeSet FailSet = SuccSet.complement(TargetDom);
+      SmallVector<ReturnEvalOutcome, 2> Next;
+      for (auto &CO : CallOutcomes) {
+        IntRangeSet In = CO.Values.intersect(SuccSet);
+        IntRangeSet OutSet = CO.Values.intersect(FailSet);
+        if (!In.empty()) {
+          ReturnEvalOutcome WithLocks = CO;
+          WithLocks.Values = std::move(In);
+          for (const auto &Cap : Caps)
+            WithLocks.PendingAcquires.push_back(
+                {Cap, LK, CallExp->getExprLoc()});
+          Next.push_back(std::move(WithLocks));
+        }
+        if (!OutSet.empty()) {
+          CO.Values = std::move(OutSet);
+          Next.push_back(std::move(CO));
+        }
+      }
+      CallOutcomes = std::move(Next);
+    };
+
+    for (const auto *Attr :
+         Callee->specific_attrs<TryAcquireCapabilityAttr>()) {
+      if (State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
+        continue;
+      bool SuccBool = false;
+      if (!evalTrylockSuccessBool(Attr->getSuccessValue(), *ASTCtx, SuccBool)) {
+        EmitDefault();
+        ApplyExprConstraint();
+        return;
+      }
+      IntRangeSet SuccSet =
+          IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
+      if (SuccBool)
+        SuccSet = SuccSet.complement(TargetDom);
+      CapExprSet Caps;
+      getMutexIDs(Caps, Attr, CallExp, Callee);
+      SplitOutcomes(SuccSet, Caps,
+                    Attr->isShared() ? LK_Shared : LK_Exclusive);
+    }
+
+    if (CallExp->getType()->isIntegralOrEnumerationType()) {
+      for (const auto *Attr :
+           Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
+        if (State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
+          continue;
+        if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue()) {
+          EmitDefault();
+          ApplyExprConstraint();
+          return;
+        }
+        auto First =
+            Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+        auto Last =
+            Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+        if (!First || !Last) {
+          EmitDefault();
+          ApplyExprConstraint();
+          return;
+        }
+        IntRangeSet SuccSet =
+            IntRangeSet::closedRange(TargetDom, *First, *Last);
+        CapExprSet Caps;
+        getMutexIDs(Caps, Attr, CallExp, Callee);
+        SplitOutcomes(SuccSet, Caps,
+                      Attr->isShared() ? LK_Shared : LK_Exclusive);
+      }
+    }
+
+    for (auto &CO : CallOutcomes)
+      if (!CO.Values.empty())
+        Out.push_back(std::move(CO));
+    ApplyExprConstraint();
+    return;
+  }
+
+  EmitDefault();
+  ApplyExprConstraint();
+}
+
+void ThreadSafetyAnalyzer::applyScopeExitCleanups(FactSet &StateSet,
+                                                  const CFGBlock *B,
+                                                  bool OnlyAfterReturn) {
+  ThreadSafetyHandler QuietHandler;
+  bool SeenReturn = false;
+  unsigned CtxIdx = BlockInfo[B->getBlockID()].EntryIndex;
+  LocalVarContext StmtCtx = BlockInfo[B->getBlockID()].EntryContext;
+
+  std::optional<llvm::scope_exit<std::function<void()>>> LookupCleanup;
+  if (Handler.issueBetaWarnings()) {
+    SxBuilder.setLookupLocalVarExpr(
+        [this, &StmtCtx](const NamedDecl *D) -> const Expr * {
+          LocalVarContext LookupCtx = StmtCtx;
+          return LocalVarMap.lookupExpr(D, LookupCtx);
+        });
+    LookupCleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
+  }
+
+  auto ApplyCallee = [&](const NamedDecl *Callee, const Expr *Exp,
+                         til::SExpr *Self, SourceLocation Loc,
+                         bool FullyRemove) {
+    if (!Callee || !Callee->hasAttrs())
+      return;
+    CapExprSet ExclusiveLocksToAdd, SharedLocksToAdd;
+    CapExprSet ExclusiveLocksToRemove, SharedLocksToRemove,
+        GenericLocksToRemove;
+
+    for (const Attr *At : Callee->attrs()) {
+      switch (At->getKind()) {
+      case attr::AcquireCapability: {
+        const auto *A = cast<AcquireCapabilityAttr>(At);
+        getMutexIDs(A->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd, A,
+                    Exp, Callee, Self);
+        break;
+      }
+      case attr::AssertCapability: {
+        const auto *A = cast<AssertCapabilityAttr>(At);
+        CapExprSet AssertLocks;
+        getMutexIDs(AssertLocks, A, Exp, Callee, Self);
+        for (const auto &AssertLock : AssertLocks) {
+          if (!AssertLock.shouldIgnore() &&
+              !StateSet.findLock(FactMan, AssertLock)) {
+            StateSet.removeLock(FactMan, !AssertLock);
+            StateSet.addLock(FactMan,
+                             FactMan.createFact<LockableFactEntry>(
+                                 AssertLock,
+                                 A->isShared() ? LK_Shared : LK_Exclusive, Loc,
+                                 FactEntry::Asserted));
+          }
+        }
+        break;
+      }
+      case attr::ReleaseCapability: {
+        const auto *A = cast<ReleaseCapabilityAttr>(At);
+        if (A->isGeneric())
+          getMutexIDs(GenericLocksToRemove, A, Exp, Callee, Self);
+        else if (A->isShared())
+          getMutexIDs(SharedLocksToRemove, A, Exp, Callee, Self);
+        else
+          getMutexIDs(ExclusiveLocksToRemove, A, Exp, Callee, Self);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+
+    auto QuietRemove = [&](const CapabilityExpr &Cp) {
+      if (Cp.shouldIgnore())
+        return;
+      if (const FactEntry *LDat = StateSet.findLock(FactMan, Cp))
+        LDat->handleUnlock(StateSet, FactMan, Cp, Loc, FullyRemove,
+                           QuietHandler);
+    };
+    for (const auto &M : ExclusiveLocksToRemove)
+      QuietRemove(M);
+    for (const auto &M : SharedLocksToRemove)
+      QuietRemove(M);
+    for (const auto &M : GenericLocksToRemove)
+      QuietRemove(M);
+
+    auto QuietAdd = [&](const CapabilityExpr &Cp, LockKind LK) {
+      if (Cp.shouldIgnore())
+        return;
+      const auto *Entry = FactMan.createFact<LockableFactEntry>(
+          Cp, LK, Loc, FactEntry::Acquired);
+      if (const FactEntry *Existing = StateSet.findLock(FactMan, *Entry)) {
+        Existing->handleLock(StateSet, FactMan, *Entry, QuietHandler);
+      } else {
+        StateSet.removeLock(FactMan, !*Entry);
+        StateSet.addLock(FactMan, Entry);
+      }
+    };
+    for (const auto &M : ExclusiveLocksToAdd)
+      QuietAdd(M, LK_Exclusive);
+    for (const auto &M : SharedLocksToAdd)
+      QuietAdd(M, LK_Shared);
+  };
+
+  for (const auto &BI : *B) {
+    if (std::optional<CFGStmt> CS = BI.getAs<CFGStmt>()) {
+      const Stmt *S = CS->getStmt();
+      llvm::scope_exit AdvanceCtx(
+          [&] { StmtCtx = LocalVarMap.getNextContext(CtxIdx, S, StmtCtx); });
+      if (isa<ReturnStmt>(S))
+        SeenReturn = true;
+      continue;
+    }
+    if (OnlyAfterReturn && !SeenReturn)
+      continue;
+    if (!OnlyAfterReturn && SeenReturn)
+      continue;
+
+    if (BI.getKind() == CFGElement::AutomaticObjectDtor) {
+      CFGAutomaticObjDtor AD = BI.castAs<CFGAutomaticObjDtor>();
+      if (isa_and_nonnull<ParmVarDecl>(AD.getVarDecl()))
+        continue;
+      const auto *DD = AD.getDestructorDecl(*ASTCtx);
+      if (!DD || !DD->hasAttrs())
+        continue;
+      ApplyCallee(DD, /*Exp=*/nullptr,
+                  SxBuilder.translateVariable(AD.getVarDecl(), nullptr),
+                  AD.getTriggerStmt()->getEndLoc(), /*FullyRemove=*/true);
+    } else if (BI.getKind() == CFGElement::CleanupFunction) {
+      const CFGCleanupFunction &CF = BI.castAs<CFGCleanupFunction>();
+      ApplyCallee(CF.getFunctionDecl(), /*Exp=*/nullptr,
+                  SxBuilder.translateVariable(CF.getVarDecl(), nullptr),
+                  CF.getVarDecl()->getLocation(), /*FullyRemove=*/true);
+    }
+  }
+}
+
+/// Returns whether \p Cap is reached through a local pointer variable of the
+/// analyzed function, e.g. 'head->lock'. If the definition of such a variable
+/// could have been resolved, the variable would have been replaced by its
+/// definition. Hence, the analysis does not know which object the variable
+/// points to, e.g. because its value has been loaded by inline assembly.
+static bool isReachedThroughUnresolvedLocal(const CapabilityExpr &Cap) {
+  const til::SExpr *E = Cap.sexpr();
+  while (E) {
+    if (const auto *P = dyn_cast<til::Project>(E))
+      E = P->record();
+    else if (const auto *A = dyn_cast<til::SApply>(E))
+      E = A->sfun();
+    else if (const auto *C = dyn_cast<til::Cast>(E))
+      E = C->expr();
+    else if (const auto *U = dyn_cast<til::UnaryOp>(E))
+      E = U->expr();
+    else if (const auto *AI = dyn_cast<til::ArrayIndex>(E))
+      E = AI->array();
+    else
+      break;
+  }
+  const auto *LP = dyn_cast_or_null<til::LiteralPtr>(E);
+  const auto *VD = LP ? dyn_cast_or_null<VarDecl>(LP->clangDecl()) : nullptr;
+  return VD && VD->hasLocalStorage() && !isa<ParmVarDecl>(VD) &&
+         VD->getType()->isPointerType();
+}
+
+void ThreadSafetyAnalyzer::checkTrylockExitOutcome(
+    const FactSet &BaseExpectedExitSet, const ReturnEvalOutcome &Outcome,
+    SourceLocation DiagLoc, ThreadSafetyHandler &ExitHandler) {
+  if (Outcome.Values.empty())
+    return;
+
+  struct ExitPartition {
+    IntRangeSet Vals;
+    FactSet ExpectedSet;
+  };
+  SmallVector<ExitPartition, 2> Partitions;
+  Partitions.push_back({Outcome.Values, BaseExpectedExitSet});
+
+  for (const TrylockExitSpec &Spec : CurrentTrylockExitSpecs) {
+    IntRangeSet Comp = Spec.SuccessSet.complement(CurrentTrylockRetDom);
+    SmallVector<ExitPartition, 2> Next;
+    for (auto &P : Partitions) {
+      IntRangeSet In = P.Vals.intersect(Spec.SuccessSet);
+      IntRangeSet Out = P.Vals.intersect(Comp);
+      if (!In.empty()) {
+        FactSet WithSpec = P.ExpectedSet;
+        addLockToExpectedSet(WithSpec, Spec.Cap, Spec.LK, Spec.Loc);
+        Next.push_back({std::move(In), std::move(WithSpec)});
+      }
+      if (!Out.empty())
+        Next.push_back({std::move(Out), std::move(P.ExpectedSet)});
+    }
+    Partitions = std::move(Next);
+  }
+
+  for (const ExitPartition &P : Partitions) {
+    // A capability that is held but not expected and that is reached through
+    // a local pointer whose value is not known may be the same capability as
+    // one that is expected but not held, e.g. 'head->lock' and
+    // 'req->head->lock' after 'head = smp_load_acquire(&req->head)'. Since
+    // the analysis cannot tell, do not report such pairs.
+    llvm::SmallPtrSet<const FactEntry *, 2> Paired;
+    for (const auto &Fact : Outcome.Lockset) {
+      const FactEntry &ExitFact = FactMan[Fact];
+      if (ExitFact.negative() || P.ExpectedSet.findLock(FactMan, ExitFact) ||
+          !isReachedThroughUnresolvedLocal(ExitFact))
+        continue;
+      for (const auto &EFact : P.ExpectedSet) {
+        const FactEntry &EntryFact = FactMan[EFact];
+        if (EntryFact.negative() || Paired.contains(&EntryFact) ||
+            Outcome.Lockset.findLock(FactMan, EntryFact) ||
+            EntryFact.kind() != ExitFact.kind() ||
+            EntryFact.getKind() != ExitFact.getKind())
+          continue;
+        Paired.insert(&EntryFact);
+        Paired.insert(&ExitFact);
+        break;
+      }
+    }
+
+    for (const auto &Fact : Outcome.Lockset) {
+      const FactEntry &ExitFact = FactMan[Fact];
+      if (Paired.contains(&ExitFact))
+        continue;
+      if (const FactEntry *EntryFact =
+              P.ExpectedSet.findLock(FactMan, ExitFact)) {
+        unsigned ReentrancyA = 0, ReentrancyB = 0;
+        if (const auto *LFE = dyn_cast<LockableFactEntry>(EntryFact))
+          ReentrancyA = LFE->getReentrancyDepth();
+        if (const auto *LFE = dyn_cast<LockableFactEntry>(&ExitFact))
+          ReentrancyB = LFE->getReentrancyDepth();
+
+        if (ReentrancyA != ReentrancyB) {
+          bool MissingAcquire = ReentrancyB < ReentrancyA;
+          ExitHandler.handleMutexHeldEndOfScope(
+              ExitFact.getKind(), ExitFact.toString(),
+              MissingAcquire ? EntryFact->loc() : ExitFact.loc(), DiagLoc,
+              MissingAcquire ? LEK_NotLockedAtEndOfFunction
+                             : LEK_LockedAtEndOfFunction,
+              /*ReentrancyMismatch=*/true);
+        } else if (EntryFact->kind() != ExitFact.kind()) {
+          if (!((EntryFact->managed() || EntryFact->asserted()) &&
+                (ExitFact.managed() || ExitFact.asserted()))) {
+            ExitHandler.handleExclusiveAndShared(
+                ExitFact.getKind(), ExitFact.toString(), ExitFact.loc(),
+                EntryFact->loc());
+          }
+        }
+      } else {
+        ExitFact.handleRemovalFromIntersection(
+            Outcome.Lockset, FactMan, DiagLoc, LEK_LockedAtEndOfFunction,
+            ExitHandler);
+      }
+    }
+
+    for (const auto &Fact : P.ExpectedSet) {
+      const FactEntry &EntryFact = FactMan[Fact];
+      if (Paired.contains(&EntryFact))
+        continue;
+      if (!Outcome.Lockset.findLock(FactMan, EntryFact)) {
+        EntryFact.handleRemovalFromIntersection(P.ExpectedSet, FactMan, DiagLoc,
+                                                LEK_NotLockedAtEndOfFunction,
+                                                ExitHandler);
+      }
+    }
+  }
 }
 
 namespace {
@@ -3579,10 +6375,25 @@ void BuildLockset::VisitReturnStmt(const ReturnStmt *S) {
         ReturnType->getPointeeType().isConstQualified() ? AK_Read : AK_Written,
         POK_ReturnByRef);
   } else if (ReturnType->isPointerType()) {
-    Analyzer->checkPtAccess(
-        FunctionExitFSet, RetVal,
-        ReturnType->getPointeeType().isConstQualified() ? AK_Read : AK_Written,
-        POK_ReturnPointer);
+    if (!Analyzer->CurrentTrylockExitSpecs.empty()) {
+      FactSet NonNullExitSet = FunctionExitFSet;
+      llvm::APSInt One = llvm::APSInt::get(1);
+      for (const auto &Spec : Analyzer->CurrentTrylockExitSpecs)
+        if (Spec.SuccessSet.intersects(One, One))
+          Analyzer->addLockToExpectedSet(NonNullExitSet, Spec.Cap, Spec.LK,
+                                         Spec.Loc);
+      Analyzer->checkPtAccess(NonNullExitSet, RetVal,
+                              ReturnType->getPointeeType().isConstQualified()
+                                  ? AK_Read
+                                  : AK_Written,
+                              POK_ReturnPointer);
+    } else {
+      Analyzer->checkPtAccess(FunctionExitFSet, RetVal,
+                              ReturnType->getPointeeType().isConstQualified()
+                                  ? AK_Read
+                                  : AK_Written,
+                              POK_ReturnPointer);
+    }
   }
 }
 
@@ -3648,10 +6459,14 @@ bool ThreadSafetyAnalyzer::join(const FactEntry &A, const FactEntry &B,
 /// diagnosed because the paths re-diverge at the terminator (but they are
 /// still removed from the intersection, and conditionally re-added on the
 /// outgoing edges by getEdgeLockset()).
+/// \param RebranchIgnoresDepth Whether a reentrancy depth difference of a
+/// re-branched capability is not diagnosed either. Only set at the exit
+/// blocks of a try-acquire function, where the lock state is verified per
+/// path.
 void ThreadSafetyAnalyzer::intersectAndWarn(
     FactSet &EntrySet, const FactSet &ExitSet, SourceLocation JoinLoc,
     LockErrorKind EntryLEK, LockErrorKind ExitLEK,
-    const CapExprSet *TrylockRebranchCaps) {
+    const CapExprSet *TrylockRebranchCaps, bool RebranchIgnoresDepth) {
   FactSet EntrySetOrig = EntrySet;
 
   auto GetFactReentrancyDepth = [](const FactEntry &FE) -> unsigned {
@@ -3678,8 +6493,8 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
           EntryLEK == LEK_LockedSomePredecessors &&
           EntryFact.loc() == ExitFact.loc() && !EntryFact.managed() &&
           !ExitFact.managed() &&
-          GetFactReentrancyDepth(EntryFact) ==
-              GetFactReentrancyDepth(ExitFact)) {
+          (RebranchIgnoresDepth || GetFactReentrancyDepth(EntryFact) ==
+                                       GetFactReentrancyDepth(ExitFact))) {
         // Both facts have been created by the same trylock call, whose result
         // is checked again by the terminator of this block. The lock kind may
         // differ if the trylock function has range attributes for different
@@ -3817,6 +6632,32 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   CapExprSet ExclusiveLocksAcquired;
   CapExprSet SharedLocksAcquired;
   CapExprSet LocksReleased;
+  CurrentTrylockExitSpecs.clear();
+
+  QualType FuncReturnType;
+  if (CurrentFunction)
+    FuncReturnType = CurrentFunction->getReturnType();
+  else if (const auto *OMD = dyn_cast<ObjCMethodDecl>(D))
+    FuncReturnType = OMD->getReturnType();
+
+  auto AddTrylockExitSpec = [&](const CapabilityExpr &Cap, LockKind LK,
+                                const IntRangeSet &SuccSet,
+                                SourceLocation AttrLoc) {
+    if (Cap.shouldIgnore())
+      return;
+    if (!Cap.reentrant()) {
+      for (TrylockExitSpec &Existing : CurrentTrylockExitSpecs) {
+        if (Existing.Cap.equals(Cap) && Existing.LK == LK) {
+          Existing.SuccessSet = Existing.SuccessSet.unionWith(SuccSet);
+          return;
+        }
+      }
+    }
+    CurrentTrylockExitSpecs.push_back({Cap, LK, SuccSet, AttrLoc});
+  };
+
+  bool SawTryAcquireAttr = false;
+
   // Add locks from exclusive_locks_required and shared_locks_required
   // to initial lockset. Also turn off checking for underlying lock and unlock
   // primitives that take zero capability arguments.
@@ -3848,12 +6689,58 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         getMutexIDs(A->isShared() ? SharedLocksAcquired
                                   : ExclusiveLocksAcquired,
                     A, nullptr, D);
-      } else if (isa<TryAcquireCapabilityAttr,
-                     TryAcquireCapabilityRangeAttr>(Attr)) {
-        // Don't try to check trylock functions for now.
-        return;
+      } else if (const auto *A = dyn_cast<TryAcquireCapabilityAttr>(Attr)) {
+        if (A->args_size() == 0)
+          return;
+        SawTryAcquireAttr = true;
+        auto RetDom = getScalarDomain(FuncReturnType);
+        if (!RetDom)
+          return;
+        CurrentTrylockRetDom = *RetDom;
+        bool SuccBool = false;
+        if (!evalTrylockSuccessBool(A->getSuccessValue(), *ASTCtx, SuccBool))
+          return;
+        IntRangeSet SuccSet =
+            IntRangeSet::single(CurrentTrylockRetDom, llvm::APSInt::get(0));
+        if (SuccBool)
+          SuccSet = SuccSet.complement(CurrentTrylockRetDom);
+        CapExprSet AttrCaps;
+        getMutexIDs(AttrCaps, A, nullptr, D);
+        LockKind LK = A->isShared() ? LK_Shared : LK_Exclusive;
+        for (const auto &Cap : AttrCaps)
+          AddTrylockExitSpec(Cap, LK, SuccSet, D->getLocation());
+      } else if (const auto *A =
+                     dyn_cast<TryAcquireCapabilityRangeAttr>(Attr)) {
+        if (A->args_size() == 0)
+          return;
+        SawTryAcquireAttr = true;
+        if (FuncReturnType.isNull() || FuncReturnType->isDependentType() ||
+            !FuncReturnType->isIntegralOrEnumerationType() ||
+            FuncReturnType->isBooleanType())
+          return;
+        auto RetDom = getScalarDomain(FuncReturnType);
+        if (!RetDom)
+          return;
+        CurrentTrylockRetDom = *RetDom;
+        if (!A->getFirstSuccessValue() || !A->getLastSuccessValue() ||
+            A->getFirstSuccessValue()->isValueDependent() ||
+            A->getLastSuccessValue()->isValueDependent())
+          return;
+        auto First = A->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+        auto Last = A->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+        if (!First || !Last)
+          return;
+        IntRangeSet SuccSet =
+            IntRangeSet::closedRange(CurrentTrylockRetDom, *First, *Last);
+        CapExprSet AttrCaps;
+        getMutexIDs(AttrCaps, A, nullptr, D);
+        LockKind LK = A->isShared() ? LK_Shared : LK_Exclusive;
+        for (const auto &Cap : AttrCaps)
+          AddTrylockExitSpec(Cap, LK, SuccSet, D->getLocation());
       }
     }
+    if (SawTryAcquireAttr && CurrentTrylockExitSpecs.empty())
+      return;
 
     ArrayRef<ParmVarDecl *> Params;
     if (CurrentFunction)
@@ -3931,12 +6818,187 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   for (const auto &Lock : LocksReleased)
     ExpectedFunctionExitSet.removeLock(FactMan, Lock);
 
+  const bool CheckingTrylockBody = !CurrentTrylockExitSpecs.empty();
+  const CFGBlock *ExitBlock = &CFGraph->getExit();
+  const unsigned NumBlocks = CFGraph->getNumBlockIDs();
+
+  CapExprSet CurrentTrylockExitCaps;
+  llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
+  llvm::SmallPtrSet<const ValueDecl *, 8> LoopModifiedVars;
+  std::vector<unsigned> RPOIdx;
+  std::vector<bool> PureExitPathBlocks;
+  std::vector<TrylockValueState> BlockExitValState;
+  std::vector<SmallVector<TrylockEdgeBundle, 2>> PureBlockBundles;
+  std::vector<bool> BundleOverflow;
+  std::vector<FactSet> PreReturnLocksets;
+  std::vector<TrylockValueState> PreReturnValStates;
+  std::vector<LocalVarContext> PreReturnVarCtx;
+
+  if (CheckingTrylockBody) {
+    for (const auto &Spec : CurrentTrylockExitSpecs)
+      CurrentTrylockExitCaps.push_back_nodup(Spec.Cap);
+
+    scanTrylockVars(AC.getBody(), EscapedVars, LoopModifiedVars);
+
+    RPOIdx.assign(NumBlocks, 0);
+    unsigned CurRPO = 0;
+    for (const CFGBlock *B : *SortedGraph)
+      RPOIdx[B->getBlockID()] = CurRPO++;
+
+    PureExitPathBlocks.assign(NumBlocks, false);
+    for (const CFGBlock *B : llvm::reverse(*SortedGraph)) {
+      if (B == ExitBlock || B == &CFGraph->getEntry())
+        continue;
+      if (neverReturns(B) || B->succ_empty())
+        continue;
+
+      bool HasNonForwardPred = false;
+      for (auto PI = B->pred_begin(), PE = B->pred_end(); PI != PE; ++PI) {
+        if (!*PI)
+          continue;
+        if (RPOIdx[(*PI)->getBlockID()] >= RPOIdx[B->getBlockID()] ||
+            isa_and_nonnull<ContinueStmt>((*PI)->getTerminatorStmt())) {
+          HasNonForwardPred = true;
+          break;
+        }
+      }
+      if (HasNonForwardPred)
+        continue;
+
+      bool AllSuccsPureToExit = true;
+      for (auto SI = B->succ_begin(), SE = B->succ_end(); SI != SE; ++SI) {
+        const CFGBlock *Succ = *SI;
+        if (!Succ || RPOIdx[Succ->getBlockID()] <= RPOIdx[B->getBlockID()] ||
+            (Succ != ExitBlock && !PureExitPathBlocks[Succ->getBlockID()])) {
+          AllSuccsPureToExit = false;
+          break;
+        }
+      }
+      if (!AllSuccsPureToExit)
+        continue;
+
+      CapExprSet TCaps;
+      getTerminatorTrylockCaps(B, TCaps);
+      if (!TCaps.empty())
+        continue;
+
+      if (!llvm::all_of(*B, isPureExitBlockElement))
+        continue;
+
+      PureExitPathBlocks[B->getBlockID()] = true;
+    }
+
+    BlockExitValState.resize(NumBlocks);
+    PureBlockBundles.resize(NumBlocks);
+    BundleOverflow.assign(NumBlocks, false);
+    PreReturnLocksets.resize(NumBlocks);
+    PreReturnValStates.resize(NumBlocks);
+    PreReturnVarCtx.resize(NumBlocks, LocalVarMap.getEmptyContext());
+  }
+
+  auto SameShortCircuits = [](const TrylockValueState &A,
+                              const TrylockValueState &B) {
+    if (A.ShortCircuitedOps.size() != B.ShortCircuitedOps.size())
+      return false;
+    for (const auto &[BO, Val] : A.ShortCircuitedOps) {
+      auto It = B.ShortCircuitedOps.find(BO);
+      if (It == B.ShortCircuitedOps.end() || It->second != Val)
+        return false;
+    }
+    return true;
+  };
+
+  auto SameUnmaterializedDefs = [](const TrylockValueState &A,
+                                   const TrylockValueState &B) {
+    if (A.UnmaterializedVarDefs.size() != B.UnmaterializedVarDefs.size())
+      return false;
+    for (const auto &[VD, DefPair] : A.UnmaterializedVarDefs) {
+      auto It = B.UnmaterializedVarDefs.find(VD);
+      if (It == B.UnmaterializedVarDefs.end() ||
+          It->second.first != DefPair.first)
+        return false;
+    }
+    return true;
+  };
+
+  auto AddOrMergeBundle = [&](unsigned BlockID, TrylockEdgeBundle Candidate) {
+    if (BundleOverflow[BlockID] || Candidate.ValState.Infeasible)
+      return;
+    auto &Bundles = PureBlockBundles[BlockID];
+    for (TrylockEdgeBundle &Existing : Bundles) {
+      if (factSetsEquivalent(Existing.Lockset, Candidate.Lockset) &&
+          SameShortCircuits(Existing.ValState, Candidate.ValState) &&
+          Existing.ValState.AcquiredTrylockAttrs ==
+              Candidate.ValState.AcquiredTrylockAttrs &&
+          SameUnmaterializedDefs(Existing.ValState, Candidate.ValState)) {
+        unionIntoValueState(Existing.ValState, Candidate.ValState, *ASTCtx);
+        return;
+      }
+    }
+    if (Bundles.size() >= 64) {
+      BundleOverflow[BlockID] = true;
+      Bundles.clear();
+      return;
+    }
+    Bundles.push_back(std::move(Candidate));
+  };
+
+  auto IntersectFactSetsQuietly = [&](FactSet &Acc, const FactSet &Other) {
+    FactSet AccOrig = Acc;
+    for (const auto &Fact : AccOrig) {
+      const FactEntry &AFact = FactMan[Fact];
+      const FactEntry *BFact = Other.findLock(FactMan, AFact);
+      if (!BFact || AFact.negative() != BFact->negative()) {
+        Acc.removeLock(FactMan, AFact);
+        continue;
+      }
+      FactSet::iterator It = Acc.findLockIter(FactMan, AFact);
+      if (It == Acc.end())
+        continue;
+      unsigned DepthA = 0, DepthB = 0;
+      if (const auto *LFE = dyn_cast<LockableFactEntry>(&AFact))
+        DepthA = LFE->getReentrancyDepth();
+      if (const auto *LFE = dyn_cast<LockableFactEntry>(BFact))
+        DepthB = LFE->getReentrancyDepth();
+      if (DepthA != DepthB) {
+        if (DepthB < DepthA)
+          Acc.replaceLock(FactMan, It, BFact);
+      } else if (AFact.kind() != BFact->kind()) {
+        if (BFact->kind() == LK_Shared)
+          Acc.replaceLock(FactMan, It, BFact);
+      } else if (AFact.asserted() && !BFact->asserted()) {
+        Acc.replaceLock(FactMan, It, BFact);
+      }
+    }
+  };
+
   for (const auto *CurrBlock : *SortedGraph) {
     unsigned CurrBlockID = CurrBlock->getBlockID();
     CFGBlockInfo *CurrBlockInfo = &BlockInfo[CurrBlockID];
 
     // Use the default initial lockset in case there are no predecessors.
     VisitedBlocks.insert(CurrBlock);
+
+    if (CheckingTrylockBody && CurrBlock == ExitBlock) {
+      for (CFGBlock::const_pred_iterator PI = CurrBlock->pred_begin(),
+                                         PE = CurrBlock->pred_end();
+           PI != PE; ++PI) {
+        if (*PI == nullptr || !VisitedBlocks.alreadySet(*PI))
+          continue;
+        if (!neverReturns(*PI) && BlockInfo[(*PI)->getBlockID()].Reachable) {
+          CurrBlockInfo->Reachable = true;
+          break;
+        }
+      }
+      continue;
+    }
+
+    const bool IsPureBlock =
+        CheckingTrylockBody && PureExitPathBlocks[CurrBlockID];
+    TrylockValueState CurrValState;
+    if (CheckingTrylockBody && CurrBlock != &CFGraph->getEntry())
+      CurrValState.Infeasible = true;
+    bool HasUnvisitedBackEdge = false;
 
     // Iterate through the predecessor blocks and warn if the lockset for all
     // predecessors is not the same. We take the entry lockset of the current
@@ -3961,8 +7023,10 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       if (*PI == nullptr)
         continue;
       // if *PI -> CurrBlock is a back edge
-      if (!VisitedBlocks.alreadySet(*PI))
+      if (!VisitedBlocks.alreadySet(*PI)) {
+        HasUnvisitedBackEdge = true;
         continue;
+      }
 
       unsigned PrevBlockID = (*PI)->getBlockID();
       CFGBlockInfo *PrevBlockInfo = &BlockInfo[PrevBlockID];
@@ -3975,7 +7039,37 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       CurrBlockInfo->Reachable = true;
 
       FactSet PrevLockset;
-      getEdgeLockset(PrevLockset, PrevBlockInfo->ExitSet, *PI, CurrBlock);
+      if (CheckingTrylockBody) {
+        TrylockValueState EdgeValState = BlockExitValState[PrevBlockID];
+        getEdgeLockset(PrevLockset, PrevBlockInfo->ExitSet, *PI, CurrBlock,
+                       &EdgeValState.AcquiredTrylockAttrs);
+        constrainValueStateOnEdge(EdgeValState, *PI, CurrBlock, EscapedVars);
+        materializeNarrowedTrylocks(PrevLockset, EdgeValState);
+        unionIntoValueState(CurrValState, EdgeValState, *ASTCtx);
+
+        if (IsPureBlock) {
+          if (BundleOverflow[PrevBlockID]) {
+            BundleOverflow[CurrBlockID] = true;
+            PureBlockBundles[CurrBlockID].clear();
+          } else if (PureExitPathBlocks[PrevBlockID]) {
+            for (const TrylockEdgeBundle &SrcBnd :
+                 PureBlockBundles[PrevBlockID]) {
+              TrylockEdgeBundle NextBnd = SrcBnd;
+              constrainValueStateOnEdge(NextBnd.ValState, *PI, CurrBlock,
+                                        EscapedVars);
+              if (!NextBnd.ValState.Infeasible) {
+                materializeNarrowedTrylocks(NextBnd.Lockset, NextBnd.ValState);
+                AddOrMergeBundle(CurrBlockID, std::move(NextBnd));
+              }
+            }
+          } else if (!EdgeValState.Infeasible) {
+            AddOrMergeBundle(CurrBlockID,
+                             {PrevLockset, std::move(EdgeValState)});
+          }
+        }
+      } else {
+        getEdgeLockset(PrevLockset, PrevBlockInfo->ExitSet, *PI, CurrBlock);
+      }
 
       if (!LocksetInitialized) {
         CurrBlockInfo->EntrySet = PrevLockset;
@@ -3995,12 +7089,18 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
           // re-branches on the try-lock result.
           if (!TerminatorTrylockCapsComputed) {
             // Compute once; the result depends only on CurrBlock, not on *PI.
-            getTerminatorTrylockCaps(CurrBlock, TerminatorTrylockCaps);
+            if (IsPureBlock) {
+              for (const auto &Cap : CurrentTrylockExitCaps)
+                TerminatorTrylockCaps.push_back_nodup(Cap);
+            } else {
+              getTerminatorTrylockCaps(CurrBlock, TerminatorTrylockCaps);
+            }
             TerminatorTrylockCapsComputed = true;
           }
           intersectAndWarn(CurrBlockInfo->EntrySet, PrevLockset,
                            CurrBlockInfo->EntryLoc, LEK_LockedSomePredecessors,
-                           LEK_LockedSomePredecessors, &TerminatorTrylockCaps);
+                           LEK_LockedSomePredecessors, &TerminatorTrylockCaps,
+                           /*RebranchIgnoresDepth=*/IsPureBlock);
         }
       }
     }
@@ -4009,14 +7109,50 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     if (!CurrBlockInfo->Reachable)
       continue;
 
+    if (CheckingTrylockBody) {
+      if (HasUnvisitedBackEdge && !CurrValState.Infeasible) {
+        for (const ValueDecl *VD : LoopModifiedVars) {
+          CurrValState.VarRanges.erase(VD);
+          CurrValState.UnmaterializedVarDefs.erase(VD);
+        }
+        CurrValState.ExprRanges.clear();
+        CurrValState.ShortCircuitedOps.clear();
+      }
+      if (IsPureBlock && !BundleOverflow[CurrBlockID] &&
+          !PureBlockBundles[CurrBlockID].empty()) {
+        FactSet BundleEntrySet = PureBlockBundles[CurrBlockID].front().Lockset;
+        for (const TrylockEdgeBundle &Bnd :
+             llvm::drop_begin(PureBlockBundles[CurrBlockID]))
+          IntersectFactSetsQuietly(BundleEntrySet, Bnd.Lockset);
+        CurrBlockInfo->EntrySet = std::move(BundleEntrySet);
+      }
+    }
+
     BuildLockset LocksetBuilder(this, *CurrBlockInfo, ExpectedFunctionExitSet);
+    unsigned ValCtxIdx = CurrBlockInfo->EntryIndex;
+    LocalVarContext ValStmtCtx = CurrBlockInfo->EntryContext;
 
     // Visit all the statements in the basic block.
     for (const auto &BI : *CurrBlock) {
       switch (BI.getKind()) {
         case CFGElement::Statement: {
           CFGStmt CS = BI.castAs<CFGStmt>();
-          LocksetBuilder.Visit(CS.getStmt());
+          const Stmt *S = CS.getStmt();
+          if (CheckingTrylockBody) {
+            if (isa<ReturnStmt>(S)) {
+              PreReturnLocksets[CurrBlockID] = LocksetBuilder.FSet;
+              PreReturnValStates[CurrBlockID] = CurrValState;
+              PreReturnVarCtx[CurrBlockID] = ValStmtCtx;
+            }
+            updateValueStateForStmt(CurrValState, S, ValStmtCtx, EscapedVars);
+            if (IsPureBlock && !BundleOverflow[CurrBlockID]) {
+              for (auto &Bnd : PureBlockBundles[CurrBlockID])
+                updateValueStateForStmt(Bnd.ValState, S, ValStmtCtx,
+                                        EscapedVars);
+            }
+            ValStmtCtx = LocalVarMap.getNextContext(ValCtxIdx, S, ValStmtCtx);
+          }
+          LocksetBuilder.Visit(S);
           break;
         }
         // Ignore BaseDtor and MemberDtor for now.
@@ -4070,6 +7206,14 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       }
     }
     CurrBlockInfo->ExitSet = LocksetBuilder.FSet;
+    if (CheckingTrylockBody) {
+      BlockExitValState[CurrBlockID] = std::move(CurrValState);
+      if (IsPureBlock && !BundleOverflow[CurrBlockID]) {
+        for (auto &Bnd : PureBlockBundles[CurrBlockID])
+          applyScopeExitCleanups(Bnd.Lockset, CurrBlock,
+                                 /*OnlyAfterReturn=*/false);
+      }
+    }
 
     // For every back edge from CurrBlock (the end of the loop) to another block
     // (FirstLoopBlock) we need to check that the Lockset of Block is equal to
@@ -4092,6 +7236,116 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   // Skip the final check if the exit block is unreachable.
   if (!Final.Reachable)
     return;
+
+  if (CheckingTrylockBody) {
+    DedupThreadSafetyHandler DedupHandler(Handler);
+    SmallVector<PendingTrylockAcquire, 0> EmptyPending;
+
+    for (CFGBlock::const_pred_iterator PI = ExitBlock->pred_begin(),
+                                       PE = ExitBlock->pred_end();
+         PI != PE; ++PI) {
+      const CFGBlock *PredBlock = *PI;
+      if (!PredBlock || !VisitedBlocks.alreadySet(PredBlock))
+        continue;
+      unsigned PredID = PredBlock->getBlockID();
+      const CFGBlockInfo &PredInfo = BlockInfo[PredID];
+      if (neverReturns(PredBlock) || !PredInfo.Reachable)
+        continue;
+
+      const ReturnStmt *RS = nullptr;
+      for (const CFGElement &BI : llvm::reverse(*PredBlock)) {
+        if (std::optional<CFGStmt> CS = BI.getAs<CFGStmt>()) {
+          if ((RS = dyn_cast<ReturnStmt>(CS->getStmt())))
+            break;
+        }
+      }
+      SourceLocation DiagLoc = RS ? RS->getBeginLoc() : Final.ExitLoc;
+      const Expr *RetVal = RS ? RS->getRetValue() : nullptr;
+
+      auto VerifyExitOutcome = [&](ReturnEvalOutcome &Outcome) {
+        for (const PendingTrylockAcquire &PA : Outcome.PendingAcquires) {
+          const auto *Entry = FactMan.createFact<LockableFactEntry>(
+              PA.Cap, PA.LK, PA.Loc, FactEntry::Acquired);
+          if (Entry->shouldIgnore())
+            continue;
+          if (!Entry->negative()) {
+            CapabilityExpr NegC = !*Entry;
+            if (Outcome.Lockset.findLock(FactMan, NegC)) {
+              Outcome.Lockset.removeLock(FactMan, NegC);
+            } else if (inCurrentScope(*Entry) && !Entry->asserted() &&
+                       !Entry->reentrant()) {
+              DedupHandler.handleNegativeNotHeld(Entry->getKind(),
+                                                 Entry->toString(),
+                                                 NegC.toString(), Entry->loc());
+            }
+          }
+          if (!Entry->asserted() && !Entry->declared()) {
+            GlobalBeforeSet->checkBeforeAfter(
+                Entry->valueDecl(), Outcome.Lockset, *this, Entry->loc(),
+                Entry->getKind(), &DedupHandler);
+          }
+          if (const FactEntry *Cp = Outcome.Lockset.findLock(FactMan, *Entry)) {
+            if (!Entry->asserted())
+              Cp->handleLock(Outcome.Lockset, FactMan, *Entry, DedupHandler);
+          } else {
+            Outcome.Lockset.addLock(FactMan, Entry);
+          }
+        }
+        applyScopeExitCleanups(Outcome.Lockset, PredBlock,
+                               /*OnlyAfterReturn=*/true);
+        checkTrylockExitOutcome(ExpectedFunctionExitSet, Outcome, DiagLoc,
+                                DedupHandler);
+      };
+
+      // If there are too many paths to track the lock state per path, the
+      // joined lock state is too imprecise to verify the postconditions
+      // without reporting false positives. Skip the verification instead.
+      if (BundleOverflow[PredID])
+        continue;
+
+      if (PureExitPathBlocks[PredID]) {
+        LocalVarContext EvalCtx =
+            RS ? PreReturnVarCtx[PredID] : PredInfo.ExitContext;
+        for (const TrylockEdgeBundle &Bnd : PureBlockBundles[PredID]) {
+          TrylockValueState EvalState = Bnd.ValState;
+          if (!RS) {
+            constrainValueStateOnEdge(EvalState, PredBlock, ExitBlock,
+                                      EscapedVars);
+            if (EvalState.Infeasible)
+              continue;
+          }
+          SmallVector<ReturnEvalOutcome, 2> Outcomes;
+          evaluateReturnOutcomes(RetVal, CurrentTrylockRetDom, Bnd.Lockset,
+                                 EmptyPending, EvalState, EvalCtx,
+                                 /*UseVarRanges=*/true, Outcomes);
+          for (ReturnEvalOutcome &Outcome : Outcomes)
+            VerifyExitOutcome(Outcome);
+        }
+      } else if (RS) {
+        SmallVector<ReturnEvalOutcome, 2> Outcomes;
+        evaluateReturnOutcomes(
+            RetVal, CurrentTrylockRetDom, PreReturnLocksets[PredID],
+            EmptyPending, PreReturnValStates[PredID], PreReturnVarCtx[PredID],
+            /*UseVarRanges=*/true, Outcomes);
+        for (ReturnEvalOutcome &Outcome : Outcomes)
+          VerifyExitOutcome(Outcome);
+      } else {
+        TrylockValueState FallthroughState = BlockExitValState[PredID];
+        constrainValueStateOnEdge(FallthroughState, PredBlock, ExitBlock,
+                                  EscapedVars);
+        if (!FallthroughState.Infeasible) {
+          ReturnEvalOutcome Outcome;
+          Outcome.Values = IntRangeSet::full(CurrentTrylockRetDom);
+          Outcome.Lockset = PredInfo.ExitSet;
+          checkTrylockExitOutcome(ExpectedFunctionExitSet, Outcome, DiagLoc,
+                                  DedupHandler);
+        }
+      }
+    }
+
+    Handler.leaveFunction(CurrentFunction);
+    return;
+  }
 
   // FIXME: Should we call this function for all blocks which exit the function?
   intersectAndWarn(ExpectedFunctionExitSet, Final.ExitSet, Final.ExitLoc,
