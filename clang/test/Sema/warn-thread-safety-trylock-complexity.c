@@ -1,6 +1,7 @@
 // RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -DMANY_BRANCHES %s
 // RUN: %clang_cc1 -fsyntax-only -Wthread-safety -DNESTED_COMPARISONS %s 2>&1 | FileCheck %s
 // RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -DDISTINCT_MUTEXES %s
+// RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -Wthread-safety-beta -DMANY_SCOPES %s
 
 // Verifying the implementation of a trylock function must take neither
 // quadratic time in the size of the function nor exponential time in the
@@ -33,6 +34,31 @@ int many_branches(void)
       use_value(v);
   })
   lock(&mu);
+  return 0;
+}
+#endif
+
+#ifdef MANY_SCOPES
+// expected-no-diagnostics
+
+// Each block declares a variable with its own scope and has an edge to the
+// same label. Keeping the ranges of variables that are out of scope or the
+// value states of all blocks would make the memory use quadratic in the
+// number of blocks.
+int many_scopes(int x)
+    __attribute__((try_acquire_capability_range(0, 0, mu))) {
+  int v = 0;
+  if (!trylock(&mu))
+    return -1;
+  REP4096({
+    int a = get_value();
+    if (a == x) {
+      v = a;
+      goto out;
+    }
+  })
+out:
+  use_value(v);
   return 0;
 }
 #endif
@@ -70,3 +96,4 @@ int distinct_mutexes(void) __attribute__((try_acquire_capability(1, mu))) {
           trylock(&m[6])) && 0;
 }
 #endif
+

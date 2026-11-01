@@ -1293,6 +1293,11 @@ static constexpr unsigned MaxInlineDepth = 4;
 /// The maximum number of inline helper expansions per analyzed function.
 /// Bounds the cost of analyzing helpers that call other helpers many times.
 static constexpr unsigned MaxInlineExpansions = 512;
+
+/// The maximum number of intervals of a range that is stored in a value
+/// state. Wider ranges are over-approximated such that the cost of copying
+/// and joining value states does not grow with the number of conditions.
+static constexpr unsigned MaxStateRangeIntervals = 16;
 /// The maximum number of nested helpers that return their argument unchanged
 /// that is looked through, e.g. ERR_CAST(ERR_CAST(p)).
 static constexpr unsigned MaxIdentityProbeDepth = 16;
@@ -1396,6 +1401,9 @@ public:
     bool subsetOfSet(const IntRangeSet &Other) const;
     bool intersectsSet(const IntRangeSet &Other) const;
     bool isSingleValue(llvm::APSInt &Val) const;
+    /// Over-approximate this set by at most \p MaxIntervals intervals by
+    /// filling the smallest gaps between intervals.
+    void widen(unsigned MaxIntervals);
     ArrayRef<std::pair<llvm::APSInt, llvm::APSInt>> intervals() const {
       return Intervals;
     }
@@ -1572,11 +1580,24 @@ public:
       TrylockValueState &State, const CFGBlock *PredBlock,
       const CFGBlock *CurrBlock,
       const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
+  void constrainValueStateOnEdgeImpl(
+      TrylockValueState &State, const CFGBlock *PredBlock,
+      const CFGBlock *CurrBlock,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
+  // The parent map of the function whose trylock implementation is verified.
+  const ParentMap *CurrentParentMap = nullptr;
+  // The statement that encloses the declaration of a local variable, i.e. the
+  // scope of the variable.
+  llvm::DenseMap<const ValueDecl *, const Stmt *> VarScopes;
+  void pruneOutOfScopeVars(TrylockValueState &State, const CFGBlock *B);
   void materializeNarrowedTrylocks(FactSet &Lockset, TrylockValueState &State);
   void constrainDereferencedPointersInStmt(
       TrylockValueState &State, const Stmt *S,
       const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
   void updateValueStateForStmt(
+      TrylockValueState &State, const Stmt *S, LocalVarContext StmtCtx,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars);
+  void updateValueStateForStmtImpl(
       TrylockValueState &State, const Stmt *S, LocalVarContext StmtCtx,
       const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars);
   bool isPureExitBlock(const CFGBlock *B, const CapExprSet &TargetCaps);
@@ -2436,6 +2457,40 @@ ThreadSafetyAnalyzer::IntRangeSet::unionWith(const IntRangeSet &Other) const {
   while (J < Other.Intervals.size())
     Append(Other.Intervals[J++]);
   return Res;
+}
+
+void ThreadSafetyAnalyzer::IntRangeSet::widen(unsigned MaxIntervals) {
+  assert(MaxIntervals > 0);
+  if (Intervals.size() <= MaxIntervals)
+    return;
+  // Fill the Intervals.size() - MaxIntervals smallest gaps. The gaps are
+  // computed with one extra bit such that the subtraction cannot overflow.
+  unsigned NumGaps = Intervals.size() - 1;
+  SmallVector<std::pair<llvm::APSInt, unsigned>, 16> Gaps;
+  Gaps.reserve(NumGaps);
+  for (unsigned I = 0; I < NumGaps; ++I) {
+    llvm::APSInt Lo =
+        Intervals[I + 1].first.extend(Intervals[I + 1].first.getBitWidth() + 1);
+    llvm::APSInt Hi =
+        Intervals[I].second.extend(Intervals[I].second.getBitWidth() + 1);
+    Gaps.emplace_back(Lo - Hi, I);
+  }
+  unsigned NumToFill = Intervals.size() - MaxIntervals;
+  std::nth_element(Gaps.begin(), Gaps.begin() + (NumToFill - 1), Gaps.end(),
+                   [](const auto &A, const auto &B) {
+                     return llvm::APSInt::compareValues(A.first, B.first) < 0;
+                   });
+  SmallVector<bool, 16> Fill(NumGaps, false);
+  for (unsigned I = 0; I < NumToFill; ++I)
+    Fill[Gaps[I].second] = true;
+  decltype(Intervals) Res;
+  for (unsigned I = 0; I < Intervals.size(); ++I) {
+    if (I > 0 && Fill[I - 1])
+      Res.back().second = Intervals[I].second;
+    else
+      Res.push_back(Intervals[I]);
+  }
+  Intervals = std::move(Res);
 }
 
 ThreadSafetyAnalyzer::IntRangeSet
@@ -4852,6 +4907,7 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
   for (auto &[VD, R] : Dst.VarRanges) {
     if (auto It = Src.VarRanges.find(VD); It != Src.VarRanges.end()) {
       R = R.unionWith(It->second);
+      R.widen(MaxStateRangeIntervals);
       if (CoversDomain(R, VD->getType()))
         VarsToErase.push_back(VD);
     } else {
@@ -4865,6 +4921,7 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
   for (auto &[E, R] : Dst.ExprRanges) {
     if (auto It = Src.ExprRanges.find(E); It != Src.ExprRanges.end()) {
       R = R.unionWith(It->second);
+      R.widen(MaxStateRangeIntervals);
       if (CoversDomain(R, E->getType()))
         ExprsToErase.push_back(E);
     } else {
@@ -4941,10 +4998,12 @@ restrictVarRange(ThreadSafetyAnalyzer::TrylockValueState &State,
   if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
     Cur = It->second;
   ThreadSafetyAnalyzer::IntRangeSet Restricted = Cur.intersect(Constraint);
-  if (Restricted.empty())
+  if (Restricted.empty()) {
     State.Infeasible = true;
-  else
-    State.VarRanges[VD] = std::move(Restricted);
+    return;
+  }
+  Restricted.widen(MaxStateRangeIntervals);
+  State.VarRanges[VD] = std::move(Restricted);
 }
 
 /// Constrain \p State such that \p VarSide EffectiveOp \p KVal holds. Returns
@@ -5629,6 +5688,21 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdge(
     TrylockValueState &State, const CFGBlock *PredBlock,
     const CFGBlock *CurrBlock,
     const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const {
+  constrainValueStateOnEdgeImpl(State, PredBlock, CurrBlock, EscapedVars);
+  // The condition of a statement terminator is consumed by the edge. Drop its
+  // range to keep the value state small.
+  const Stmt *Term = PredBlock->getTerminatorStmt();
+  if (!State.Infeasible &&
+      isa_and_nonnull<IfStmt, WhileStmt, DoStmt, ForStmt, SwitchStmt>(Term))
+    if (const auto *Cond = dyn_cast_or_null<Expr>(
+            PredBlock->getTerminatorCondition(/*Strip=*/false)))
+      State.ExprRanges.erase(stripNoOpExprWrappers(Cond));
+}
+
+void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
+    TrylockValueState &State, const CFGBlock *PredBlock,
+    const CFGBlock *CurrBlock,
+    const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const {
   if (State.Infeasible)
     return;
 
@@ -6010,8 +6084,80 @@ void ThreadSafetyAnalyzer::constrainDereferencedPointersInStmt(
   }
 }
 
+/// Drop the ranges of local variables that are out of scope in \p B. Their
+/// values cannot be used anymore, and dropping them keeps the size of the
+/// value state proportional to the number of variables in scope. Trylock
+/// results stored in such variables are kept: these may still be referenced,
+/// e.g. by the value of a statement expression.
+void ThreadSafetyAnalyzer::pruneOutOfScopeVars(TrylockValueState &State,
+                                               const CFGBlock *B) {
+  if (State.Infeasible || !CurrentParentMap || State.VarRanges.empty())
+    return;
+  const Stmt *Rep = nullptr;
+  for (const CFGElement &E : *B)
+    if (std::optional<CFGStmt> CS = E.getAs<CFGStmt>()) {
+      Rep = CS->getStmt();
+      break;
+    }
+  if (!Rep)
+    Rep = B->getTerminatorStmt();
+  if (!Rep)
+    return;
+  auto InScope = [&](const ValueDecl *VD) {
+    if (State.UnmaterializedVarDefs.count(VD))
+      return true;
+    auto It = VarScopes.find(VD);
+    if (It == VarScopes.end())
+      return true;
+    for (const Stmt *P = Rep; P; P = CurrentParentMap->getParent(P))
+      if (P == It->second)
+        return true;
+    return false;
+  };
+  SmallVector<const ValueDecl *, 4> Dead;
+  for (const auto &[VD, R] : State.VarRanges)
+    if (!InScope(VD))
+      Dead.push_back(VD);
+  for (const ValueDecl *VD : Dead) {
+    State.VarRanges.erase(VD);
+    State.DerefNonNullVars.erase(VD);
+  }
+}
 
 void ThreadSafetyAnalyzer::updateValueStateForStmt(
+    TrylockValueState &State, const Stmt *S, LocalVarContext StmtCtx,
+    const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) {
+  updateValueStateForStmtImpl(State, S, StmtCtx, EscapedVars);
+  // Once a full expression has been processed, its range is no longer needed.
+  // Dropping it keeps the size of the value state independent of the size of
+  // the function. Ranges of subexpressions are kept since an enclosing
+  // expression may be evaluated in another CFG block, e.g. for || and ?:.
+  if (const auto *DS = dyn_cast<DeclStmt>(S); DS && CurrentParentMap)
+    if (const Stmt *Scope = CurrentParentMap->getParent(DS)) {
+      // The value of a statement expression may be evaluated in a CFG block
+      // after the blocks of its body.
+      if (const Stmt *P = CurrentParentMap->getParent(Scope);
+          isa_and_nonnull<StmtExpr>(P))
+        Scope = P;
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D); VD && VD->hasLocalStorage())
+          VarScopes.try_emplace(cast<ValueDecl>(VD->getCanonicalDecl()), Scope);
+    }
+  if (State.Infeasible || State.ExprRanges.empty() || !CurrentParentMap)
+    return;
+  if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+    for (const Decl *D : DS->decls())
+      if (const auto *VD = dyn_cast<VarDecl>(D); VD && VD->getInit())
+        State.ExprRanges.erase(stripNoOpExprWrappers(VD->getInit()));
+    return;
+  }
+  if (const auto *E = dyn_cast<Expr>(S))
+    if (isa_and_nonnull<CompoundStmt, LabelStmt, CaseStmt, DefaultStmt,
+                        AttributedStmt>(CurrentParentMap->getParent(S)))
+      State.ExprRanges.erase(stripNoOpExprWrappers(E));
+}
+
+void ThreadSafetyAnalyzer::updateValueStateForStmtImpl(
     TrylockValueState &State, const Stmt *S, LocalVarContext StmtCtx,
     const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) {
   if (State.Infeasible || !S || UnevaluatedStmts.contains(S))
@@ -8897,6 +9043,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   std::vector<llvm::SmallPtrSet<const ValueDecl *, 4>> BlockModifiedVars;
   std::vector<bool> PureExitPathBlocks;
   std::vector<TrylockValueState> BlockExitValState;
+  std::vector<bool> KeepStateForExit;
   std::vector<SmallVector<TrylockEdgeBundle, 2>> PureBlockBundles;
   std::vector<bool> BundleOverflow;
   std::vector<FactSet> PreReturnLocksets;
@@ -8912,6 +9059,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     // Collect the trylock calls whose result is discarded.
     DiscardedCalls.clear();
     const ParentMap &PM = AC.getParentMap();
+    CurrentParentMap = &PM;
+    VarScopes.clear();
     auto CollectDiscarded = [&](auto &Self, const Stmt *S) -> void {
       if (!S || isa<LambdaExpr, BlockExpr, CapturedStmt>(S))
         return;
@@ -9022,6 +9171,15 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     }
 
     BlockExitValState.resize(NumBlocks);
+    KeepStateForExit.assign(NumBlocks, false);
+    for (const CFGBlock *ExitPred : CFGraph->getExit().preds()) {
+      if (!ExitPred)
+        continue;
+      KeepStateForExit[ExitPred->getBlockID()] = true;
+      for (const CFGBlock *Q : ExitPred->preds())
+        if (Q)
+          KeepStateForExit[Q->getBlockID()] = true;
+    }
     PureBlockBundles.resize(NumBlocks);
     BundleOverflow.assign(NumBlocks, false);
     PreReturnLocksets.resize(NumBlocks);
@@ -9264,6 +9422,10 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       continue;
 
     if (CheckingTrylockBody) {
+      pruneOutOfScopeVars(CurrValState, CurrBlock);
+      if (IsPureBlock && !BundleOverflow[CurrBlockID])
+        for (TrylockEdgeBundle &Bnd : PureBlockBundles[CurrBlockID])
+          pruneOutOfScopeVars(Bnd.ValState, CurrBlock);
       if (!UnvisitedBackPreds.empty()) {
         const CFGBlock *EntryBlock = &CFGraph->getEntry();
         llvm::SmallPtrSet<const CFGBlock *, 16> LoopBlocks;
@@ -9553,6 +9715,22 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         for (auto &Bnd : PureBlockBundles[CurrBlockID])
           applyScopeExitCleanups(Bnd.Lockset, CurrBlock,
                                  /*OnlyAfterReturn=*/false);
+      }
+
+      // Free the states of predecessors whose successors have all been
+      // visited. Only the exit verification reads them after that, and only
+      // for the predecessors of the exit block and their predecessors. This
+      // keeps the memory use proportional to the number of live states.
+      for (const CFGBlock *Pred : CurrBlock->preds()) {
+        if (!Pred || !VisitedBlocks.alreadySet(Pred) ||
+            KeepStateForExit[Pred->getBlockID()])
+          continue;
+        if (llvm::all_of(Pred->succs(), [&](const CFGBlock *Succ) {
+              return !Succ || VisitedBlocks.alreadySet(Succ);
+            })) {
+          BlockExitValState[Pred->getBlockID()] = TrylockValueState();
+          PureBlockBundles[Pred->getBlockID()].clear();
+        }
       }
     }
 
