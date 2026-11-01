@@ -1002,6 +1002,50 @@ int c_trylock_unsigned_roundtrip_valid(int err)
   return 0;
 }
 
+// Multi-statement GNU statement expressions in trylock implementations.
+void trace_value(long val);
+#define TEST_TRACED_VALUE(x)                                                   \
+  ({                                                                           \
+    long __v = (x);                                                            \
+    trace_value(__v);                                                          \
+    __v;                                                                       \
+  })
+
+int c_stmtexpr_return_valid(int fail)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  if (fail)
+    return TEST_TRACED_VALUE(-11);
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
+int c_stmtexpr_condition_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret = check_hw_ready();
+  mutex_exclusive_lock(&mu1);
+  if (TEST_TRACED_VALUE(ret)) {
+    mutex_unlock(&mu1);
+    return ret;
+  }
+  return ret;
+}
+
+int c_stmtexpr_init_assign_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  // The initializer of 'd' assigns 0 to 'r'.
+  return ({ int r = -11; int d = (r = 0); (void)d; r; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_stmtexpr_nested_assign_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return ({ int r = -11, d; d = (r = 0); r; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_stmtexpr_comma_init_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return ({ int r = -11; int d = (r = 0, r); d; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

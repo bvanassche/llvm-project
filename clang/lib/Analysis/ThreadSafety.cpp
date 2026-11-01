@@ -3207,6 +3207,21 @@ static bool hasThreadSafetyCallEffects(const NamedDecl *Callee,
   return false;
 }
 
+static bool isStraightLineStmtExprSubStmt(const Stmt *S, bool IsRoot = false) {
+  if (!S)
+    return true;
+  if (!IsRoot && isa<StmtExpr, LambdaExpr, BlockExpr, CapturedStmt>(S))
+    return true;
+  if (isa<IfStmt, SwitchStmt, WhileStmt, DoStmt, ForStmt, CXXForRangeStmt,
+          GotoStmt, IndirectGotoStmt, ReturnStmt, BreakStmt, ContinueStmt,
+          LabelStmt, CaseStmt, DefaultStmt, CXXTryStmt>(S))
+    return false;
+  for (const Stmt *Child : S->children())
+    if (Child && !isStraightLineStmtExprSubStmt(Child))
+      return false;
+  return true;
+}
+
 static bool isPureExitBlockElement(const CFGElement &BI) {
   switch (BI.getKind()) {
   case CFGElement::Statement: {
@@ -3936,10 +3951,96 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
 
   if (const auto *SE = dyn_cast<StmtExpr>(E)) {
     const CompoundStmt *CS = SE->getSubStmt();
-    if (CS && CS->size() == 1)
-      if (const auto *SubE = dyn_cast<Expr>(CS->body_back()))
-        return evaluatePureExprRange(SubE, State, Depth + 1);
-    return std::nullopt;
+    if (!CS || CS->body_empty() || !isStraightLineStmtExprSubStmt(CS, true))
+      return std::nullopt;
+    const auto *LastExpr = dyn_cast<Expr>(CS->body_back());
+    if (!LastExpr)
+      return std::nullopt;
+
+    llvm::SmallPtrSet<const ValueDecl *, 4> LocalDecls;
+    for (const Stmt *S : CS->body())
+      if (const auto *DS = dyn_cast<DeclStmt>(S))
+        for (const Decl *D : DS->decls())
+          if (const auto *VD = dyn_cast<VarDecl>(D);
+              VD && VD->hasLocalStorage())
+            LocalDecls.insert(cast<ValueDecl>(VD->getCanonicalDecl()));
+
+    llvm::SmallPtrSet<const ValueDecl *, 4> SEEscaped, SEModified;
+    scanTrylockVars(CS, SEEscaped, SEModified);
+    for (const ValueDecl *MVD : SEModified)
+      if (!SEEscaped.contains(MVD) && !LocalDecls.contains(MVD))
+        return std::nullopt;
+
+    TrylockValueState SubState = State;
+    for (const Stmt *S : llvm::drop_end(CS->body())) {
+      if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+        for (const Decl *D : DS->decls()) {
+          const auto *VD = dyn_cast<VarDecl>(D);
+          if (!VD || !VD->hasLocalStorage())
+            continue;
+          const auto *CanonVD = cast<ValueDecl>(VD->getCanonicalDecl());
+          if (SEEscaped.contains(CanonVD) || !VD->getInit())
+            continue;
+          // The initializer may modify local variables, e.g.
+          // 'int d = (r = 0, r);'. Evaluating such an initializer would use
+          // stale values, so forget the modified variables and the
+          // initialized variable instead.
+          llvm::SmallPtrSet<const ValueDecl *, 4> InitEsc, InitMod;
+          scanTrylockVars(VD->getInit(), InitEsc, InitMod);
+          if (!InitMod.empty()) {
+            for (const ValueDecl *MVD : InitMod)
+              SubState.VarRanges.erase(MVD);
+            SubState.VarRanges.erase(CanonVD);
+            continue;
+          }
+          auto VDom = getScalarDomain(VD->getType());
+          auto InitR =
+              evaluatePureExprRange(VD->getInit(), SubState, Depth + 1);
+          if (VDom && InitR)
+            SubState.VarRanges[CanonVD] = reprojectRangeSet(*InitR, *VDom);
+          else
+            SubState.VarRanges.erase(CanonVD);
+        }
+        continue;
+      }
+      const Expr *StmtE = dyn_cast<Expr>(S);
+      if (const auto *BO =
+              dyn_cast_or_null<BinaryOperator>(stripNoOpExprWrappers(StmtE));
+          BO && BO->getOpcode() == BO_Assign) {
+        if (const auto *DRE = unwrapDirectLValueDRE(BO->getLHS())) {
+          const auto *CanonVD =
+              cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+          if (LocalDecls.contains(CanonVD) && !SEEscaped.contains(CanonVD)) {
+            // The right-hand side may modify local variables, e.g.
+            // 'd = (r = 0);'. Forget these and the assigned variable.
+            llvm::SmallPtrSet<const ValueDecl *, 4> RHSEsc, RHSMod;
+            scanTrylockVars(BO->getRHS(), RHSEsc, RHSMod);
+            if (!RHSMod.empty()) {
+              for (const ValueDecl *MVD : RHSMod)
+                SubState.VarRanges.erase(MVD);
+              SubState.VarRanges.erase(CanonVD);
+              continue;
+            }
+            auto VDom = getScalarDomain(CanonVD->getType());
+            auto RHSR =
+                evaluatePureExprRange(BO->getRHS(), SubState, Depth + 1);
+            if (VDom && RHSR)
+              SubState.VarRanges[CanonVD] = reprojectRangeSet(*RHSR, *VDom);
+            else
+              SubState.VarRanges.erase(CanonVD);
+            continue;
+          }
+        }
+      }
+      llvm::SmallPtrSet<const ValueDecl *, 4> SubEsc, SubMod;
+      scanTrylockVars(S, SubEsc, SubMod);
+      for (const ValueDecl *MVD : SubMod)
+        if (LocalDecls.contains(MVD))
+          SubState.VarRanges.erase(MVD);
+    }
+    auto Sub = evaluatePureExprRange(LastExpr, SubState, Depth + 1);
+    return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
+               : std::nullopt;
   }
 
   return std::nullopt;
@@ -4086,9 +4187,95 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
 
   if (const auto *SE = dyn_cast<StmtExpr>(Cond)) {
     const CompoundStmt *CS = SE->getSubStmt();
-    if (CS && CS->size() == 1)
-      if (const auto *SubE = dyn_cast<Expr>(CS->body_back()))
-        constrainLeafCondition(State, SubE, WantTrue, EscapedVars, Depth + 1);
+    if (!CS || CS->body_empty() || !isStraightLineStmtExprSubStmt(CS, true))
+      return;
+    const auto *LastExpr = dyn_cast<Expr>(CS->body_back());
+    if (!LastExpr)
+      return;
+
+    llvm::SmallPtrSet<const ValueDecl *, 4> LocalDecls;
+    for (const Stmt *S : CS->body())
+      if (const auto *DS = dyn_cast<DeclStmt>(S))
+        for (const Decl *D : DS->decls())
+          if (const auto *VD = dyn_cast<VarDecl>(D);
+              VD && VD->hasLocalStorage())
+            LocalDecls.insert(cast<ValueDecl>(VD->getCanonicalDecl()));
+
+    llvm::SmallPtrSet<const ValueDecl *, 4> SEEscaped, SEModified;
+    scanTrylockVars(CS, SEEscaped, SEModified);
+    for (const ValueDecl *MVD : SEModified)
+      if (!SEEscaped.contains(MVD) && !LocalDecls.contains(MVD))
+        return;
+
+    auto UsesAnyLocalDecl = [&](auto &Self, const Stmt *S) -> bool {
+      if (!S)
+        return false;
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(S))
+        if (LocalDecls.contains(
+                cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl())))
+          return true;
+      for (const Stmt *Child : S->children())
+        if (Child && Self(Self, Child))
+          return true;
+      return false;
+    };
+
+    const Expr *UnwrappedLast = stripNoOpExprWrappers(LastExpr);
+    if (const auto *L2R = dyn_cast<CastExpr>(UnwrappedLast);
+        L2R && L2R->getCastKind() == CK_LValueToRValue)
+      UnwrappedLast = stripNoOpExprWrappers(L2R->getSubExpr());
+
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(UnwrappedLast)) {
+      const auto *TargetVD =
+          cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+      if (LocalDecls.contains(TargetVD) && !SEEscaped.contains(TargetVD)) {
+        const Expr *AssignedRHS = nullptr;
+        unsigned AssignCount = 0;
+        for (const Stmt *S : llvm::drop_end(CS->body())) {
+          if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+            for (const Decl *D : DS->decls()) {
+              const auto *VD = dyn_cast<VarDecl>(D);
+              if (!VD || !VD->getInit())
+                continue;
+              // An initializer may assign to the target variable, e.g.
+              // 'int d = (r = 0);'.
+              llvm::SmallPtrSet<const ValueDecl *, 4> InitEsc, InitMod;
+              scanTrylockVars(VD->getInit(), InitEsc, InitMod);
+              if (InitMod.contains(TargetVD))
+                return;
+              if (VD->getCanonicalDecl() == TargetVD) {
+                AssignedRHS = VD->getInit();
+                ++AssignCount;
+              }
+            }
+            continue;
+          }
+          const Expr *StmtE = dyn_cast<Expr>(S);
+          if (const auto *BO = dyn_cast_or_null<BinaryOperator>(
+                  stripNoOpExprWrappers(StmtE));
+              BO && BO->getOpcode() == BO_Assign) {
+            if (const auto *LHSDRE = unwrapDirectLValueDRE(BO->getLHS());
+                LHSDRE && LHSDRE->getDecl()->getCanonicalDecl() == TargetVD) {
+              AssignedRHS = BO->getRHS();
+              ++AssignCount;
+              continue;
+            }
+          }
+          llvm::SmallPtrSet<const ValueDecl *, 4> SubEsc, SubMod;
+          scanTrylockVars(S, SubEsc, SubMod);
+          if (SubMod.contains(TargetVD))
+            return;
+        }
+        if (AssignCount == 1 && AssignedRHS &&
+            !UsesAnyLocalDecl(UsesAnyLocalDecl, AssignedRHS))
+          constrainLeafCondition(State, AssignedRHS, WantTrue, EscapedVars,
+                                 Depth + 1);
+        return;
+      }
+    }
+
+    if (!UsesAnyLocalDecl(UsesAnyLocalDecl, LastExpr))
+      constrainLeafCondition(State, LastExpr, WantTrue, EscapedVars, Depth + 1);
     return;
   }
 
