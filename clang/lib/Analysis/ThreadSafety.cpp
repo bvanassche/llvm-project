@@ -3844,22 +3844,40 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
     return;
   }
 
+  // A missing entry means that nothing is known about a value. Drop entries
+  // that cover the whole domain of their type such that the state does not
+  // keep growing with every branch condition, which would make the analysis
+  // quadratic in the size of the function.
+  auto CoversDomain = [&Ctx](const ThreadSafetyAnalyzer::IntRangeSet &R,
+                             QualType Ty) {
+    auto Dom = getScalarDomainForType(Ty, Ctx);
+    return Dom && R.intervals().size() == 1 &&
+           llvm::APSInt::compareValues(R.intervals()[0].first, Dom->Lo) <= 0 &&
+           llvm::APSInt::compareValues(R.intervals()[0].second, Dom->Hi) >= 0;
+  };
+
   SmallVector<const ValueDecl *, 4> VarsToErase;
   for (auto &[VD, R] : Dst.VarRanges) {
-    if (auto It = Src.VarRanges.find(VD); It != Src.VarRanges.end())
+    if (auto It = Src.VarRanges.find(VD); It != Src.VarRanges.end()) {
       R = R.unionWith(It->second);
-    else
+      if (CoversDomain(R, VD->getType()))
+        VarsToErase.push_back(VD);
+    } else {
       VarsToErase.push_back(VD);
+    }
   }
   for (const ValueDecl *VD : VarsToErase)
     Dst.VarRanges.erase(VD);
 
   SmallVector<const Expr *, 4> ExprsToErase;
   for (auto &[E, R] : Dst.ExprRanges) {
-    if (auto It = Src.ExprRanges.find(E); It != Src.ExprRanges.end())
+    if (auto It = Src.ExprRanges.find(E); It != Src.ExprRanges.end()) {
       R = R.unionWith(It->second);
-    else
+      if (CoversDomain(R, E->getType()))
+        ExprsToErase.push_back(E);
+    } else {
       ExprsToErase.push_back(E);
+    }
   }
   for (const Expr *E : ExprsToErase)
     Dst.ExprRanges.erase(E);
@@ -4655,13 +4673,74 @@ bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
   return false;
 }
 
+/// The maximum number of distinct outcomes that evaluateReturnOutcomes()
+/// produces for a single expression.
+static constexpr unsigned MaxReturnOutcomes = 64;
+
 void ThreadSafetyAnalyzer::evaluateReturnOutcomes(
     const Expr *E, const IntDomain &TargetDom, const FactSet &InLockset,
     const SmallVectorImpl<PendingTrylockAcquire> &InPending,
     const TrylockValueState &State, LocalVarContext Ctx, bool UseVarRanges,
     SmallVectorImpl<ReturnEvalOutcome> &Out, unsigned Depth) {
+  SmallVector<ReturnEvalOutcome, 4> Local;
   evaluateReturnOutcomesImpl(E, TargetDom, InLockset, InPending, State, Ctx,
-                             UseVarRanges, Out, Depth);
+                             UseVarRanges, Local, Depth);
+
+  // Merge outcomes that only differ in their values. This keeps the number
+  // of outcomes linear instead of exponential in the number of trylock calls
+  // in nested comparisons and logical operators.
+  auto SamePending = [](const SmallVectorImpl<PendingTrylockAcquire> &A,
+                        const SmallVectorImpl<PendingTrylockAcquire> &B) {
+    return A.size() == B.size() &&
+           llvm::all_of(llvm::zip_equal(A, B), [](const auto &P) {
+             const PendingTrylockAcquire &PA = std::get<0>(P);
+             const PendingTrylockAcquire &PB = std::get<1>(P);
+             return PA.LK == PB.LK && PA.Loc == PB.Loc &&
+                    PA.Cap.equals(PB.Cap);
+           });
+  };
+  SmallVector<ReturnEvalOutcome, 4> Merged;
+  for (ReturnEvalOutcome &O : Local) {
+    auto It = llvm::find_if(Merged, [&](const ReturnEvalOutcome &M) {
+      return SamePending(M.PendingAcquires, O.PendingAcquires) &&
+             factSetsEquivalent(M.Lockset, O.Lockset);
+    });
+    if (It != Merged.end())
+      It->Values = It->Values.unionWith(O.Values);
+    else
+      Merged.push_back(std::move(O));
+  }
+
+  if (Merged.size() > MaxReturnOutcomes) {
+    // Give up on tracking the lock state per outcome. Assume that every
+    // capability that any outcome holds or acquires is held or acquired for
+    // every return value, such that a capability that is acquired on some
+    // path is not forgotten. This may report false positives but never
+    // misses a leaked capability.
+    ReturnEvalOutcome O;
+    O.Values = IntRangeSet::full(TargetDom);
+    O.Lockset = InLockset;
+    for (const ReturnEvalOutcome &M : Merged) {
+      for (const auto &Fact : M.Lockset)
+        if (!O.Lockset.findLock(FactMan, FactMan[Fact]))
+          O.Lockset.addLock(FactMan, &FactMan[Fact]);
+      for (const PendingTrylockAcquire &PA : M.PendingAcquires) {
+        // Acquire each capability at most once.
+        auto It = llvm::find_if(O.PendingAcquires,
+                                [&](const PendingTrylockAcquire &Existing) {
+                                  return Existing.Cap.equals(PA.Cap);
+                                });
+        if (It == O.PendingAcquires.end())
+          O.PendingAcquires.push_back(PA);
+        else if (PA.LK == LK_Exclusive)
+          It->LK = LK_Exclusive;
+      }
+    }
+    Out.push_back(std::move(O));
+    return;
+  }
+  for (ReturnEvalOutcome &O : Merged)
+    Out.push_back(std::move(O));
 }
 
 void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
