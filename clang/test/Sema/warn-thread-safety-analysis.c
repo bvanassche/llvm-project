@@ -1046,6 +1046,103 @@ int c_stmtexpr_comma_init_bad(void) // expected-note{{mutex acquired here}}
   return ({ int r = -11; int d = (r = 0, r); d; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
 
+// Trivial inline helpers (restart_syscall, IS_ERR, PTR_ERR, PTR_ERR_OR_ZERO)
+// and multi-statement GNU statement expressions in trylock implementations.
+void trace_branch_hit(int val);
+#define TEST_UNLIKELY_STMTEXPR(x)                                              \
+  ({                                                                           \
+    long __r = __builtin_expect(!!(x), 0);                                     \
+    trace_branch_hit((int)__r);                                                \
+    __r;                                                                       \
+  })
+
+static inline int c_restart_syscall_helper(void) {
+  do_some_work();
+  return -513;
+}
+
+static inline _Bool c_is_err_value(__UINTPTR_TYPE__ x) {
+  return TEST_UNLIKELY_STMTEXPR(x >= (__UINTPTR_TYPE__)-4095);
+}
+
+static inline _Bool c_is_err(const void *ptr) {
+  return c_is_err_value((__UINTPTR_TYPE__)(void *)((__UINTPTR_TYPE__)ptr));
+}
+
+// Recursive inline helpers must not be expanded recursively.
+static inline int c_recursive_helper(int x) {
+  if (c_recursive_helper(x))
+    return c_recursive_helper(x);
+  return c_recursive_helper(x);
+}
+
+int c_recursive_inline_helper_valid(int x)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  if (c_recursive_helper(x))
+    return -1;
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
+static inline __INTPTR_TYPE__ c_ptr_err(const void *ptr) {
+  return (__INTPTR_TYPE__)ptr;
+}
+
+static inline int c_ptr_err_or_zero(const void *ptr) {
+  if (c_is_err(ptr))
+    return c_ptr_err(ptr);
+  else
+    return 0;
+}
+
+void *c_lookup_obj(void);
+
+int c_trylock_restart_syscall_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  if (mutex_exclusive_trylock(&mu1))
+    return 0;
+  do_some_work();
+  return c_restart_syscall_helper();
+}
+
+int c_trylock_is_err_ptr_err_valid(int retry_busy)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret;
+  mutex_exclusive_lock(&mu1);
+  for (int i = 0; i < 2; ++i)
+    do_some_work();
+  void *obj = c_lookup_obj();
+  if (c_is_err(obj)) {
+    ret = c_ptr_err(obj);
+    goto fail_unlock;
+  }
+  if (retry_busy) {
+    ret = c_restart_syscall_helper();
+    goto fail_unlock;
+  }
+  return 0;
+
+fail_unlock:
+  mutex_unlock(&mu1);
+  return ret;
+}
+
+int c_trylock_ptr_err_or_zero_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  void *obj = c_lookup_obj();
+  if (c_is_err(obj))
+    return c_ptr_err_or_zero(obj);
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
+int c_trylock_ptr_err_unchecked_bad(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  // Without c_is_err(obj), obj may be NULL, so c_ptr_err(obj) may return 0!
+  void *obj = c_lookup_obj();
+  return c_ptr_err(obj); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

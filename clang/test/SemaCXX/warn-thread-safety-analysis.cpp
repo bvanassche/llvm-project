@@ -9472,6 +9472,34 @@ class BodyCheckSuite {
     return ok; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
+  static constexpr int constexprNegErr() { return -513; }
+  static inline bool inlineIsErrPtr(const void *p) {
+    return (__UINTPTR_TYPE__)p >= (__UINTPTR_TYPE__)(__INTPTR_TYPE__)-4095;
+  }
+  static inline __INTPTR_TYPE__ inlinePtrErr(const void *p) {
+    return (__INTPTR_TYPE__)p;
+  }
+  void *lookupMaybeErrPtr();
+
+  int validInlineHelperErrPtr(bool retry) TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int ret;
+    mu.Lock();
+    void *p = lookupMaybeErrPtr();
+    if (inlineIsErrPtr(p)) {
+      ret = (int)inlinePtrErr(p);
+      goto fail_unlock;
+    }
+    if (retry) {
+      ret = constexprNegErr();
+      goto fail_unlock;
+    }
+    return 0;
+
+  fail_unlock:
+    mu.Unlock();
+    return ret;
+  }
+
   //===--------------------------------------------------------------------===//
   // Invalid implementations
   //===--------------------------------------------------------------------===//

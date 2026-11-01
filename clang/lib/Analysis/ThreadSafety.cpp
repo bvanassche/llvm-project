@@ -1251,6 +1251,17 @@ private:
 };
 
 /// Class which implements the core thread safety analysis routines.
+/// The body of a trivial inline or constexpr function whose return value can
+/// be evaluated in terms of its parameters.
+struct TrivialInlineBody {
+  const FunctionDecl *DefFD = nullptr;
+  const Expr *SingleRet = nullptr;
+  const Expr *CondExpr = nullptr;
+  const Expr *ThenRet = nullptr;
+  const Expr *ElseRet = nullptr;
+  llvm::SmallPtrSet<const ValueDecl *, 8> CalleeEscaped;
+};
+
 class ThreadSafetyAnalyzer {
   friend class BuildLockset;
   friend class threadSafety::BeforeSet;
@@ -1501,6 +1512,20 @@ public:
   llvm::SmallPtrSet<const CallExpr *, 4> DiscardedCalls;
   void applyScopeExitCleanups(FactSet &StateSet, const CFGBlock *B,
                               bool OnlyAfterReturn = false);
+
+  // Cache of getTrivialInlineBody() results, keyed by the callee and the
+  // number of call arguments.
+  mutable llvm::DenseMap<std::pair<const FunctionDecl *, unsigned>,
+                         std::optional<TrivialInlineBody>>
+      InlineBodyCache;
+  // Functions that are being expanded inline and the expansion depth. Used to
+  // prevent recursive and deeply nested inline expansion.
+  mutable llvm::SmallPtrSet<const FunctionDecl *, 4> ActiveInlineCallees;
+  mutable unsigned InlineDepth = 0;
+  // The number of inline expansions performed for the current function.
+  mutable unsigned InlineExpansionCount = 0;
+  std::optional<TrivialInlineBody>
+  getCachedTrivialInlineBody(const CallExpr *CallExp) const;
   void checkTrylockExitOutcome(const FactSet &BaseExpectedExitSet,
                                const ReturnEvalOutcome &Outcome,
                                SourceLocation DiagLoc,
@@ -3207,6 +3232,140 @@ static bool hasThreadSafetyCallEffects(const NamedDecl *Callee,
   return false;
 }
 
+
+static const ReturnStmt *unwrapSingleReturnStmt(const Stmt *S) {
+  while (const auto *CS = dyn_cast_or_null<CompoundStmt>(S)) {
+    if (CS->size() != 1)
+      return nullptr;
+    S = CS->body_front();
+  }
+  const auto *RS = dyn_cast_or_null<ReturnStmt>(S);
+  return (RS && RS->getRetValue()) ? RS : nullptr;
+}
+
+static unsigned countReturnStmts(const Stmt *S) {
+  if (!S || isa<LambdaExpr, BlockExpr, CapturedStmt>(S))
+    return 0;
+  unsigned Count = isa<ReturnStmt>(S) ? 1 : 0;
+  for (const Stmt *Child : S->children())
+    if (Child)
+      Count += countReturnStmts(Child);
+  return Count;
+}
+
+static std::optional<TrivialInlineBody>
+getTrivialInlineBody(const CallExpr *CallExp) {
+  if (!CallExp || CallExp->isTypeDependent() || CallExp->isValueDependent())
+    return std::nullopt;
+  const FunctionDecl *FD = CallExp->getDirectCallee();
+  if (!FD)
+    return std::nullopt;
+  if (const auto *MD = dyn_cast<CXXMethodDecl>(FD))
+    if (!MD->isStatic())
+      return std::nullopt;
+
+  const FunctionDecl *DefFD = nullptr;
+  const Stmt *Body = FD->getBody(DefFD);
+  if (!Body || !DefFD)
+    return std::nullopt;
+  if ((!DefFD->isInlined() && !DefFD->isConstexpr()) || DefFD->isWeak())
+    return std::nullopt;
+  if (DefFD->isVariadic() || CallExp->getNumArgs() != DefFD->getNumParams())
+    return std::nullopt;
+  if (hasThreadSafetyCallEffects(FD, CallExp) ||
+      hasThreadSafetyCallEffects(DefFD, CallExp))
+    return std::nullopt;
+
+  for (const ParmVarDecl *P : DefFD->parameters()) {
+    QualType PTy = P->getType();
+    if (PTy.isNull() || PTy->isReferenceType() || PTy.isVolatileQualified())
+      return std::nullopt;
+  }
+
+  const auto *CS = dyn_cast<CompoundStmt>(Body);
+  if (!CS || CS->body_empty())
+    return std::nullopt;
+
+  TrivialInlineBody Info;
+  Info.DefFD = DefFD;
+  llvm::SmallPtrSet<const ValueDecl *, 8> CalleeModified;
+  scanTrylockVars(CS, Info.CalleeEscaped, CalleeModified);
+  for (const ParmVarDecl *P : DefFD->parameters()) {
+    const auto *PVD = cast<ValueDecl>(P->getCanonicalDecl());
+    if (Info.CalleeEscaped.contains(PVD) || CalleeModified.contains(PVD))
+      return std::nullopt;
+  }
+
+  unsigned NumRets = countReturnStmts(CS);
+  if (NumRets == 1) {
+    if (const auto *RS = dyn_cast<ReturnStmt>(CS->body_back());
+        RS && RS->getRetValue()) {
+      Info.SingleRet = RS->getRetValue();
+      return Info;
+    }
+    return std::nullopt;
+  }
+
+  if (NumRets == 2) {
+    if (CS->size() == 1) {
+      if (const auto *IS = dyn_cast<IfStmt>(CS->body_front());
+          IS && !IS->getInit() && !IS->getConditionVariable() &&
+          IS->getCond() && IS->getElse()) {
+        const ReturnStmt *ThenRS = unwrapSingleReturnStmt(IS->getThen());
+        const ReturnStmt *ElseRS = unwrapSingleReturnStmt(IS->getElse());
+        if (ThenRS && ElseRS) {
+          Info.CondExpr = IS->getCond();
+          Info.ThenRet = ThenRS->getRetValue();
+          Info.ElseRet = ElseRS->getRetValue();
+          return Info;
+        }
+      }
+    } else if (CS->size() == 2) {
+      const auto *IS = dyn_cast<IfStmt>(CS->body_front());
+      const auto *ElseRS = dyn_cast<ReturnStmt>(CS->body_back());
+      if (IS && !IS->getInit() && !IS->getConditionVariable() &&
+          IS->getCond() && !IS->getElse() && ElseRS && ElseRS->getRetValue()) {
+        if (const ReturnStmt *ThenRS = unwrapSingleReturnStmt(IS->getThen())) {
+          Info.CondExpr = IS->getCond();
+          Info.ThenRet = ThenRS->getRetValue();
+          Info.ElseRet = ElseRS->getRetValue();
+          return Info;
+        }
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
+/// The maximum nesting depth of inline helper expansion.
+static constexpr unsigned MaxInlineDepth = 4;
+/// The maximum number of inline helper expansions per analyzed function.
+/// Bounds the cost of analyzing helpers that call other helpers many times.
+static constexpr unsigned MaxInlineExpansions = 512;
+
+std::optional<TrivialInlineBody>
+ThreadSafetyAnalyzer::getCachedTrivialInlineBody(const CallExpr *CallExp) const {
+  const FunctionDecl *FD = CallExp ? CallExp->getDirectCallee() : nullptr;
+  if (!FD || CallExp->isTypeDependent() || CallExp->isValueDependent())
+    return std::nullopt;
+  if (InlineDepth >= MaxInlineDepth ||
+      InlineExpansionCount >= MaxInlineExpansions)
+    return std::nullopt;
+  std::pair<const FunctionDecl *, unsigned> Key(FD->getCanonicalDecl(),
+                                                CallExp->getNumArgs());
+  auto [It, Inserted] = InlineBodyCache.try_emplace(Key);
+  if (Inserted)
+    It->second = getTrivialInlineBody(CallExp);
+  std::optional<TrivialInlineBody> Info = It->second;
+  // Do not expand recursive calls.
+  if (Info && ActiveInlineCallees.contains(Info->DefFD))
+    return std::nullopt;
+  if (Info)
+    ++InlineExpansionCount;
+  return Info;
+}
+
 static bool isStraightLineStmtExprSubStmt(const Stmt *S, bool IsRoot = false) {
   if (!S)
     return true;
@@ -3795,6 +3954,51 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
         return std::nullopt;
       return castIntegralRangeSet(*Sub, CallExp->getType(), *ASTCtx);
     }
+    if (auto InlineInfo = getCachedTrivialInlineBody(CallExp)) {
+      TrylockValueState CalleeState;
+      for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
+        const auto *PVD = cast<ValueDecl>(
+            InlineInfo->DefFD->getParamDecl(I)->getCanonicalDecl());
+        auto PDom = getScalarDomain(PVD->getType());
+        if (!PDom)
+          continue;
+        if (auto ArgR =
+                evaluatePureExprRange(CallExp->getArg(I), State, Depth + 1))
+          CalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgR, *PDom);
+      }
+      ActiveInlineCallees.insert(InlineInfo->DefFD);
+      ++InlineDepth;
+      llvm::scope_exit PopInline([&] {
+        --InlineDepth;
+        ActiveInlineCallees.erase(InlineInfo->DefFD);
+      });
+      if (InlineInfo->SingleRet) {
+        auto RetR = evaluatePureExprRange(InlineInfo->SingleRet, CalleeState,
+                                          Depth + 1);
+        return RetR ? std::optional<IntRangeSet>(reprojectRangeSet(*RetR, Dom))
+                    : std::nullopt;
+      }
+      TrylockValueState TState = CalleeState;
+      TrylockValueState FState = CalleeState;
+      constrainLeafCondition(TState, InlineInfo->CondExpr, /*WantTrue=*/true,
+                             InlineInfo->CalleeEscaped, Depth + 1);
+      constrainLeafCondition(FState, InlineInfo->CondExpr, /*WantTrue=*/false,
+                             InlineInfo->CalleeEscaped, Depth + 1);
+      IntRangeSet Res;
+      if (!TState.Infeasible) {
+        auto TR = evaluatePureExprRange(InlineInfo->ThenRet, TState, Depth + 1);
+        if (!TR)
+          return std::nullopt;
+        Res = Res.unionWith(reprojectRangeSet(*TR, Dom));
+      }
+      if (!FState.Infeasible) {
+        auto FR = evaluatePureExprRange(InlineInfo->ElseRet, FState, Depth + 1);
+        if (!FR)
+          return std::nullopt;
+        Res = Res.unionWith(reprojectRangeSet(*FR, Dom));
+      }
+      return Res;
+    }
     return std::nullopt;
   }
 
@@ -4181,6 +4385,72 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
       constrainLeafCondition(State, CallExp->getArg(0), WantTrue, EscapedVars,
                              Depth + 1);
       return;
+    }
+    if (auto InlineInfo = getCachedTrivialInlineBody(CallExp)) {
+      TrylockValueState CalleeState;
+      for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
+        const auto *PVD = cast<ValueDecl>(
+            InlineInfo->DefFD->getParamDecl(I)->getCanonicalDecl());
+        auto PDom = getScalarDomain(PVD->getType());
+        if (!PDom)
+          continue;
+        if (auto ArgR =
+                evaluatePureExprRange(CallExp->getArg(I), State, Depth + 1))
+          CalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgR, *PDom);
+      }
+      ActiveInlineCallees.insert(InlineInfo->DefFD);
+      ++InlineDepth;
+      llvm::scope_exit PopInline([&] {
+        --InlineDepth;
+        ActiveInlineCallees.erase(InlineInfo->DefFD);
+      });
+      if (InlineInfo->SingleRet) {
+        constrainLeafCondition(CalleeState, InlineInfo->SingleRet, WantTrue,
+                               InlineInfo->CalleeEscaped, Depth + 1);
+      } else {
+        TrylockValueState TState = CalleeState;
+        TrylockValueState FState = CalleeState;
+        constrainLeafCondition(TState, InlineInfo->CondExpr, /*WantTrue=*/true,
+                               InlineInfo->CalleeEscaped, Depth + 1);
+        constrainLeafCondition(TState, InlineInfo->ThenRet, WantTrue,
+                               InlineInfo->CalleeEscaped, Depth + 1);
+        constrainLeafCondition(FState, InlineInfo->CondExpr, /*WantTrue=*/false,
+                               InlineInfo->CalleeEscaped, Depth + 1);
+        constrainLeafCondition(FState, InlineInfo->ElseRet, WantTrue,
+                               InlineInfo->CalleeEscaped, Depth + 1);
+        CalleeState.Infeasible = true;
+        unionIntoValueState(CalleeState, TState, *ASTCtx);
+        unionIntoValueState(CalleeState, FState, *ASTCtx);
+      }
+      if (CalleeState.Infeasible) {
+        State.Infeasible = true;
+        return;
+      }
+      for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
+        const ValueDecl *CallerVD =
+            extractTrackableVarExpr(CallExp->getArg(I), EscapedVars);
+        if (!CallerVD)
+          continue;
+        auto CallerDom = getScalarDomain(CallerVD->getType());
+        if (!CallerDom)
+          continue;
+        const auto *PVD = cast<ValueDecl>(
+            InlineInfo->DefFD->getParamDecl(I)->getCanonicalDecl());
+        auto PIt = CalleeState.VarRanges.find(PVD);
+        if (PIt == CalleeState.VarRanges.end())
+          continue;
+        IntRangeSet Mapped = reprojectRangeSet(PIt->second, *CallerDom);
+        IntRangeSet Cur = IntRangeSet::full(*CallerDom);
+        if (auto CIt = State.VarRanges.find(CallerVD);
+            CIt != State.VarRanges.end())
+          Cur = CIt->second;
+        IntRangeSet Restricted = Cur.intersect(Mapped);
+        if (Restricted.empty()) {
+          State.Infeasible = true;
+          return;
+        }
+        State.VarRanges[CallerVD] = std::move(Restricted);
+      }
     }
     return;
   }
@@ -7168,6 +7438,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   ASTCtx = &AC.getASTContext();
   RangeCondCache.clear();
   SwitchTables.clear();
+  InlineBodyCache.clear();
+  InlineExpansionCount = 0;
   CurrentFunction = dyn_cast<FunctionDecl>(D);
 
   if (D->hasAttr<NoThreadSafetyAnalysisAttr>())
