@@ -22,6 +22,7 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/OperationKinds.h"
+#include "clang/AST/ParentMap.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/AST/Type.h"
@@ -1409,6 +1410,17 @@ public:
     SourceLocation Loc;
   };
 
+  /// A trylock result that is no longer stored in any variable, e.g. because
+  /// the variable has been overwritten.
+  struct OverwrittenTrylockDef {
+    const Expr *DefE;
+    LocalVarContext Ctx;
+    QualType Ty;
+    // The values that the variable may have had when it was overwritten, or
+    // std::nullopt if unknown.
+    std::optional<IntRangeSet> Allowed;
+  };
+
   struct TrylockValueState {
     bool Infeasible = false;
     llvm::SmallDenseMap<const ValueDecl *, IntRangeSet, 4> VarRanges;
@@ -1421,6 +1433,9 @@ public:
     llvm::SmallDenseSet<AcquiredTrylockKey, 4> ConsumedTrylockAttrs;
     // Trylock calls whose result has been discarded.
     llvm::SmallSetVector<const CallExpr *, 2> DiscardedTrylockCalls;
+    // Trylock results that are no longer stored in any variable. The
+    // capabilities of these calls may still have been acquired.
+    SmallVector<OverwrittenTrylockDef, 1> OverwrittenTrylockDefs;
     // Pointer variables that have been dereferenced unconditionally since
     // their last modification. These are assumed to be non-null when
     // evaluating their value, unless a branch condition contradicts that.
@@ -3482,6 +3497,52 @@ scanTrylockVars(const Stmt *Root,
   VisitNode(VisitNode, Root, /*InNestedClosure=*/false);
 }
 
+/// Return whether the value of \p E is discarded, e.g. because \p E is an
+/// expression statement, the left operand of a comma operator or the operand
+/// of a cast to void. Statements whose use of \p E is not modeled count as
+/// discarding it, so that a trylock call in such a context is still assumed
+/// to have possibly acquired its capabilities.
+static bool isDiscardedValue(const Expr *E, const ParentMap &PM) {
+  const Stmt *Child = E;
+  while (const Stmt *P = PM.getParent(Child)) {
+    if (const auto *CE = dyn_cast<CastExpr>(P)) {
+      if (CE->getCastKind() == CK_ToVoid)
+        return true;
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(P);
+               BO && BO->getOpcode() == BO_Comma) {
+      if (Child == BO->getLHS())
+        return true;
+    } else if (const auto *CO = dyn_cast<AbstractConditionalOperator>(P)) {
+      if (Child == CO->getCond())
+        return false;
+    } else if (const auto *CS = dyn_cast<CompoundStmt>(P)) {
+      // Only the value of the last statement of a statement expression is
+      // used.
+      const Stmt *GP = PM.getParent(CS);
+      if (!GP || !isa<StmtExpr>(GP) || CS->body_back() != Child)
+        return true;
+      P = GP;
+    } else if (!isa<ParenExpr, FullExpr, MaterializeTemporaryExpr,
+                    CXXBindTemporaryExpr>(P)) {
+      if (isa<Expr, DeclStmt, ReturnStmt>(P))
+        return false;
+      if (const auto *IS = dyn_cast<IfStmt>(P))
+        return Child != IS->getCond();
+      if (const auto *WS = dyn_cast<WhileStmt>(P))
+        return Child != WS->getCond();
+      if (const auto *DS = dyn_cast<DoStmt>(P))
+        return Child != DS->getCond();
+      if (const auto *FS = dyn_cast<ForStmt>(P))
+        return Child != FS->getCond();
+      if (const auto *SS = dyn_cast<SwitchStmt>(P))
+        return Child != SS->getCond();
+      return true;
+    }
+    Child = P;
+  }
+  return true;
+}
+
 static void
 scanBlockModifiedVars(const CFGBlock *B,
                       llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars) {
@@ -4696,6 +4757,34 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
   return std::nullopt;
 }
 
+/// Record in \p State that the trylock result \p Def is no longer stored in
+/// any variable.
+static void
+addOverwrittenTrylockDef(ThreadSafetyAnalyzer::TrylockValueState &State,
+                         ThreadSafetyAnalyzer::OverwrittenTrylockDef Def) {
+  for (const auto &[VD, DefPair] : State.UnmaterializedVarDefs)
+    if (DefPair.first == Def.DefE)
+      return;
+  for (auto &Existing : State.OverwrittenTrylockDefs) {
+    if (Existing.DefE != Def.DefE)
+      continue;
+    if (!Existing.Allowed || !Def.Allowed || Existing.Ty != Def.Ty)
+      Existing.Allowed = std::nullopt;
+    else
+      Existing.Allowed = Existing.Allowed->unionWith(*Def.Allowed);
+    return;
+  }
+  State.OverwrittenTrylockDefs.push_back(std::move(Def));
+}
+
+/// Return the trylock definition stored in \p VD as an OverwrittenTrylockDef.
+/// \p Allowed is the set of values that \p VD may have.
+static ThreadSafetyAnalyzer::OverwrittenTrylockDef makeOverwrittenTrylockDef(
+    const ValueDecl *VD, const std::pair<const Expr *, LocalVarContext> &Def,
+    std::optional<ThreadSafetyAnalyzer::IntRangeSet> Allowed) {
+  return {Def.first, Def.second, VD->getType(), std::move(Allowed)};
+}
+
 static void
 unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
                     const ThreadSafetyAnalyzer::TrylockValueState &Src,
@@ -4707,6 +4796,46 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
     return;
   }
 
+  // A variable that holds different trylock results on the two paths, or a
+  // trylock result on one path only, no longer holds a trylock result after
+  // the join. Remember these results such that the capabilities that the
+  // calls may have acquired are not forgotten.
+  {
+    using OverwrittenDef = ThreadSafetyAnalyzer::OverwrittenTrylockDef;
+    SmallVector<OverwrittenDef, 2> Lost;
+    auto RangeOf = [](const ThreadSafetyAnalyzer::TrylockValueState &S,
+                      const ValueDecl *VD)
+        -> std::optional<ThreadSafetyAnalyzer::IntRangeSet> {
+      if (auto It = S.VarRanges.find(VD); It != S.VarRanges.end())
+        return It->second;
+      return std::nullopt;
+    };
+    SmallVector<const ValueDecl *, 2> DefsToErase;
+    for (const auto &[VD, DefPair] : Dst.UnmaterializedVarDefs) {
+      auto It = Src.UnmaterializedVarDefs.find(VD);
+      if (It == Src.UnmaterializedVarDefs.end() ||
+          It->second.first != DefPair.first) {
+        Lost.push_back(
+            makeOverwrittenTrylockDef(VD, DefPair, RangeOf(Dst, VD)));
+        DefsToErase.push_back(VD);
+      }
+    }
+    for (const auto &[VD, DefPair] : Src.UnmaterializedVarDefs) {
+      auto It = Dst.UnmaterializedVarDefs.find(VD);
+      if (It == Dst.UnmaterializedVarDefs.end() ||
+          It->second.first != DefPair.first)
+        Lost.push_back(
+            makeOverwrittenTrylockDef(VD, DefPair, RangeOf(Src, VD)));
+    }
+    // Erase the definitions first such that addOverwrittenTrylockDef() only
+    // skips results that are still stored in a variable on both paths.
+    for (const ValueDecl *VD : DefsToErase)
+      Dst.UnmaterializedVarDefs.erase(VD);
+    for (const OverwrittenDef &Def : Src.OverwrittenTrylockDefs)
+      Lost.push_back(Def);
+    for (OverwrittenDef &L : Lost)
+      addOverwrittenTrylockDef(Dst, std::move(L));
+  }
   // A missing entry means that nothing is known about a value. Drop entries
   // that cover the whole domain of their type such that the state does not
   // keep growing with every branch condition, which would make the analysis
@@ -4761,16 +4890,6 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
   for (const CallExpr *CE : Src.DiscardedTrylockCalls)
     Dst.DiscardedTrylockCalls.insert(CE);
   llvm::set_intersect(Dst.DerefNonNullVars, Src.DerefNonNullVars);
-
-  SmallVector<const ValueDecl *, 2> DefsToErase;
-  for (const auto &[VD, DefPair] : Dst.UnmaterializedVarDefs) {
-    auto It = Src.UnmaterializedVarDefs.find(VD);
-    if (It == Src.UnmaterializedVarDefs.end() ||
-        It->second.first != DefPair.first)
-      DefsToErase.push_back(VD);
-  }
-  for (const ValueDecl *VD : DefsToErase)
-    Dst.UnmaterializedVarDefs.erase(VD);
 }
 
 /// If \p CallExp calls a trivial inline helper that returns its only argument
@@ -5931,8 +6050,45 @@ void ThreadSafetyAnalyzer::updateValueStateForStmt(
 
   constrainDereferencedPointersInStmt(State, S, EscapedVars);
 
+  // Called before VD is modified. If VD holds a trylock result that is not
+  // stored anywhere else and that the new value \p NewRHS does not depend on,
+  // remember that result together with the values VD may have had.
+  auto RetireDef = [&](const ValueDecl *VD, const Expr *NewRHS) {
+    auto It = State.UnmaterializedVarDefs.find(VD);
+    if (It == State.UnmaterializedVarDefs.end())
+      return;
+    const std::pair<const Expr *, LocalVarContext> Def = It->second;
+    if (NewRHS) {
+      bool Referenced = false;
+      auto Visit = [&](auto &Self, const Stmt *Node) -> void {
+        if (!Node || Referenced || isa<LambdaExpr, BlockExpr>(Node))
+          return;
+        if (const auto *DRE = dyn_cast<DeclRefExpr>(Node)) {
+          const auto *RefVD =
+              cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+          if (auto RefIt = State.UnmaterializedVarDefs.find(RefVD);
+              RefIt != State.UnmaterializedVarDefs.end() &&
+              RefIt->second.first == Def.first)
+            Referenced = true;
+        }
+        for (const Stmt *Child : Node->children())
+          Self(Self, Child);
+      };
+      Visit(Visit, NewRHS);
+      if (Referenced)
+        return;
+    }
+    std::optional<IntRangeSet> Allowed;
+    if (auto VR = State.VarRanges.find(VD); VR != State.VarRanges.end())
+      Allowed = VR->second;
+    State.UnmaterializedVarDefs.erase(It);
+    addOverwrittenTrylockDef(State,
+                             makeOverwrittenTrylockDef(VD, Def, Allowed));
+  };
+
   auto UpdateVarFromExpr = [&](const ValueDecl *VD, const Expr *RHS) {
     VD = cast<ValueDecl>(VD->getCanonicalDecl());
+    RetireDef(VD, RHS);
     State.DerefNonNullVars.erase(VD);
     if (!isTrackableLocalVar(VD, EscapedVars)) {
       State.VarRanges.erase(VD);
@@ -5994,7 +6150,7 @@ void ThreadSafetyAnalyzer::updateValueStateForStmt(
       if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
         State.ExprRanges[stripNoOpExprWrappers(BO)] = It->second;
     } else {
-      State.UnmaterializedVarDefs.erase(VD);
+      RetireDef(VD, /*NewRHS=*/nullptr);
       State.DerefNonNullVars.erase(VD);
       // Arithmetic on a bool converts the result back to bool instead of
       // wrapping it. Do not model that.
@@ -6035,7 +6191,7 @@ void ThreadSafetyAnalyzer::updateValueStateForStmt(
     const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
     if (!VD)
       return;
-    State.UnmaterializedVarDefs.erase(VD);
+    RetireDef(VD, /*NewRHS=*/nullptr);
     State.DerefNonNullVars.erase(VD);
     if (isTrackableLocalVar(VD, EscapedVars) &&
         VD->getType()->isIntegralOrEnumerationType() &&
@@ -6219,6 +6375,14 @@ void ThreadSafetyAnalyzer::evaluateReturnWithPendingTrylocks(
     auto VR = State.VarRanges.find(VD);
     Fork(DefE, DefPair.second,
          VR != State.VarRanges.end() ? &VR->second : nullptr, *Dom);
+  }
+  for (const OverwrittenTrylockDef &Def : State.OverwrittenTrylockDefs) {
+    if (ReferencedDefs.contains(Def.DefE) || !Done.insert(Def.DefE).second)
+      continue;
+    auto Dom = getScalarDomain(Def.Ty);
+    if (!Dom)
+      continue;
+    Fork(Def.DefE, Def.Ctx, Def.Allowed ? &*Def.Allowed : nullptr, *Dom);
   }
   for (const CallExpr *CE : State.DiscardedTrylockCalls) {
     if (!Done.insert(CE).second)
@@ -8741,37 +8905,19 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 
     scanTrylockVars(AC.getBody(), EscapedVars, LoopModifiedVars);
 
-    // Collect the calls whose result is discarded: expression statements and
-    // casts to void.
+    // Collect the trylock calls whose result is discarded.
     DiscardedCalls.clear();
+    const ParentMap &PM = AC.getParentMap();
     auto CollectDiscarded = [&](auto &Self, const Stmt *S) -> void {
       if (!S || isa<LambdaExpr, BlockExpr, CapturedStmt>(S))
         return;
-      auto Note = [&](const Stmt *Child) {
-        const auto *E = dyn_cast_or_null<Expr>(Child);
-        while (E) {
-          E = E->IgnoreParens();
-          if (const auto *FE = dyn_cast<FullExpr>(E)) {
-            E = FE->getSubExpr();
-            continue;
-          }
-          if (const auto *CE = dyn_cast<CastExpr>(E);
-              CE && CE->getCastKind() == CK_ToVoid) {
-            E = CE->getSubExpr();
-            continue;
-          }
-          break;
-        }
-        if (const auto *Call = dyn_cast_or_null<CallExpr>(E))
+      if (const auto *Call = dyn_cast<CallExpr>(S)) {
+        const auto *Callee = dyn_cast_or_null<NamedDecl>(Call->getCalleeDecl());
+        if (Callee &&
+            (Callee->hasAttr<TryAcquireCapabilityAttr>() ||
+             Callee->hasAttr<TryAcquireCapabilityRangeAttr>()) &&
+            isDiscardedValue(Call, PM))
           DiscardedCalls.insert(Call);
-      };
-      if (const auto *CS = dyn_cast<CompoundStmt>(S)) {
-        // The value of the last statement of a statement expression is used.
-        for (const Stmt *Child : CS->body())
-          Note(Child);
-      } else if (const auto *CE = dyn_cast<CastExpr>(S);
-                 CE && CE->getCastKind() == CK_ToVoid) {
-        Note(CE);
       }
       for (const Stmt *Child : S->children())
         Self(Self, Child);
@@ -8815,20 +8961,6 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         Self(Self, Child);
     };
     CollectUnevaluated(CollectUnevaluated, AC.getBody());
-    // The result of the last statement of a statement expression is used.
-    auto UnmarkStmtExprResults = [&](auto &Self, const Stmt *S) -> void {
-      if (!S)
-        return;
-      if (const auto *SE = dyn_cast<StmtExpr>(S))
-        if (const CompoundStmt *CS = SE->getSubStmt(); CS && !CS->body_empty())
-          if (const auto *E = dyn_cast<Expr>(CS->body_back()))
-            if (const auto *Call =
-                    dyn_cast<CallExpr>(E->IgnoreParens()->IgnoreImplicit()))
-              DiscardedCalls.erase(Call);
-      for (const Stmt *Child : S->children())
-        Self(Self, Child);
-    };
-    UnmarkStmtExprResults(UnmarkStmtExprResults, AC.getBody());
 
     RPOIdx.assign(NumBlocks, UINT_MAX);
     BlockModifiedVars.resize(NumBlocks);
@@ -8918,6 +9050,16 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     return true;
   };
 
+  auto SameOverwrittenDefs = [](const TrylockValueState &A,
+                                const TrylockValueState &B) {
+    return A.OverwrittenTrylockDefs.size() == B.OverwrittenTrylockDefs.size() &&
+           llvm::all_of(A.OverwrittenTrylockDefs, [&](const auto &ADef) {
+             return llvm::any_of(
+                 B.OverwrittenTrylockDefs,
+                 [&](const auto &BDef) { return ADef.DefE == BDef.DefE; });
+           });
+  };
+
   auto AddOrMergeBundle = [&](unsigned BlockID, TrylockEdgeBundle Candidate) {
     if (BundleOverflow[BlockID] || Candidate.ValState.Infeasible)
       return;
@@ -8933,7 +9075,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
               Candidate.ValState.DiscardedTrylockCalls &&
           Existing.ValState.DerefNonNullVars ==
               Candidate.ValState.DerefNonNullVars &&
-          SameUnmaterializedDefs(Existing.ValState, Candidate.ValState)) {
+          SameUnmaterializedDefs(Existing.ValState, Candidate.ValState) &&
+          SameOverwrittenDefs(Existing.ValState, Candidate.ValState)) {
         unionIntoValueState(Existing.ValState, Candidate.ValState, *ASTCtx);
         return;
       }
@@ -9143,6 +9286,17 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
           }
         }
 
+        // The loop may overwrite a trylock result that is stored in a
+        // variable before the loop. Remember such results with unknown
+        // variable values.
+        auto RetireLoopDef = [&](const ValueDecl *VD) {
+          auto It = CurrValState.UnmaterializedVarDefs.find(VD);
+          if (It == CurrValState.UnmaterializedVarDefs.end())
+            return;
+          auto Def = makeOverwrittenTrylockDef(VD, It->second, std::nullopt);
+          CurrValState.UnmaterializedVarDefs.erase(It);
+          addOverwrittenTrylockDef(CurrValState, std::move(Def));
+        };
         // A block of an irreducible cycle may be entered from outside the
         // cycle through another block of the cycle. Hence, it is reachable
         // even if all its forward predecessor edges are infeasible. Since
@@ -9150,8 +9304,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         if (CurrValState.Infeasible && IrreducibleLoop)
           CurrValState = TrylockValueState();
         auto EraseModifiedVar = [&](const ValueDecl *VD) {
+          RetireLoopDef(VD);
           CurrValState.VarRanges.erase(VD);
-          CurrValState.UnmaterializedVarDefs.erase(VD);
           CurrValState.DerefNonNullVars.erase(VD);
         };
         if (IrreducibleLoop) {
@@ -9276,7 +9430,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
           }
 
           for (const ValueDecl *VD : LoopModVars) {
-            CurrValState.UnmaterializedVarDefs.erase(VD);
+            RetireLoopDef(VD);
             CurrValState.DerefNonNullVars.erase(VD);
             if (!CandidateVars.contains(VD))
               CurrValState.VarRanges.erase(VD);

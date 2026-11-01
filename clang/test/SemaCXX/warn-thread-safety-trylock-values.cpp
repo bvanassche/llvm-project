@@ -153,3 +153,97 @@ int impl_increment_through_alias(void) // expected-note{{mutex acquired here}}
   ++*p;
   return r; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
 }
+
+//===----------------------------------------------------------------------===//
+// Trylock results that are overwritten or discarded.
+//===----------------------------------------------------------------------===//
+
+#define TRY1 __attribute__((try_acquire_capability(1, mu)))
+
+int overwritten() TRY1 {
+  int ok = trylock(&mu); // expected-note{{mutex acquired here}}
+  ok = 0;
+  return ok; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int overwritten_conditionally(int c) TRY1 {
+  int ok = trylock(&mu); // expected-note{{mutex acquired here}}
+  if (c)
+    ok = 0;
+  return ok; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int overwritten_before_call(int c) TRY1 {
+  int ok = trylock(&mu); // expected-note{{mutex acquired here}}
+  if (c)
+    ok = 0;
+  cond();
+  return ok; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+// The loop invalidates what is known about the value of ok.
+int overwritten_in_loop() TRY1 { // expected-note{{mutex acquired here}}
+  int ok = trylock(&mu); // expected-note{{mutex acquired here}}
+  while (cond())
+    ok = 0;
+  return ok; // expected-warning{{mutex 'mu' is still held at the end of function}} expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+int overwritten_by_trylock() TRY1 {
+  int ok;
+  ok = trylock(&mu); // expected-note 2{{mutex acquired here}}
+  ok = trylock(&mu); // expected-warning{{acquiring mutex 'mu' that is already held}}
+  return ok; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+// The overwritten value can only be a failure value.
+int overwritten_after_failure() TRY1 {
+  int ok = trylock(&mu);
+  if (!ok)
+    ok = 0;
+  return ok;
+}
+
+// The result is still stored in another variable.
+int overwritten_copy_kept() TRY1 {
+  int ok = trylock(&mu);
+  int ok2 = ok;
+  ok = 5;
+  return ok2;
+}
+
+int valid_join(void) TRY1 {
+  int ret = 1;
+  if (cond())
+    lock(&mu);
+  else
+    ret = trylock(&mu);
+  cond();
+  if (!ret)
+    return 0;
+  return 1;
+}
+
+int discarded_in_unbraced_if(int c) TRY1 {
+  if (c)
+    trylock(&mu); // expected-note{{mutex acquired here}}
+  return 0; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int discarded_by_comma() TRY1 {
+  return (trylock(&mu), 0); // expected-warning{{mutex 'mu' is still held at the end of function}} expected-note{{mutex acquired here}}
+}
+
+int discarded_in_initializer() TRY1 {
+  int x = (trylock(&mu), 0); // expected-note{{mutex acquired here}}
+  return x; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int discarded_in_for_init() TRY1 {
+  for (trylock(&mu);;) // expected-note{{mutex acquired here}}
+    return 0; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int not_discarded_conditional(int c) TRY1 {
+  return c ? trylock(&mu) : 0;
+}
