@@ -468,11 +468,32 @@ private:
   Context::Factory ContextFactory;
   std::vector<VarDefinition> VarDefinitions;
   std::vector<std::pair<const Stmt *, Context>> SavedContexts;
+  // Local variables that may be modified other than by a direct assignment,
+  // e.g. because their address is taken.
+  llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
 
 public:
   LocalVariableMap() {
     // index 0 is a placeholder for undefined variables (aka phi-nodes).
     VarDefinitions.push_back(VarDefinition(nullptr, 0, 0, getEmptyContext()));
+  }
+
+  /// Record that \p VD may be modified other than by a direct assignment.
+  void addEscapedVar(const ValueDecl *VD) {
+    EscapedVars.insert(cast<ValueDecl>(VD->getCanonicalDecl()));
+  }
+
+  /// Return whether the value of \p D at a program point is the value of its
+  /// last definition. This does not hold for variables without local storage,
+  /// whose initializer only runs once, nor for volatile and __block variables
+  /// or for variables that escape, since these may be modified behind the
+  /// analysis' back. Capability expressions deliberately look through such
+  /// variables anyway; see testReassignmentPointerToAlias().
+  bool hasTrackableValue(const NamedDecl *D) const {
+    const auto *VD = dyn_cast<VarDecl>(D);
+    return VD && VD->hasLocalStorage() &&
+           !VD->getType().isVolatileQualified() && !VD->hasAttr<BlocksAttr>() &&
+           !EscapedVars.contains(cast<ValueDecl>(VD->getCanonicalDecl()));
   }
 
   /// Look up a definition, within the given context.
@@ -501,6 +522,13 @@ public:
       i = VarDefinitions[i].DirectRef;
     }
     return nullptr;
+  }
+
+  /// Like lookupExpr(), but return null if the value of \p D may differ from
+  /// its last definition. Use this when evaluating the value of a variable,
+  /// e.g. a trylock result.
+  const Expr *lookupValueExpr(const NamedDecl *D, Context &Ctx) const {
+    return hasTrackableValue(D) ? lookupExpr(D, Ctx) : nullptr;
   }
 
   Context getEmptyContext() { return ContextFactory.getEmptyMap(); }
@@ -724,43 +752,50 @@ void VarMapBuilder::VisitUnaryOperator(const UnaryOperator *UO) {
 // Invalidates local variable definitions if variable escaped.
 void VarMapBuilder::VisitCallExpr(const CallExpr *CE) {
   const FunctionDecl *FD = CE->getDirectCallee();
-  if (!FD)
-    return;
 
   // Heuristic for likely-benign functions that pass by mutable reference. This
   // is needed to avoid a slew of false positives due to mutable reference
   // passing where the captured reference is usually passed on by-value.
-  if (const IdentifierInfo *II = FD->getIdentifier()) {
+  if (const IdentifierInfo *II = FD ? FD->getIdentifier() : nullptr) {
     // Any kind of std::bind-like functions.
     if (II->isStr("bind") || II->isStr("bind_front"))
       return;
   }
 
+  // Returns the variable whose address is \p Arg, if any.
+  auto GetAddressOfVar = [](const Expr *Arg) -> const ValueDecl * {
+    if (const auto *UO = dyn_cast<UnaryOperator>(Arg->IgnoreParenCasts()))
+      if (UO->getOpcode() == UO_AddrOf)
+        if (const auto *DRE =
+                dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParenCasts()))
+          return DRE->getDecl();
+    return nullptr;
+  };
+
   // Invalidate local variable definitions that are passed by non-const
   // reference or non-const pointer.
   for (unsigned Idx = 0; Idx < CE->getNumArgs(); ++Idx) {
-    if (Idx >= FD->getNumParams())
-      break;
-
     const Expr *Arg = CE->getArg(Idx)->IgnoreParenImpCasts();
-    const ParmVarDecl *PVD = FD->getParamDecl(Idx);
-    QualType ParamType = PVD->getType();
-
-    // Potential reassignment if passed by non-const reference / pointer.
     const ValueDecl *VDec = nullptr;
-    if (ParamType->isReferenceType() &&
-        !ParamType->getPointeeType().isConstQualified()) {
-      if (const auto *DRE = dyn_cast<DeclRefExpr>(Arg))
-        VDec = DRE->getDecl();
-    } else if (ParamType->isPointerType() &&
-               !ParamType->getPointeeType().isConstQualified()) {
-      Arg = Arg->IgnoreParenCasts();
-      if (const auto *UO = dyn_cast<UnaryOperator>(Arg)) {
-        if (UO->getOpcode() == UO_AddrOf) {
-          const Expr *SubE = UO->getSubExpr()->IgnoreParenCasts();
-          if (const auto *DRE = dyn_cast<DeclRefExpr>(SubE))
-            VDec = DRE->getDecl();
-        }
+
+    if (!FD || Idx >= FD->getNumParams()) {
+      // The parameter type is not known, e.g. for a variadic argument or an
+      // indirect call. Assume that the callee may modify the variable.
+      VDec = GetAddressOfVar(Arg);
+      if (!VDec && CE->getArg(Idx)->isGLValue())
+        if (const auto *DRE = dyn_cast<DeclRefExpr>(Arg))
+          VDec = DRE->getDecl();
+    } else {
+      QualType ParamType = FD->getParamDecl(Idx)->getType();
+
+      // Potential reassignment if passed by non-const reference / pointer.
+      if (ParamType->isReferenceType() &&
+          !ParamType->getPointeeType().isConstQualified()) {
+        if (const auto *DRE = dyn_cast<DeclRefExpr>(Arg))
+          VDec = DRE->getDecl();
+      } else if (ParamType->isPointerType() &&
+                 !ParamType->getPointeeType().isConstQualified()) {
+        VDec = GetAddressOfVar(Arg);
       }
     }
 
@@ -2003,7 +2038,7 @@ const CallExpr* ThreadSafetyAnalyzer::getTrylockCallExpr(const Stmt *Cond,
   else if (const auto *FE = dyn_cast<FullExpr>(Cond))
     return getTrylockCallExpr(FE->getSubExpr(), C, Negate);
   else if (const auto *DRE = dyn_cast<DeclRefExpr>(Cond)) {
-    const Expr *E = LocalVarMap.lookupExpr(DRE->getDecl(), C);
+    const Expr *E = LocalVarMap.lookupValueExpr(DRE->getDecl(), C);
     return getTrylockCallExpr(E, C, Negate);
   }
   else if (const auto *UOP = dyn_cast<UnaryOperator>(Cond)) {
@@ -2557,7 +2592,7 @@ const Expr *ThreadSafetyAnalyzer::skipValuePreservingWrappers(
     }
     if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
       const Expr *Def =
-          C ? LocalVarMap.lookupExpr(DRE->getDecl(), *C) : nullptr;
+          C ? LocalVarMap.lookupValueExpr(DRE->getDecl(), *C) : nullptr;
       if (!Def)
         return E;
       E = Def;
@@ -2678,7 +2713,7 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
   }
 
   if (const auto *DRE = dyn_cast<DeclRefExpr>(Cond)) {
-    const Expr *E = LocalVarMap.lookupExpr(DRE->getDecl(), C);
+    const Expr *E = LocalVarMap.lookupValueExpr(DRE->getDecl(), C);
     return evaluateTrylockRangeCond(E, C);
   }
 
@@ -3341,10 +3376,18 @@ static const DeclRefExpr *unwrapDirectLValueDRE(const Expr *E) {
   return dyn_cast_or_null<DeclRefExpr>(E);
 }
 
+/// Collect the local variables that are referenced in \p Root other than by
+/// reading or assigning their value (EscapedVars) and the variables that may
+/// be modified (ModifiedVars). If \p CallArgsAreTransient is true, passing
+/// the address of a variable or a reference to a variable as a function
+/// argument does not count as an escape: the callee can only modify the
+/// variable during the call, and the LocalVariableMap invalidates the
+/// definition of the variable at the call.
 static void
 scanTrylockVars(const Stmt *Root,
                 llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
-                llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars) {
+                llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars,
+                bool CallArgsAreTransient = false) {
   if (!Root)
     return;
 
@@ -3397,6 +3440,22 @@ scanTrylockVars(const Stmt *Root,
       } else if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
         if (UO->isIncrementDecrementOp()) {
           if (const auto *DRE = unwrapDirectLValueDRE(UO->getSubExpr())) {
+            SafeDREs.insert(DRE);
+            ModifiedVars.insert(
+                cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+          }
+        }
+      } else if (const auto *Call = dyn_cast<CallExpr>(S);
+                 Call && CallArgsAreTransient) {
+        for (const Expr *Arg : Call->arguments()) {
+          const DeclRefExpr *DRE = nullptr;
+          if (const auto *AddrOf =
+                  dyn_cast<UnaryOperator>(Arg->IgnoreParenCasts());
+              AddrOf && AddrOf->getOpcode() == UO_AddrOf)
+            DRE = unwrapDirectLValueDRE(AddrOf->getSubExpr());
+          else if (Arg->isGLValue())
+            DRE = unwrapDirectLValueDRE(Arg);
+          if (DRE) {
             SafeDREs.insert(DRE);
             ModifiedVars.insert(
                 cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
@@ -6054,7 +6113,7 @@ bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
                                             Depth + 1);
     }
     LocalVarContext SubCtx = Ctx;
-    if (const Expr *DefE = LocalVarMap.lookupExpr(DRE->getDecl(), SubCtx))
+    if (const Expr *DefE = LocalVarMap.lookupValueExpr(DRE->getDecl(), SubCtx))
       return exprHasUnmaterializedTrylock(DefE, SubCtx, State,
                                           /*UseStateDefs=*/false, Depth + 1);
     return false;
@@ -6518,7 +6577,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     }
     if (!DefE) {
       DefCtx = Ctx;
-      DefE = LocalVarMap.lookupExpr(DRE->getDecl(), DefCtx);
+      DefE = LocalVarMap.lookupValueExpr(DRE->getDecl(), DefCtx);
     }
     if (DefE) {
       if (auto SubDom = getScalarDomain(DefE->getType())) {
@@ -8459,7 +8518,15 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   // Mark entry block as reachable
   Initial.Reachable = true;
 
-  // Compute SSA names for local variables
+  // Compute SSA names for local variables. Record which variables may be
+  // modified through an alias, since the analysis would not see the update.
+  {
+    llvm::SmallPtrSet<const ValueDecl *, 16> Escaped, Modified;
+    scanTrylockVars(AC.getBody(), Escaped, Modified,
+                    /*CallArgsAreTransient=*/true);
+    for (const ValueDecl *VD : Escaped)
+      LocalVarMap.addEscapedVar(VD);
+  }
   LocalVarMap.traverseCFG(CFGraph, SortedGraph, BlockInfo);
 
   // Fill in source locations for all CFGBlocks.

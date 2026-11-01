@@ -497,6 +497,12 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   Existing implementations of such functions that do not match their
   annotations now trigger warnings.
 
+- The thread safety analysis no longer looks through the definition of a local
+  variable that holds a trylock result if the variable is `static`, `volatile`
+  or `__block`, or if it escapes, e.g. because its address is taken or because
+  it is captured by reference. Such a variable may be modified without the
+  analysis noticing.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed missing `-Wuninitialized-explicit-init` warnings for C file-scope
