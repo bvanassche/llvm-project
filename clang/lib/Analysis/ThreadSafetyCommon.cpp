@@ -258,14 +258,28 @@ CapabilityExpr SExprBuilder::translateAttrExpr(const Expr *AttrExp,
   return CapabilityExpr(E, AttrExp->getType(), Neg);
 }
 
+void SExprBuilder::markIfStmtExprLocal(const VarDecl *VD) {
+  if (ActiveStmtExprs.empty() || isa<ParmVarDecl>(VD))
+    return;
+  const ValueDecl *CanonVD = VD->getCanonicalDecl();
+  for (const StmtExpr *SE : ActiveStmtExprs) {
+    if (getStmtExprLocals(SE).contains(CanonVD)) {
+      RefersToStmtExprLocal = true;
+      return;
+    }
+  }
+}
+
 til::SExpr *SExprBuilder::translateVariable(const VarDecl *VD,
                                             CallingContext *Ctx) {
   assert(VD);
 
   // General recursion guard for x = f(x). If we are already in the process of
   // defining VD, use its pre-assignment value to break the cycle.
-  if (VarsBeingTranslated.contains(VD->getCanonicalDecl()))
+  if (VarsBeingTranslated.contains(VD->getCanonicalDecl())) {
+    markIfStmtExprLocal(VD);
     return new (Arena) til::LiteralPtr(VD);
+  }
 
   // The closure captures state that is updated to correctly translate chains of
   // aliases. Restore it when we are done with recursive translation.
@@ -286,16 +300,22 @@ til::SExpr *SExprBuilder::translateVariable(const VarDecl *VD,
       // lookup. This will fail with complex control-flow graphs (where we
       // revert to no alias resolution to retain stable variable names).
       if (const Expr *E = LookupLocalVarExpr(VD)) {
+        bool SavedRefersToLocal = RefersToStmtExprLocal;
+        RefersToStmtExprLocal = false;
         til::SExpr *Result = translate(E, Ctx);
-        // Unsupported expression (such as heap allocations) will be undefined;
-        // rather than failing here, we simply revert to the pointer being the
-        // canonical variable.
-        if (Result && !isa<til::Undefined>(Result))
+        bool SubRefersToLocal = RefersToStmtExprLocal;
+        RefersToStmtExprLocal = SavedRefersToLocal;
+        // Unsupported expressions (such as heap allocations) will be
+        // undefined, and any expression referring to a variable declared inside
+        // a statement expression names a variable that does not exist outside
+        // it; revert to the pointer being the canonical variable.
+        if (Result && !isa<til::Undefined>(Result) && !SubRefersToLocal)
           return Result;
       }
     }
   }
 
+  markIfStmtExprLocal(VD);
   return new (Arena) til::LiteralPtr(VD);
 }
 
@@ -930,13 +950,39 @@ SExprBuilder::translateDeclStmt(const DeclStmt *S, CallingContext *Ctx) {
   return nullptr;
 }
 
+const llvm::DenseSet<const ValueDecl *> &
+SExprBuilder::getStmtExprLocals(const StmtExpr *SE) {
+  auto [It, Inserted] = StmtExprLocalCache.try_emplace(SE);
+  if (Inserted) {
+    llvm::DenseSet<const ValueDecl *> &Locals = It->second;
+    auto Collect = [&](auto &Self, const Stmt *S) -> void {
+      if (!S || isa<StmtExpr, LambdaExpr, BlockExpr>(S))
+        return;
+      if (const auto *DS = dyn_cast<DeclStmt>(S))
+        for (const Decl *D : DS->decls())
+          if (const auto *VD = dyn_cast<VarDecl>(D))
+            Locals.insert(VD->getCanonicalDecl());
+      for (const Stmt *Child : S->children())
+        Self(Self, Child);
+    };
+    Collect(Collect, SE->getSubStmt());
+  }
+  return It->second;
+}
+
 til::SExpr *SExprBuilder::translateStmtExpr(const StmtExpr *SE,
                                             CallingContext *Ctx) {
   // The value of a statement expression is the value of the last statement,
   // which must be an expression.
   const CompoundStmt *CS = SE->getSubStmt();
-  return CS->body_empty() ? new (Arena) til::Undefined(SE)
-                          : translate(CS->body_back(), Ctx);
+  if (CS->body_empty())
+    return new (Arena) til::Undefined(SE);
+  if (VarsBeingTranslated.empty() && ActiveStmtExprs.empty())
+    return translate(CS->body_back(), Ctx);
+
+  ActiveStmtExprs.push_back(SE);
+  llvm::scope_exit Pop([&] { ActiveStmtExprs.pop_back(); });
+  return translate(CS->body_back(), Ctx);
 }
 
 // If (E) is non-trivial, then add it to the current basic block, and

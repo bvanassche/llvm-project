@@ -455,6 +455,9 @@ private:
 
   til::SExpr *translateDeclStmt(const DeclStmt *S, CallingContext *Ctx);
   til::SExpr *translateStmtExpr(const StmtExpr *SE, CallingContext *Ctx);
+  const llvm::DenseSet<const ValueDecl *> &
+  getStmtExprLocals(const StmtExpr *SE);
+  void markIfStmtExprLocal(const VarDecl *VD);
 
   // Map from statements in the clang CFG to SExprs in the til::SCFG.
   using StatementMap = llvm::DenseMap<const Stmt *, til::SExpr *>;
@@ -548,6 +551,12 @@ private:
       std::function<const Expr *(const NamedDecl *)>;
   // Recursion guard.
   llvm::DenseSet<const ValueDecl *> VarsBeingTranslated;
+  // Statement expressions currently being translated, their cached local
+  // variable declarations, and whether the active translation refers to one.
+  SmallVector<const StmtExpr *, 4> ActiveStmtExprs;
+  llvm::DenseMap<const StmtExpr *, llvm::DenseSet<const ValueDecl *>>
+      StmtExprLocalCache;
+  bool RefersToStmtExprLocal = false;
   // Context-dependent lookup of currently valid definitions of local variables.
   LookupLocalVarExprClosure LookupLocalVarExpr;
 };
