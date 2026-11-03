@@ -1551,6 +1551,15 @@ public:
       const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs =
           nullptr);
   void getAcquiredTrylockCaps(const AcquiredTrylockKey &Key, CapExprSet &Caps);
+  void getTrylockMutexIDs(CapExprSet &Mtxs, const Attr *A, const Expr *Exp,
+                          const NamedDecl *D);
+  bool collectTrylockCaps(const Attr *A, const Expr *CallExp,
+                          const NamedDecl *Callee, CapExprSet &ExclusiveCaps,
+                          CapExprSet &SharedCaps);
+  void addTrylockFacts(FactSet &FSet, const CapExprSet &ExclusiveCaps,
+                       const CapExprSet &SharedCaps, SourceLocation Loc);
+  std::optional<IntRangeSet> getTrylockSuccessSet(const Attr *A,
+                                                  const IntDomain &Dom) const;
 
   void getTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
 
@@ -2223,22 +2232,133 @@ void ThreadSafetyAnalyzer::getEdgeLockset(
                         ConsumedAttrs);
 }
 
+/// Whether \p A is a try_acquire_capability or try_acquire_capability_range
+/// attribute.
+static bool isTrylockAttr(const Attr *A) {
+  return isa<TryAcquireCapabilityAttr, TryAcquireCapabilityRangeAttr>(A);
+}
+
+static bool hasTrylockAttr(const Decl *D) {
+  return D->hasAttr<TryAcquireCapabilityAttr>() ||
+         D->hasAttr<TryAcquireCapabilityRangeAttr>();
+}
+
+/// The trylock attributes of \p D: try_acquire_capability attributes first,
+/// followed by try_acquire_capability_range attributes.
+static SmallVector<const Attr *, 4> trylockAttrs(const Decl *D) {
+  SmallVector<const Attr *, 4> Attrs;
+  llvm::append_range(Attrs, D->specific_attrs<TryAcquireCapabilityAttr>());
+  llvm::append_range(Attrs, D->specific_attrs<TryAcquireCapabilityRangeAttr>());
+  return Attrs;
+}
+
+/// Call \p F with trylock attribute \p A cast to its attribute class.
+template <typename Fn> static auto visitTrylockAttr(const Attr *A, Fn &&F) {
+  if (const auto *TA = dyn_cast<TryAcquireCapabilityAttr>(A))
+    return F(TA);
+  return F(cast<TryAcquireCapabilityRangeAttr>(A));
+}
+
+static bool isSharedTrylockAttr(const Attr *A) {
+  return visitTrylockAttr(A, [](const auto *TA) { return TA->isShared(); });
+}
+
+static bool trylockAttrHasArgs(const Attr *A) {
+  return visitTrylockAttr(A,
+                          [](const auto *TA) { return TA->args_size() != 0; });
+}
+
+void ThreadSafetyAnalyzer::getTrylockMutexIDs(CapExprSet &Mtxs, const Attr *A,
+                                              const Expr *Exp,
+                                              const NamedDecl *D) {
+  visitTrylockAttr(A, [&](const auto *TA) { getMutexIDs(Mtxs, TA, Exp, D); });
+}
+
+/// Add the capabilities that the trylock attribute \p A of \p Callee names to
+/// \p ExclusiveCaps or \p SharedCaps. Returns whether \p A names any
+/// capability.
+bool ThreadSafetyAnalyzer::collectTrylockCaps(const Attr *A,
+                                              const Expr *CallExp,
+                                              const NamedDecl *Callee,
+                                              CapExprSet &ExclusiveCaps,
+                                              CapExprSet &SharedCaps) {
+  CapExprSet AttrLocks;
+  getTrylockMutexIDs(AttrLocks, A, CallExp, Callee);
+  CapExprSet &Dest = isSharedTrylockAttr(A) ? SharedCaps : ExclusiveCaps;
+  for (const auto &Cap : AttrLocks)
+    Dest.push_back_nodup(Cap);
+  return !AttrLocks.empty();
+}
+
+/// Add the capabilities acquired by a successful trylock call at \p Loc to
+/// \p FSet.
+void ThreadSafetyAnalyzer::addTrylockFacts(FactSet &FSet,
+                                           const CapExprSet &ExclusiveCaps,
+                                           const CapExprSet &SharedCaps,
+                                           SourceLocation Loc) {
+  auto AddTrylockFact = [&](const CapabilityExpr &Cap, LockKind LK) {
+    const FactEntry *Existing = FSet.findLock(FactMan, Cap);
+    if (Existing && Existing->loc() == Loc && !Existing->asserted()) {
+      // The fact comes from the same trylock call, e.g. because a join kept
+      // the shared fact of a call that acquires the capability exclusively
+      // for other return values. Refine the lock kind instead of reporting a
+      // double acquisition.
+      if (Existing->kind() != LK)
+        FSet.replaceLock(FactMan, Cap,
+                         FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
+      return;
+    }
+    addLock(FSet, FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
+  };
+  for (const auto &Cap : ExclusiveCaps)
+    AddTrylockFact(Cap, LK_Exclusive);
+  for (const auto &Cap : SharedCaps)
+    AddTrylockFact(Cap, LK_Shared);
+}
+
+/// Returns the set of return values in \p Dom for which a call of a function
+/// with the trylock attribute \p A acquires the capabilities named by \p A, or
+/// std::nullopt if the success value(s) of \p A cannot be evaluated.
+std::optional<ThreadSafetyAnalyzer::IntRangeSet>
+ThreadSafetyAnalyzer::getTrylockSuccessSet(const Attr *A,
+                                           const IntDomain &Dom) const {
+  if (const auto *TA = dyn_cast<TryAcquireCapabilityAttr>(A)) {
+    bool SuccBool = false;
+    if (!evalTrylockSuccessBool(TA->getSuccessValue(), *ASTCtx, SuccBool))
+      return std::nullopt;
+    IntRangeSet Zero = IntRangeSet::single(Dom, llvm::APSInt::get(0));
+    return SuccBool ? Zero.complement(Dom) : Zero;
+  }
+  const auto *RA = cast<TryAcquireCapabilityRangeAttr>(A);
+  if (!RA->getFirstSuccessValue() || !RA->getLastSuccessValue())
+    return std::nullopt;
+  auto First = RA->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+  auto Last = RA->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+  if (!First || !Last)
+    return std::nullopt;
+  return IntRangeSet::closedRange(Dom, *First, *Last);
+}
+
 /// Add the capabilities acquired by the trylock call and attribute \p Key to
 /// \p Caps.
 void ThreadSafetyAnalyzer::getAcquiredTrylockCaps(const AcquiredTrylockKey &Key,
                                                   CapExprSet &Caps) {
-  const auto *Callee = dyn_cast_or_null<NamedDecl>(Key.first->getCalleeDecl());
-  if (!Callee)
-    return;
-  if (const auto *A = dyn_cast<TryAcquireCapabilityAttr>(Key.second))
-    getMutexIDs(Caps, A, Key.first, Callee);
-  else if (const auto *A = dyn_cast<TryAcquireCapabilityRangeAttr>(Key.second))
-    getMutexIDs(Caps, A, Key.first, Callee);
+  if (const auto *Callee =
+          dyn_cast_or_null<NamedDecl>(Key.first->getCalleeDecl()))
+    getTrylockMutexIDs(Caps, Key.second, Key.first, Callee);
 }
 
 static bool isRangeTrylockReturnType(QualType Ty) {
   return !Ty.isNull() && !Ty->isDependentType() &&
          (Ty->isIntegralOrEnumerationType() || Ty->isAnyPointerType());
+}
+
+/// Whether the trylock attribute \p A applies to a call that returns \p RetTy.
+/// try_acquire_capability_range only applies to integer, enumeration and
+/// pointer return types.
+static bool trylockAttrAppliesTo(const Attr *A, QualType RetTy) {
+  return !isa<TryAcquireCapabilityRangeAttr>(A) ||
+         isRangeTrylockReturnType(RetTy);
 }
 
 static const NamedDecl *getRangeTrylockCallee(const CallExpr *CallExp) {
@@ -3017,6 +3137,7 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
       BlockInfo[PredBlock->getBlockID()].ExitContext;
   const CallExpr *CallExp = nullptr;
   const NamedDecl *Callee = nullptr;
+  IntDomain Dom;
   IntRangeSet EdgeSet;
 
   if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
@@ -3026,7 +3147,7 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
     Callee = getRangeTrylockCallee(CallExp);
     if (!Callee)
       return;
-    IntDomain Dom = *getScalarDomain(CallExp->getType());
+    Dom = *getScalarDomain(CallExp->getType());
     const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
     if (!Table.Valid)
       return;
@@ -3048,6 +3169,7 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
       return;
     CallExp = CondRes.Call;
     Callee = CondRes.Callee;
+    Dom = CondRes.Dom;
     int BranchIdx = 0;
     for (auto SI = PredBlock->succ_begin(), SE = PredBlock->succ_end();
          SI != SE && BranchIdx < 2; ++SI, ++BranchIdx) {
@@ -3074,49 +3196,19 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
   CapExprSet SharedLocksToAdd;
   for (const auto *Attr :
        Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
-    if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue())
+    auto SuccSet = getTrylockSuccessSet(Attr, Dom);
+    if (!SuccSet || !EdgeSet.subsetOfSet(*SuccSet))
       continue;
-    auto First = Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-    auto Last = Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-    if (!First || !Last)
+    if (ConsumedAttrs && ConsumedAttrs->contains({CallExp, Attr}))
       continue;
-    if (EdgeSet.subsetOf(*First, *Last)) {
-      if (ConsumedAttrs && ConsumedAttrs->contains({CallExp, Attr}))
-        continue;
-      CapExprSet AttrLocks;
-      getMutexIDs(AttrLocks, Attr, CallExp, Callee);
-      if (!AttrLocks.empty()) {
-        if (AcquiredAttrs)
-          AcquiredAttrs->insert({CallExp, Attr});
-        CapExprSet &Dest =
-            Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd;
-        for (const auto &Cap : AttrLocks)
-          Dest.push_back_nodup(Cap);
-      }
-    }
+    if (collectTrylockCaps(Attr, CallExp, Callee, ExclusiveLocksToAdd,
+                           SharedLocksToAdd) &&
+        AcquiredAttrs)
+      AcquiredAttrs->insert({CallExp, Attr});
   }
 
-  auto AddTrylockFact = [&](const CapabilityExpr &Cap, LockKind LK,
-                            SourceLocation Loc) {
-    const FactEntry *Existing = Result.findLock(FactMan, Cap);
-    if (Existing && Existing->loc() == Loc && !Existing->asserted()) {
-      // The fact comes from the same trylock call, e.g. because a join kept
-      // the shared fact of a call that acquires the capability exclusively
-      // for other return values. Refine the lock kind instead of reporting a
-      // double acquisition.
-      if (Existing->kind() != LK)
-        Result.replaceLock(FactMan, Cap,
-                           FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
-      return;
-    }
-    addLock(Result, FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
-  };
-
-  SourceLocation Loc = CallExp->getExprLoc();
-  for (const auto &ExclusiveLockToAdd : ExclusiveLocksToAdd)
-    AddTrylockFact(ExclusiveLockToAdd, LK_Exclusive, Loc);
-  for (const auto &SharedLockToAdd : SharedLocksToAdd)
-    AddTrylockFact(SharedLockToAdd, LK_Shared, Loc);
+  addTrylockFacts(Result, ExclusiveLocksToAdd, SharedLocksToAdd,
+                  CallExp->getExprLoc());
 }
 
 void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
@@ -3134,6 +3226,7 @@ void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
   const LocalVarContext &LVarCtx = BlockInfo[Block->getBlockID()].ExitContext;
   const CallExpr *CallExp = nullptr;
   const NamedDecl *Callee = nullptr;
+  IntDomain Dom;
   SmallVector<IntRangeSet, 4> BranchSets;
 
   if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
@@ -3143,7 +3236,7 @@ void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
     Callee = getRangeTrylockCallee(CallExp);
     if (!Callee)
       return;
-    IntDomain Dom = *getScalarDomain(CallExp->getType());
+    Dom = *getScalarDomain(CallExp->getType());
     const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
     if (!Table.Valid)
       return;
@@ -3159,6 +3252,7 @@ void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
       return;
     CallExp = CondRes.Call;
     Callee = CondRes.Callee;
+    Dom = CondRes.Dom;
     BranchSets.push_back(std::move(CondRes.TrueSet));
     BranchSets.push_back(std::move(CondRes.FalseSet));
   }
@@ -3174,15 +3268,11 @@ void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
 
   for (const auto *Attr :
        Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
-    if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue())
-      continue;
-    auto First = Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-    auto Last = Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-    if (!First || !Last)
+    auto SuccSet = getTrylockSuccessSet(Attr, Dom);
+    if (!SuccSet)
       continue;
     bool CleanPartition = llvm::all_of(BranchSets, [&](const IntRangeSet &S) {
-      return S.empty() || S.subsetOf(*First, *Last) ||
-             !S.intersects(*First, *Last);
+      return S.empty() || S.subsetOfSet(*SuccSet) || !S.intersectsSet(*SuccSet);
     });
     if (CleanPartition)
       getMutexIDs(Caps, Attr, CallExp, Callee);
@@ -3642,9 +3732,7 @@ static bool hasThreadSafetyCallEffects(const NamedDecl *Callee,
     return false;
   if (Callee->hasAttr<AcquireCapabilityAttr>() ||
       Callee->hasAttr<ReleaseCapabilityAttr>() ||
-      Callee->hasAttr<AssertCapabilityAttr>() ||
-      Callee->hasAttr<TryAcquireCapabilityAttr>() ||
-      Callee->hasAttr<TryAcquireCapabilityRangeAttr>() ||
+      Callee->hasAttr<AssertCapabilityAttr>() || hasTrylockAttr(Callee) ||
       Callee->hasAttr<LocksExcludedAttr>() ||
       Callee->hasAttr<RequiresCapabilityAttr>())
     return true;
@@ -5259,18 +5347,13 @@ ThreadSafetyAnalyzer::evaluateInlineCallRangeCond(
     SmallVector<IntRangeSet, 4> Pieces{FullDom};
     for (const auto *Attr :
          TargetCallee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
-      if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue())
+      auto Success = getTrylockSuccessSet(Attr, TargetDom);
+      if (!Success)
         continue;
-      auto First =
-          Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-      auto Last = Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-      if (!First || !Last)
-        continue;
-      IntRangeSet Success = IntRangeSet::closedRange(TargetDom, *First, *Last);
-      IntRangeSet Failure = Success.complement(TargetDom);
+      IntRangeSet Failure = Success->complement(TargetDom);
       SmallVector<IntRangeSet, 4> Refined;
       for (const IntRangeSet &Piece : Pieces)
-        for (const IntRangeSet *Part : {&Success, &Failure})
+        for (const IntRangeSet *Part : {&*Success, &Failure})
           if (IntRangeSet Sub = Piece.intersect(*Part); !Sub.empty())
             Refined.push_back(std::move(Sub));
       Pieces = std::move(Refined);
@@ -5860,22 +5943,6 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
     return nullptr;
   };
 
-  auto AddTrylockFact = [&](const CapabilityExpr &Cap, LockKind LK,
-                            SourceLocation Loc) {
-    const FactEntry *Existing = Lockset.findLock(FactMan, Cap);
-    if (Existing && Existing->loc() == Loc && !Existing->asserted()) {
-      // The fact comes from the same trylock call, e.g. because a join kept
-      // the shared fact of a call that acquires the capability exclusively
-      // for other return values. Refine the lock kind instead of reporting a
-      // double acquisition.
-      if (Existing->kind() != LK)
-        Lockset.replaceLock(FactMan, Cap,
-                           FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
-      return;
-    }
-    addLock(Lockset, FactMan.createFact<LockableFactEntry>(Cap, LK, Loc));
-  };
-
   for (const auto &[VD, DefPair] : State.UnmaterializedVarDefs) {
     auto VR = State.VarRanges.find(VD);
     if (VR == State.VarRanges.end() || VR->second.empty())
@@ -5903,63 +5970,25 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
     CapExprSet ExclusiveLocksToAdd;
     CapExprSet SharedLocksToAdd;
 
-    for (const auto *Attr :
-         Callee->specific_attrs<TryAcquireCapabilityAttr>()) {
-      if (State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
+    // A range attribute only applies if the variable holds the exact result
+    // of the call.
+    bool ExactInt = PreservesExactInt &&
+                    isRangeTrylockReturnType(CallExp->getType()) &&
+                    isRangeTrylockReturnType(VD->getType());
+    for (const Attr *A : trylockAttrs(Callee)) {
+      if (isa<TryAcquireCapabilityRangeAttr>(A) && !ExactInt)
         continue;
-      bool SuccBool = false;
-      if (!evalTrylockSuccessBool(Attr->getSuccessValue(), *ASTCtx, SuccBool))
+      if (State.AcquiredTrylockAttrs.contains({CallExp, A}))
         continue;
-      IntRangeSet SuccSet = IntRangeSet::single(*VarDom, llvm::APSInt::get(0));
-      if (SuccBool)
-        SuccSet = SuccSet.complement(*VarDom);
-      if (VR->second.subsetOfSet(SuccSet)) {
-        CapExprSet AttrLocks;
-        getMutexIDs(AttrLocks, Attr, CallExp, Callee);
-        if (!AttrLocks.empty()) {
-          State.AcquiredTrylockAttrs.insert({CallExp, Attr});
-          CapExprSet &Dest =
-              Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd;
-          for (const auto &Cap : AttrLocks)
-            Dest.push_back_nodup(Cap);
-        }
-      }
+      auto SuccSet = getTrylockSuccessSet(A, *VarDom);
+      if (SuccSet && VR->second.subsetOfSet(*SuccSet) &&
+          collectTrylockCaps(A, CallExp, Callee, ExclusiveLocksToAdd,
+                             SharedLocksToAdd))
+        State.AcquiredTrylockAttrs.insert({CallExp, A});
     }
 
-    if (PreservesExactInt && isRangeTrylockReturnType(CallExp->getType()) &&
-        isRangeTrylockReturnType(VD->getType())) {
-      for (const auto *Attr :
-           Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
-        if (State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
-          continue;
-        if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue())
-          continue;
-        auto First =
-            Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-        auto Last =
-            Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-        if (!First || !Last)
-          continue;
-        IntRangeSet SuccSet = IntRangeSet::closedRange(*VarDom, *First, *Last);
-        if (VR->second.subsetOfSet(SuccSet)) {
-          CapExprSet AttrLocks;
-          getMutexIDs(AttrLocks, Attr, CallExp, Callee);
-          if (!AttrLocks.empty()) {
-            State.AcquiredTrylockAttrs.insert({CallExp, Attr});
-            CapExprSet &Dest =
-                Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd;
-            for (const auto &Cap : AttrLocks)
-              Dest.push_back_nodup(Cap);
-          }
-        }
-      }
-    }
-
-    SourceLocation Loc = CallExp->getExprLoc();
-    for (const auto &Cap : ExclusiveLocksToAdd)
-      AddTrylockFact(Cap, LK_Exclusive, Loc);
-    for (const auto &Cap : SharedLocksToAdd)
-      AddTrylockFact(Cap, LK_Shared, Loc);
+    addTrylockFacts(Lockset, ExclusiveLocksToAdd, SharedLocksToAdd,
+                    CallExp->getExprLoc());
   }
 }
 
@@ -6176,10 +6205,8 @@ void ThreadSafetyAnalyzer::updateValueStateForStmtImpl(
     }
     if (const auto *CE = dyn_cast<CallExpr>(E);
         CE && DiscardedCalls.contains(CE)) {
-      if (const auto *Callee =
-              dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl());
-          Callee && (Callee->hasAttr<TryAcquireCapabilityAttr>() ||
-                     Callee->hasAttr<TryAcquireCapabilityRangeAttr>()))
+      if (const auto *Callee = dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl());
+          Callee && hasTrylockAttr(Callee))
         State.DiscardedTrylockCalls.insert(CE);
     }
     if (const auto *CE = dyn_cast<CallExpr>(E)) {
@@ -6387,16 +6414,10 @@ bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
                                           UseStateDefs, Depth + 1);
     if (const auto *Callee =
             dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl())) {
-      for (const auto *Attr :
-           Callee->specific_attrs<TryAcquireCapabilityAttr>())
-        if (!State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
+      for (const Attr *A : trylockAttrs(Callee))
+        if (trylockAttrAppliesTo(A, CallExp->getType()) &&
+            !State.AcquiredTrylockAttrs.contains({CallExp, A}))
           return true;
-      if (isRangeTrylockReturnType(CallExp->getType())) {
-        for (const auto *Attr :
-             Callee->specific_attrs<TryAcquireCapabilityRangeAttr>())
-          if (!State.AcquiredTrylockAttrs.contains({CallExp, Attr}))
-            return true;
-      }
     }
     for (const Expr *Arg : CallExp->arguments())
       if (exprHasUnmaterializedTrylock(Arg, Ctx, State, UseStateDefs,
@@ -7162,8 +7183,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       return;
     }
 
-    if (!Callee->hasAttr<TryAcquireCapabilityAttr>() &&
-        !Callee->hasAttr<TryAcquireCapabilityRangeAttr>()) {
+    if (!hasTrylockAttr(Callee)) {
       if (auto InlineInfo = getCachedTrivialInlineBody(CallExp)) {
         struct InlineArgBranch {
           FactSet Lockset;
@@ -7320,48 +7340,19 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       }
     };
 
-    for (const auto *Attr :
-         Callee->specific_attrs<TryAcquireCapabilityAttr>()) {
-      bool SuccBool = false;
-      if (!evalTrylockSuccessBool(Attr->getSuccessValue(), *ASTCtx, SuccBool)) {
+    for (const Attr *A : trylockAttrs(Callee)) {
+      if (!trylockAttrAppliesTo(A, CallExp->getType()))
+        continue;
+      auto SuccSet = getTrylockSuccessSet(A, TargetDom);
+      if (!SuccSet) {
         EmitDefault();
         ApplyExprConstraint();
         return;
       }
-      IntRangeSet SuccSet =
-          IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
-      if (SuccBool)
-        SuccSet = SuccSet.complement(TargetDom);
       CapExprSet Caps;
-      getMutexIDs(Caps, Attr, CallExp, Callee);
-      RecordCallSpec(Attr, SuccSet, Caps,
-                     Attr->isShared() ? LK_Shared : LK_Exclusive);
-    }
-
-    if (isRangeTrylockReturnType(CallExp->getType())) {
-      for (const auto *Attr :
-           Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
-        if (!Attr->getFirstSuccessValue() || !Attr->getLastSuccessValue()) {
-          EmitDefault();
-          ApplyExprConstraint();
-          return;
-        }
-        auto First =
-            Attr->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-        auto Last =
-            Attr->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-        if (!First || !Last) {
-          EmitDefault();
-          ApplyExprConstraint();
-          return;
-        }
-        IntRangeSet SuccSet =
-            IntRangeSet::closedRange(TargetDom, *First, *Last);
-        CapExprSet Caps;
-        getMutexIDs(Caps, Attr, CallExp, Callee);
-        RecordCallSpec(Attr, SuccSet, Caps,
-                       Attr->isShared() ? LK_Shared : LK_Exclusive);
-      }
+      getTrylockMutexIDs(Caps, A, CallExp, Callee);
+      RecordCallSpec(A, *SuccSet, Caps,
+                     isSharedTrylockAttr(A) ? LK_Shared : LK_Exclusive);
     }
 
     for (const TrylockExitSpec &Spec : CallSpecs) {
@@ -8904,53 +8895,26 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         getMutexIDs(A->isShared() ? SharedLocksAcquired
                                   : ExclusiveLocksAcquired,
                     A, nullptr, D);
-      } else if (const auto *A = dyn_cast<TryAcquireCapabilityAttr>(Attr)) {
-        if (A->args_size() == 0)
+      } else if (isTrylockAttr(Attr)) {
+        if (!trylockAttrHasArgs(Attr))
           return;
         SawTryAcquireAttr = true;
-        auto RetDom = getScalarDomain(FuncReturnType);
-        if (!RetDom)
-          return;
-        CurrentTrylockRetDom = *RetDom;
-        bool SuccBool = false;
-        if (!evalTrylockSuccessBool(A->getSuccessValue(), *ASTCtx, SuccBool))
-          return;
-        IntRangeSet SuccSet =
-            IntRangeSet::single(CurrentTrylockRetDom, llvm::APSInt::get(0));
-        if (SuccBool)
-          SuccSet = SuccSet.complement(CurrentTrylockRetDom);
-        CapExprSet AttrCaps;
-        getMutexIDs(AttrCaps, A, nullptr, D);
-        LockKind LK = A->isShared() ? LK_Shared : LK_Exclusive;
-        for (const auto &Cap : AttrCaps)
-          AddTrylockExitSpec(Cap, LK, SuccSet, D->getLocation());
-      } else if (const auto *A =
-                     dyn_cast<TryAcquireCapabilityRangeAttr>(Attr)) {
-        if (A->args_size() == 0)
-          return;
-        SawTryAcquireAttr = true;
-        if (!isRangeTrylockReturnType(FuncReturnType) ||
-            FuncReturnType->isBooleanType())
+        if (isa<TryAcquireCapabilityRangeAttr>(Attr) &&
+            (!isRangeTrylockReturnType(FuncReturnType) ||
+             FuncReturnType->isBooleanType()))
           return;
         auto RetDom = getScalarDomain(FuncReturnType);
         if (!RetDom)
           return;
         CurrentTrylockRetDom = *RetDom;
-        if (!A->getFirstSuccessValue() || !A->getLastSuccessValue() ||
-            A->getFirstSuccessValue()->isValueDependent() ||
-            A->getLastSuccessValue()->isValueDependent())
+        auto SuccSet = getTrylockSuccessSet(Attr, CurrentTrylockRetDom);
+        if (!SuccSet)
           return;
-        auto First = A->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-        auto Last = A->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-        if (!First || !Last)
-          return;
-        IntRangeSet SuccSet =
-            IntRangeSet::closedRange(CurrentTrylockRetDom, *First, *Last);
         CapExprSet AttrCaps;
-        getMutexIDs(AttrCaps, A, nullptr, D);
-        LockKind LK = A->isShared() ? LK_Shared : LK_Exclusive;
+        getTrylockMutexIDs(AttrCaps, Attr, nullptr, D);
+        LockKind LK = isSharedTrylockAttr(Attr) ? LK_Shared : LK_Exclusive;
         for (const auto &Cap : AttrCaps)
-          AddTrylockExitSpec(Cap, LK, SuccSet, D->getLocation());
+          AddTrylockExitSpec(Cap, LK, *SuccSet, D->getLocation());
       }
     }
     if (SawTryAcquireAttr && CurrentTrylockExitSpecs.empty())
@@ -9066,10 +9030,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         return;
       if (const auto *Call = dyn_cast<CallExpr>(S)) {
         const auto *Callee = dyn_cast_or_null<NamedDecl>(Call->getCalleeDecl());
-        if (Callee &&
-            (Callee->hasAttr<TryAcquireCapabilityAttr>() ||
-             Callee->hasAttr<TryAcquireCapabilityRangeAttr>()) &&
-            isDiscardedValue(Call, PM))
+        if (Callee && hasTrylockAttr(Callee) && isDiscardedValue(Call, PM))
           DiscardedCalls.insert(Call);
       }
       for (const Stmt *Child : S->children())
