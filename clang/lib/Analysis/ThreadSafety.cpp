@@ -2754,7 +2754,7 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
       return evaluateTrylockRangeCond(BOP->getRHS(), C);
     }
 
-    if (BOP->isComparisonOp()) {
+    if (BOP->isRelationalOp() || BOP->isEqualityOp()) {
       auto EvalConstSide =
           [&](const Expr *ConstSide) -> std::optional<llvm::APSInt> {
         if (ConstSide->getType()->isIntegralOrEnumerationType())
@@ -5541,7 +5541,7 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
       return;
     }
 
-    if (BO->isComparisonOp()) {
+    if (BO->isRelationalOp() || BO->isEqualityOp()) {
       auto TryConstrainVarCmp = [&](const Expr *VarSide, const Expr *ConstSide,
                                     BinaryOperator::Opcode CmpOp) -> bool {
         std::optional<llvm::APSInt> KVal;
