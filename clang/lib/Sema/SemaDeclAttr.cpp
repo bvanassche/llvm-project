@@ -851,37 +851,29 @@ static void handleAllocSizeAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
                  AllocSizeAttr(S.Context, AL, SizeArgNo, NumberArgNo));
 }
 
+/// Check the arguments of a try_acquire_capability attribute, which has one
+/// success value argument, or of a try_acquire_capability_range attribute,
+/// which has two success value arguments.
 static bool checkTryLockFunAttrCommon(Sema &S, Decl *D, const ParsedAttr &AL,
-                                      SmallVectorImpl<Expr *> &Args) {
-  if (!AL.checkAtLeastNumArgs(S, 1))
+                                      SmallVectorImpl<Expr *> &Args,
+                                      unsigned NumSuccessArgs) {
+  if (!AL.checkAtLeastNumArgs(S, NumSuccessArgs))
     return false;
 
-  if (!isIntOrBool(AL.getArgAsExpr(0))) {
-    S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
-        << AL << 1 << AANT_ArgumentIntOrBool;
+  if (NumSuccessArgs == 1) {
+    if (!isIntOrBool(AL.getArgAsExpr(0))) {
+      S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
+          << AL << 1 << AANT_ArgumentIntOrBool;
+      return false;
+    }
+    checkTryAcquireCapabilitySuccessValue(S, AL, AL.getArgAsExpr(0));
+  } else if (!checkTryAcquireCapabilityRangeBounds(S, D, AL, AL.getArgAsExpr(0),
+                                                   AL.getArgAsExpr(1))) {
     return false;
   }
 
-  checkTryAcquireCapabilitySuccessValue(S, AL, AL.getArgAsExpr(0));
-
   // check that all arguments are lockable objects
-  checkAttrArgsAreCapabilityObjs(S, D, AL, Args, 1);
-
-  return true;
-}
-
-static bool checkTryLockRangeFunAttrCommon(Sema &S, Decl *D,
-                                           const ParsedAttr &AL,
-                                           SmallVectorImpl<Expr *> &Args) {
-  if (!AL.checkAtLeastNumArgs(S, 2))
-    return false;
-
-  if (!checkTryAcquireCapabilityRangeBounds(S, D, AL, AL.getArgAsExpr(0),
-                                            AL.getArgAsExpr(1)))
-    return false;
-
-  // check that all arguments are lockable objects
-  checkAttrArgsAreCapabilityObjs(S, D, AL, Args, 2);
+  checkAttrArgsAreCapabilityObjs(S, D, AL, Args, NumSuccessArgs);
 
   return true;
 }
@@ -7123,31 +7115,25 @@ static void handleAcquireCapabilityAttr(Sema &S, Decl *D,
                                                      Args.size()));
 }
 
+/// Handle the try_acquire_capability and try_acquire_capability_range
+/// attributes.
 static void handleTryAcquireCapabilityAttr(Sema &S, Decl *D,
                                            const ParsedAttr &AL) {
   if (!checkThreadSafetyAttrSubject(S, D, AL))
     return;
 
-  SmallVector<Expr*, 2> Args;
-  if (!checkTryLockFunAttrCommon(S, D, AL, Args))
-    return;
-
-  D->addAttr(::new (S.Context) TryAcquireCapabilityAttr(
-      S.Context, AL, AL.getArgAsExpr(0), Args.data(), Args.size()));
-}
-
-static void handleTryAcquireCapabilityRangeAttr(Sema &S, Decl *D,
-                                                const ParsedAttr &AL) {
-  if (!checkThreadSafetyAttrSubject(S, D, AL))
-    return;
-
+  bool IsRange = AL.getKind() == ParsedAttr::AT_TryAcquireCapabilityRange;
   SmallVector<Expr *, 2> Args;
-  if (!checkTryLockRangeFunAttrCommon(S, D, AL, Args))
+  if (!checkTryLockFunAttrCommon(S, D, AL, Args, IsRange ? 2 : 1))
     return;
 
-  D->addAttr(::new (S.Context) TryAcquireCapabilityRangeAttr(
-      S.Context, AL, AL.getArgAsExpr(0), AL.getArgAsExpr(1), Args.data(),
-      Args.size()));
+  if (IsRange)
+    D->addAttr(::new (S.Context) TryAcquireCapabilityRangeAttr(
+        S.Context, AL, AL.getArgAsExpr(0), AL.getArgAsExpr(1), Args.data(),
+        Args.size()));
+  else
+    D->addAttr(::new (S.Context) TryAcquireCapabilityAttr(
+        S.Context, AL, AL.getArgAsExpr(0), Args.data(), Args.size()));
 }
 
 static void handleReleaseCapabilityAttr(Sema &S, Decl *D,
@@ -8631,10 +8617,8 @@ ProcessDeclAttribute(Sema &S, Decl *D, const ParsedAttr &AL,
     handleReleaseCapabilityAttr(S, D, AL);
     break;
   case ParsedAttr::AT_TryAcquireCapability:
-    handleTryAcquireCapabilityAttr(S, D, AL);
-    break;
   case ParsedAttr::AT_TryAcquireCapabilityRange:
-    handleTryAcquireCapabilityRangeAttr(S, D, AL);
+    handleTryAcquireCapabilityAttr(S, D, AL);
     break;
 
   // Consumed analysis attributes.
