@@ -1352,12 +1352,6 @@ public:
   void getMutexIDs(CapExprSet &Mtxs, AttrType *Attr, const Expr *Exp,
                    const NamedDecl *D, til::SExpr *Self = nullptr);
 
-  template <class AttrType>
-  void getMutexIDs(CapExprSet &Mtxs, AttrType *Attr, const Expr *Exp,
-                   const NamedDecl *D,
-                   const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
-                   Expr *BrE, bool Neg);
-
   struct IntDomain {
     unsigned BitWidth = 0;
     llvm::APSInt Lo;
@@ -1506,8 +1500,6 @@ public:
           TrueSet(std::move(TrueSet)), FalseSet(std::move(FalseSet)) {}
   };
 
-  const CallExpr *getTrylockCallExpr(const Stmt *Cond, LocalVarContext C,
-                                     bool &Negate);
   std::optional<unsigned>
   getIdentityInlineParamIndex(const CallExpr *CallExp) const;
   const Expr *skipValuePreservingWrappers(const Expr *E, LocalVarContext *C,
@@ -1530,19 +1522,8 @@ public:
   // chains of logical operators on variables linear instead of exponential.
   llvm::DenseMap<std::pair<const Stmt *, const void *>, TrylockRangeCondResult>
       RangeCondCache;
-  void applyRangeTrylockEdge(
-      FactSet &Result, const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
-      llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs = nullptr,
-      const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs =
-          nullptr);
-  void getRangeTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
-
-  using TerminatorTrylockCall =
-      std::tuple<const CallExpr *, const NamedDecl *,
-                 std::optional<llvm::scope_exit<std::function<void()>>>>;
-
-  TerminatorTrylockCall getTerminatorTrylockCall(const CFGBlock *Block,
-                                                 bool &Negate);
+  TrylockRangeCondResult evaluateTerminatorTrylockCond(const Stmt *Cond,
+                                                       LocalVarContext C);
 
   void getEdgeLockset(
       FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
@@ -1564,6 +1545,7 @@ public:
   void getTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
 
   std::optional<IntDomain> getScalarDomain(QualType Ty) const;
+  IntDomain getTrylockCallDomain(const CallExpr *CallExp) const;
   bool isTrackableLocalVar(
       const ValueDecl *VD,
       const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
@@ -2019,34 +2001,6 @@ static bool evalTrylockSuccessBool(const Expr *BrE, const ASTContext &Ctx,
   return false;
 }
 
-/// Extract the list of mutexIDs from a trylock attribute.  If the
-/// trylock applies to the given edge, then push them onto Mtxs, discarding
-/// any duplicates.
-template <class AttrType>
-void ThreadSafetyAnalyzer::getMutexIDs(CapExprSet &Mtxs, AttrType *Attr,
-                                       const Expr *Exp, const NamedDecl *D,
-                                       const CFGBlock *PredBlock,
-                                       const CFGBlock *CurrBlock,
-                                       Expr *BrE, bool Neg) {
-  // Find out which branch has the lock. Ignore the attribute if its success
-  // value cannot be evaluated. Sema warns about such attributes.
-  bool branch = false;
-  if (!evalTrylockSuccessBool(BrE, *ASTCtx, branch))
-    return;
-
-  int branchnum = branch ? 0 : 1;
-  if (Neg)
-    branchnum = !branchnum;
-
-  // If we've taken the trylock branch, then add the lock
-  int i = 0;
-  for (CFGBlock::const_succ_iterator SI = PredBlock->succ_begin(),
-       SE = PredBlock->succ_end(); SI != SE && i < 2; ++SI, ++i) {
-    if (*SI == CurrBlock && i == branchnum)
-      getMutexIDs(Mtxs, Attr, Exp, D);
-  }
-}
-
 static bool getStaticBooleanValue(Expr *E, bool &TCond) {
   if (isa<CXXNullPtrLiteralExpr>(E) || isa<GNUNullExpr>(E)) {
     TCond = false;
@@ -2060,176 +2014,6 @@ static bool getStaticBooleanValue(Expr *E, bool &TCond) {
   } else if (auto *CE = dyn_cast<ImplicitCastExpr>(E))
     return getStaticBooleanValue(CE->getSubExpr(), TCond);
   return false;
-}
-
-// If Cond can be traced back to a function call, return the call expression.
-// The negate variable should be called with false, and will be set to true
-// if the function call is negated, e.g. if (!mu.tryLock(...))
-const CallExpr* ThreadSafetyAnalyzer::getTrylockCallExpr(const Stmt *Cond,
-                                                         LocalVarContext C,
-                                                         bool &Negate) {
-  if (!Cond)
-    return nullptr;
-
-  if (const auto *CallExp = dyn_cast<CallExpr>(Cond)) {
-    if (CallExp->getBuiltinCallee() == Builtin::BI__builtin_expect)
-      return getTrylockCallExpr(CallExp->getArg(0), C, Negate);
-    return CallExp;
-  }
-  else if (const auto *PE = dyn_cast<ParenExpr>(Cond))
-    return getTrylockCallExpr(PE->getSubExpr(), C, Negate);
-  else if (const auto *CE = dyn_cast<ImplicitCastExpr>(Cond))
-    return getTrylockCallExpr(CE->getSubExpr(), C, Negate);
-  else if (const auto *FE = dyn_cast<FullExpr>(Cond))
-    return getTrylockCallExpr(FE->getSubExpr(), C, Negate);
-  else if (const auto *DRE = dyn_cast<DeclRefExpr>(Cond)) {
-    const Expr *E = LocalVarMap.lookupValueExpr(DRE->getDecl(), C);
-    return getTrylockCallExpr(E, C, Negate);
-  }
-  else if (const auto *UOP = dyn_cast<UnaryOperator>(Cond)) {
-    if (UOP->getOpcode() == UO_LNot) {
-      Negate = !Negate;
-      return getTrylockCallExpr(UOP->getSubExpr(), C, Negate);
-    }
-    return nullptr;
-  }
-  else if (const auto *BOP = dyn_cast<BinaryOperator>(Cond)) {
-    if (BOP->getOpcode() == BO_EQ || BOP->getOpcode() == BO_NE) {
-      if (BOP->getOpcode() == BO_NE)
-        Negate = !Negate;
-
-      bool TCond = false;
-      if (getStaticBooleanValue(BOP->getRHS(), TCond)) {
-        if (!TCond) Negate = !Negate;
-        return getTrylockCallExpr(BOP->getLHS(), C, Negate);
-      }
-      TCond = false;
-      if (getStaticBooleanValue(BOP->getLHS(), TCond)) {
-        if (!TCond) Negate = !Negate;
-        return getTrylockCallExpr(BOP->getRHS(), C, Negate);
-      }
-      return nullptr;
-    }
-    if (BOP->getOpcode() == BO_LAnd) {
-      // LHS must have been evaluated in a different block.
-      return getTrylockCallExpr(BOP->getRHS(), C, Negate);
-    }
-    if (BOP->getOpcode() == BO_LOr)
-      return getTrylockCallExpr(BOP->getRHS(), C, Negate);
-    return nullptr;
-  } else if (const auto *COP = dyn_cast<ConditionalOperator>(Cond)) {
-    bool TCond, FCond;
-    if (getStaticBooleanValue(COP->getTrueExpr(), TCond) &&
-        getStaticBooleanValue(COP->getFalseExpr(), FCond)) {
-      if (TCond && !FCond)
-        return getTrylockCallExpr(COP->getCond(), C, Negate);
-      if (!TCond && FCond) {
-        Negate = !Negate;
-        return getTrylockCallExpr(COP->getCond(), C, Negate);
-      }
-    }
-  } else if (const auto *SE = dyn_cast<StmtExpr>(Cond)) {
-    if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
-      if (const auto *E = dyn_cast<Expr>(CS->body_back()))
-        return getTrylockCallExpr(E, C, Negate);
-    }
-  }
-  return nullptr;
-}
-
-/// If the terminator of \p Block branches on the result of a call to a
-/// function annotated with try_acquire_capability (possibly negated or stored
-/// in a local variable), return that call and its callee. \p Negate is set if
-/// the branch tests the negated result of the call. In beta mode, this leaves
-/// the local variable lookup closure of SExprBuilder installed so that callers
-/// can translate the callee's attribute expressions
-ThreadSafetyAnalyzer::TerminatorTrylockCall
-ThreadSafetyAnalyzer::getTerminatorTrylockCall(const CFGBlock *Block,
-                                               bool &Negate) {
-  assert(!Negate && "Must be called with Negate initialized to false");
-
-  const Stmt *Cond = Block->getTerminatorCondition();
-  if (!Cond)
-    return {};
-
-  // We don't acquire try-locks on ?: branches, except when its result is used.
-  if (const auto *COp =
-          dyn_cast_if_present<ConditionalOperator>(Block->getTerminatorStmt()))
-    if (!COp->getType()->isVoidType())
-      return {};
-
-  const LocalVarContext &LVarCtx = BlockInfo[Block->getBlockID()].ExitContext;
-
-  std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
-  if (Handler.issueBetaWarnings()) {
-    // Temporarily set the lookup context for SExprBuilder.
-    SxBuilder.setLookupLocalVarExpr(
-        [this, Ctx = LVarCtx](const NamedDecl *D) mutable -> const Expr * {
-          return LocalVarMap.lookupExpr(D, Ctx);
-        });
-    Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
-  }
-
-  const auto *Exp = getTrylockCallExpr(Cond, LVarCtx, Negate);
-  if (!Exp)
-    return {};
-
-  auto *FunDecl = dyn_cast_or_null<NamedDecl>(Exp->getCalleeDecl());
-  if (!FunDecl || !FunDecl->hasAttr<TryAcquireCapabilityAttr>())
-    return {};
-
-  return {Exp, FunDecl, std::move(Cleanup)};
-}
-
-/// Find the lockset that holds on the edge between PredBlock
-/// and CurrBlock.  The edge set is the exit set of PredBlock (passed
-/// as the ExitSet parameter) plus any trylocks, which are conditionally held.
-void ThreadSafetyAnalyzer::getEdgeLockset(
-    FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
-    const CFGBlock *CurrBlock,
-    llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs,
-    const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs) {
-  Result = ExitSet;
-
-  {
-    bool Negate = false;
-    auto [Exp, FunDecl, Cleanup] = getTerminatorTrylockCall(PredBlock, Negate);
-    if (Exp) {
-      CapExprSet ExclusiveLocksToAdd;
-      CapExprSet SharedLocksToAdd;
-
-      // If the condition is a call to a Trylock function, then grab the
-      // attributes
-      for (const auto *Attr :
-           FunDecl->specific_attrs<TryAcquireCapabilityAttr>()) {
-        if (ConsumedAttrs && ConsumedAttrs->contains({Exp, Attr}))
-          continue;
-        CapExprSet AttrLocks;
-        getMutexIDs(AttrLocks, Attr, Exp, FunDecl, PredBlock, CurrBlock,
-                    Attr->getSuccessValue(), Negate);
-        if (!AttrLocks.empty()) {
-          if (AcquiredAttrs)
-            AcquiredAttrs->insert({Exp, Attr});
-          CapExprSet &Dest =
-              Attr->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd;
-          for (const auto &Cap : AttrLocks)
-            Dest.push_back_nodup(Cap);
-        }
-      }
-
-      // Add and remove locks.
-      SourceLocation Loc = Exp->getExprLoc();
-      for (const auto &ExclusiveLockToAdd : ExclusiveLocksToAdd)
-        addLock(Result, FactMan.createFact<LockableFactEntry>(
-                            ExclusiveLockToAdd, LK_Exclusive, Loc));
-      for (const auto &SharedLockToAdd : SharedLocksToAdd)
-        addLock(Result, FactMan.createFact<LockableFactEntry>(SharedLockToAdd,
-                                                              LK_Shared, Loc));
-    }
-  }
-
-  applyRangeTrylockEdge(Result, PredBlock, CurrBlock, AcquiredAttrs,
-                        ConsumedAttrs);
 }
 
 /// Whether \p A is a try_acquire_capability or try_acquire_capability_range
@@ -2357,13 +2141,30 @@ static bool trylockAttrAppliesTo(const Attr *A, QualType RetTy) {
          isRangeTrylockReturnType(RetTy);
 }
 
-static const NamedDecl *getRangeTrylockCallee(const CallExpr *CallExp) {
-  if (!CallExp || !isRangeTrylockReturnType(CallExp->getType()))
+/// If \p CallExp calls a function with a trylock attribute that applies to the
+/// result of the call, return the callee.
+static const NamedDecl *getTrylockCallee(const CallExpr *CallExp) {
+  if (!CallExp)
+    return nullptr;
+  QualType Ty = CallExp->getType();
+  if (Ty->isDependentType() || !Ty->isScalarType())
     return nullptr;
   const auto *FunDecl = dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl());
-  if (!FunDecl || !FunDecl->hasAttr<TryAcquireCapabilityRangeAttr>())
+  if (!FunDecl || llvm::none_of(trylockAttrs(FunDecl), [&](const Attr *A) {
+        return trylockAttrAppliesTo(A, Ty);
+      }))
     return nullptr;
   return FunDecl;
+}
+
+/// The domain of the values returned by the trylock call \p CallExp. Values of
+/// a type without an integer domain, e.g. a floating-point type, are modeled as
+/// zero (0) or non-zero (1).
+ThreadSafetyAnalyzer::IntDomain
+ThreadSafetyAnalyzer::getTrylockCallDomain(const CallExpr *CallExp) const {
+  if (auto Dom = getScalarDomain(CallExp->getType()))
+    return *Dom;
+  return IntDomain::forType(ASTCtx->BoolTy, *ASTCtx);
 }
 
 static bool isValuePreservingIntegralCast(QualType SrcTy, QualType DstTy,
@@ -2823,7 +2624,7 @@ ThreadSafetyAnalyzer::unwrapValuePreservingToCallExpr(const Expr *E,
 const CallExpr *
 ThreadSafetyAnalyzer::unwrapTrylockValueExpr(const Expr *E, LocalVarContext C) {
   const CallExpr *CallExp = unwrapValuePreservingToCallExpr(E, C);
-  return getRangeTrylockCallee(CallExp) ? CallExp : nullptr;
+  return getTrylockCallee(CallExp) ? CallExp : nullptr;
 }
 
 bool ThreadSafetyAnalyzer::isGuaranteedZeroOrOneExpr(const Expr *E,
@@ -2891,11 +2692,20 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
     return evaluateTrylockRangeCond(FE->getSubExpr(), C);
 
   if (const auto *CE = dyn_cast<CastExpr>(Cond)) {
-    if (CE->getCastKind() == CK_IntegralToBoolean ||
-        CE->getCastKind() == CK_PointerToBoolean ||
-        isValuePreservingCast(CE, *ASTCtx))
+    switch (CE->getCastKind()) {
+    case CK_IntegralToBoolean:
+    case CK_PointerToBoolean:
+    case CK_MemberPointerToBoolean:
+    case CK_FloatingToBoolean:
+    case CK_FloatingComplexToBoolean:
+    case CK_IntegralComplexToBoolean:
+    case CK_FixedPointToBoolean:
       return evaluateTrylockRangeCond(CE->getSubExpr(), C);
-    return {};
+    default:
+      if (isValuePreservingCast(CE, *ASTCtx))
+        return evaluateTrylockRangeCond(CE->getSubExpr(), C);
+      return {};
+    }
   }
 
   if (const auto *DRE = dyn_cast<DeclRefExpr>(Cond)) {
@@ -2914,8 +2724,8 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
     if (isBuiltinExpectCall(CallExp))
       return evaluateTrylockRangeCond(CallExp->getArg(0), C);
 
-    if (const NamedDecl *Callee = getRangeTrylockCallee(CallExp)) {
-      IntDomain Dom = *getScalarDomain(CallExp->getType());
+    if (const NamedDecl *Callee = getTrylockCallee(CallExp)) {
+      IntDomain Dom = getTrylockCallDomain(CallExp);
       IntRangeSet FalseSet = IntRangeSet::single(Dom, llvm::APSInt::get(0));
       IntRangeSet TrueSet = FalseSet.complement(Dom);
       return {CallExp, Callee, std::move(Dom), std::move(TrueSet),
@@ -2957,7 +2767,15 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
             if (R->isSingleValue(K))
               return K;
           }
+          return std::nullopt;
         }
+        // The values of other types are modeled as zero or non-zero. Hence
+        // only an (in)equality comparison with zero can be evaluated.
+        bool NonZero = true;
+        if ((BOP->getOpcode() == BO_EQ || BOP->getOpcode() == BO_NE) &&
+            !ConstSide->isValueDependent() &&
+            ConstSide->EvaluateAsBooleanCondition(NonZero, *ASTCtx) && !NonZero)
+          return llvm::APSInt::get(0);
         return std::nullopt;
       };
       const CallExpr *CallExp = nullptr;
@@ -2988,8 +2806,8 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
         }
       }
       if (CallExp && ConstVal) {
-        if (const NamedDecl *Callee = getRangeTrylockCallee(CallExp)) {
-          IntDomain Dom = *getScalarDomain(CallExp->getType());
+        if (const NamedDecl *Callee = getTrylockCallee(CallExp)) {
+          IntDomain Dom = getTrylockCallDomain(CallExp);
           IntRangeSet TrueSet =
               IntRangeSet::forComparison(Dom, CmpOp, *ConstVal);
           IntRangeSet FalseSet = TrueSet.complement(Dom);
@@ -3016,10 +2834,10 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
           return {};
         const CallExpr *PtrCall =
             unwrapTrylockValueExpr(CE->getSubExpr(), SubCtx);
-        const NamedDecl *Callee = getRangeTrylockCallee(PtrCall);
+        const NamedDecl *Callee = getTrylockCallee(PtrCall);
         if (!Callee)
           return {};
-        IntDomain Dom = *getScalarDomain(PtrCall->getType());
+        IntDomain Dom = getTrylockCallDomain(PtrCall);
         IntRangeSet TrueSet =
             signedPointerCmpRangeSet(CE, SideOp, *K, Dom, *ASTCtx);
         IntRangeSet FalseSet = TrueSet.complement(Dom);
@@ -3114,14 +2932,49 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
   return {};
 }
 
-void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
-    FactSet &Result, const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
+/// Evaluate the condition \p Cond of a terminator. If \p Cond is a logical
+/// operator, the block with the terminator evaluates the right-hand side of
+/// \p Cond and the left-hand side is known to be true (&&) or false (||).
+ThreadSafetyAnalyzer::TrylockRangeCondResult
+ThreadSafetyAnalyzer::evaluateTerminatorTrylockCond(const Stmt *Cond,
+                                                    LocalVarContext C) {
+  const auto *BOP = dyn_cast_or_null<BinaryOperator>(
+      stripNoOpExprWrappers(dyn_cast_or_null<Expr>(Cond)));
+  if (!BOP || !BOP->isLogicalOp())
+    return evaluateTrylockRangeCond(Cond, C);
+  auto Res = evaluateTerminatorTrylockCond(BOP->getRHS(), C);
+  if (!Res.Call)
+    return {};
+  auto LHSRes = evaluateTrylockRangeCond(BOP->getLHS(), C);
+  if (LHSRes.Call == Res.Call) {
+    const IntRangeSet &Known =
+        BOP->getOpcode() == BO_LAnd ? LHSRes.TrueSet : LHSRes.FalseSet;
+    // An empty set means that the branch cannot be taken. Keep the set of
+    // the right-hand side for such a branch such that it does not lose the
+    // capabilities that the right-hand side implies, e.g. for (b || b).
+    if (IntRangeSet T = Known.intersect(Res.TrueSet); !T.empty())
+      Res.TrueSet = std::move(T);
+    if (IntRangeSet F = Known.intersect(Res.FalseSet); !F.empty())
+      Res.FalseSet = std::move(F);
+  }
+  return Res;
+}
+
+/// Find the lockset that holds on the edge between PredBlock
+/// and CurrBlock.  The edge set is the exit set of PredBlock (passed
+/// as the ExitSet parameter) plus any trylocks, which are conditionally held.
+void ThreadSafetyAnalyzer::getEdgeLockset(
+    FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
+    const CFGBlock *CurrBlock,
     llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs,
     const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs) {
+  Result = ExitSet;
+
   const Stmt *Term = PredBlock->getTerminatorStmt();
   if (!Term || isa<IndirectGotoStmt>(Term))
     return;
 
+  // We don't acquire try-locks on ?: branches, except when its result is used.
   if (const auto *COp = dyn_cast<ConditionalOperator>(Term))
     if (!COp->getType()->isVoidType())
       return;
@@ -3140,10 +2993,10 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
     CallExp = unwrapTrylockValueExpr(SS->getCond(), LVarCtx);
     if (!CallExp)
       return;
-    Callee = getRangeTrylockCallee(CallExp);
+    Callee = getTrylockCallee(CallExp);
     if (!Callee)
       return;
-    Dom = *getScalarDomain(CallExp->getType());
+    Dom = getTrylockCallDomain(CallExp);
     const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
     if (!Table.Valid)
       return;
@@ -3160,7 +3013,7 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
     const Stmt *Cond = PredBlock->getTerminatorCondition();
     if (!Cond)
       return;
-    auto CondRes = evaluateTrylockRangeCond(Cond, LVarCtx);
+    auto CondRes = evaluateTerminatorTrylockCond(Cond, LVarCtx);
     if (!CondRes.Call)
       return;
     CallExp = CondRes.Call;
@@ -3190,25 +3043,29 @@ void ThreadSafetyAnalyzer::applyRangeTrylockEdge(
 
   CapExprSet ExclusiveLocksToAdd;
   CapExprSet SharedLocksToAdd;
-  for (const auto *Attr :
-       Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
-    auto SuccSet = getTrylockSuccessSet(Attr, Dom);
+  for (const Attr *A : trylockAttrs(Callee)) {
+    if (!trylockAttrAppliesTo(A, CallExp->getType()))
+      continue;
+    auto SuccSet = getTrylockSuccessSet(A, Dom);
     if (!SuccSet || !EdgeSet.subsetOfSet(*SuccSet))
       continue;
-    if (ConsumedAttrs && ConsumedAttrs->contains({CallExp, Attr}))
+    if (ConsumedAttrs && ConsumedAttrs->contains({CallExp, A}))
       continue;
-    if (collectTrylockCaps(Attr, CallExp, Callee, ExclusiveLocksToAdd,
+    if (collectTrylockCaps(A, CallExp, Callee, ExclusiveLocksToAdd,
                            SharedLocksToAdd) &&
         AcquiredAttrs)
-      AcquiredAttrs->insert({CallExp, Attr});
+      AcquiredAttrs->insert({CallExp, A});
   }
 
   addTrylockFacts(Result, ExclusiveLocksToAdd, SharedLocksToAdd,
                   CallExp->getExprLoc());
 }
 
-void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
-                                                         CapExprSet &Caps) {
+/// If the terminator of \p Block branches on the result of a try-lock call
+/// (possibly stored in a local variable), add the capabilities acquired by
+/// that call to \p Caps.
+void ThreadSafetyAnalyzer::getTerminatorTrylockCaps(const CFGBlock *Block,
+                                                    CapExprSet &Caps) {
   const Stmt *Term = Block->getTerminatorStmt();
   if (!Term || isa<IndirectGotoStmt>(Term))
     return;
@@ -3229,10 +3086,10 @@ void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
     CallExp = unwrapTrylockValueExpr(SS->getCond(), LVarCtx);
     if (!CallExp)
       return;
-    Callee = getRangeTrylockCallee(CallExp);
+    Callee = getTrylockCallee(CallExp);
     if (!Callee)
       return;
-    Dom = *getScalarDomain(CallExp->getType());
+    Dom = getTrylockCallDomain(CallExp);
     const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
     if (!Table.Valid)
       return;
@@ -3243,7 +3100,7 @@ void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
     const Stmt *Cond = Block->getTerminatorCondition();
     if (!Cond)
       return;
-    auto CondRes = evaluateTrylockRangeCond(Cond, LVarCtx);
+    auto CondRes = evaluateTerminatorTrylockCond(Cond, LVarCtx);
     if (!CondRes.Call)
       return;
     CallExp = CondRes.Call;
@@ -3262,34 +3119,18 @@ void ThreadSafetyAnalyzer::getRangeTerminatorTrylockCaps(const CFGBlock *Block,
     Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
   }
 
-  for (const auto *Attr :
-       Callee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
-    auto SuccSet = getTrylockSuccessSet(Attr, Dom);
+  for (const Attr *A : trylockAttrs(Callee)) {
+    if (!trylockAttrAppliesTo(A, CallExp->getType()))
+      continue;
+    auto SuccSet = getTrylockSuccessSet(A, Dom);
     if (!SuccSet)
       continue;
     bool CleanPartition = llvm::all_of(BranchSets, [&](const IntRangeSet &S) {
       return S.empty() || S.subsetOfSet(*SuccSet) || !S.intersectsSet(*SuccSet);
     });
     if (CleanPartition)
-      getMutexIDs(Caps, Attr, CallExp, Callee);
+      getTrylockMutexIDs(Caps, A, CallExp, Callee);
   }
-}
-
-/// If the terminator of \p Block branches on the result of a try-lock call
-/// (possibly stored in a local variable), add the capabilities acquired by
-/// that call to \p Caps.
-void ThreadSafetyAnalyzer::getTerminatorTrylockCaps(const CFGBlock *Block,
-                                                    CapExprSet &Caps) {
-  {
-    bool Negate = false;
-    auto [Exp, FunDecl, Cleanup] = getTerminatorTrylockCall(Block, Negate);
-    if (Exp) {
-      for (const auto *Attr :
-           FunDecl->specific_attrs<TryAcquireCapabilityAttr>())
-        getMutexIDs(Caps, Attr, Exp, FunDecl);
-    }
-  }
-  getRangeTerminatorTrylockCaps(Block, Caps);
 }
 
 namespace {
@@ -5211,7 +5052,7 @@ ThreadSafetyAnalyzer::evaluateInlineCallRangeCond(
   }
   if (!TargetCall)
     return {};
-  const NamedDecl *TargetCallee = getRangeTrylockCallee(TargetCall);
+  const NamedDecl *TargetCallee = getTrylockCallee(TargetCall);
   if (!TargetCallee)
     return {};
 
@@ -5219,7 +5060,7 @@ ThreadSafetyAnalyzer::evaluateInlineCallRangeCond(
   if (!InlineInfo)
     return {};
 
-  IntDomain TargetDom = *getScalarDomain(TargetCall->getType());
+  IntDomain TargetDom = getTrylockCallDomain(TargetCall);
   const IntDomain &RetDom = *RetDomOpt;
 
   TrylockValueState BaseCalleeState;
@@ -5341,9 +5182,10 @@ ThreadSafetyAnalyzer::evaluateInlineCallRangeCond(
     // target parameters are known to be in the same piece. Whether the
     // capability is held only depends on the piece of the result.
     SmallVector<IntRangeSet, 4> Pieces{FullDom};
-    for (const auto *Attr :
-         TargetCallee->specific_attrs<TryAcquireCapabilityRangeAttr>()) {
-      auto Success = getTrylockSuccessSet(Attr, TargetDom);
+    for (const Attr *A : trylockAttrs(TargetCallee)) {
+      if (!trylockAttrAppliesTo(A, TargetCall->getType()))
+        continue;
+      auto Success = getTrylockSuccessSet(A, TargetDom);
       if (!Success)
         continue;
       IntRangeSet Failure = Success->complement(TargetDom);

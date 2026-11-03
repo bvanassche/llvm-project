@@ -486,7 +486,11 @@ the function. See {ref}`mutexheader`, below, for example uses.
 
 Because the analysis doesn't support general conditional locking, a capability
 is treated by callers as acquired after branching on the return value of a
-try-acquire function.
+try-acquire function. Callers handle `TRY_ACQUIRE(true, ...)` like
+`TRY_ACQUIRE_RANGE` with a range of all non-zero return values and
+`TRY_ACQUIRE(false, ...)` like a range that only contains zero. Hence the
+return value may also be compared with other constants or used in a `switch`
+statement.
 
 ```c++
 Mutex mu;

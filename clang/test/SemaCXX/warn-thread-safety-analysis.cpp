@@ -4500,6 +4500,111 @@ void Foo::test1() {
 } // end namespace TryLockEqTest
 
 
+// try_acquire_capability(true, ...) is handled as a success range that
+// contains all non-zero values.
+namespace TryLockValueTest {
+
+class Foo {
+  Mutex mu_;
+  int a GUARDED_BY(mu_);
+
+  int    tryLockMutexI() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu_);
+  double tryLockMutexD() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu_);
+  void unlock() UNLOCK_FUNCTION(mu_);
+  bool cond();
+
+  void test();
+};
+
+void Foo::test() {
+  if (tryLockMutexI() == 2) {
+    a = 0;
+    unlock();
+  }
+
+  switch (tryLockMutexI()) {
+  case 0:
+    a = 0;  // expected-warning {{writing variable 'a' requires holding mutex 'mu_' exclusively}}
+    break;
+  default:
+    a = 0;
+    unlock();
+    break;
+  }
+
+  switch (static_cast<int>(mu_.TryLock())) {
+  case 1:
+    a = 0;
+    unlock();
+    break;
+  case 0:
+    break;
+  }
+
+  if (!cond() && mu_.TryLock()) {
+    a = 0;
+    unlock();
+  }
+
+  {
+    bool b = mu_.TryLock();
+    if (b || b) {
+      a = 0;
+      unlock();
+    }
+  }
+
+  // The right-hand side of || is only evaluated if the left-hand side is
+  // false and the right-hand side of && only if the left-hand side is true.
+  if (mu_.TryLock() || mu_.TryLock()) {
+    a = 0;
+    unlock();
+  }
+
+  if (!mu_.TryLock() && !mu_.TryLock())
+    return;
+  a = 0;
+  unlock(); // expected-note {{mutex released here}}
+
+  // A conversion to char may truncate a non-zero value to zero.
+  {
+    char c = tryLockMutexI();
+    if (c) {
+      a = 0;    // expected-warning {{writing variable 'a' requires holding mutex 'mu_' exclusively}}
+      unlock(); // expected-warning {{releasing mutex 'mu_' that was not held}}
+    }
+  }
+
+  // The left-hand side of || may be true without calling TryLock().
+  bool b = cond() || mu_.TryLock();
+  if (!b)
+    return;
+  a = 0;  // expected-warning {{writing variable 'a' requires holding mutex 'mu_' exclusively}}
+
+  if (__builtin_expect_with_probability(mu_.TryLock(), 1, 0.9)) {
+    a = 0;
+    unlock();
+  }
+
+  if (tryLockMutexD()) {
+    a = 0;
+    unlock();
+  }
+
+  if (tryLockMutexD() == 0)
+    return;
+  a = 0;
+  unlock();
+
+  if (tryLockMutexD() != 0.0) {
+    a = 0;
+    unlock();
+  }
+}
+
+} // end namespace TryLockValueTest
+
+
 namespace ExistentialPatternMatching {
 
 class Graph {
