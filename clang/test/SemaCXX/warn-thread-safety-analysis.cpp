@@ -9767,6 +9767,22 @@ class BodyCheckSuite {
     return &a; // expected-warning {{returning pointer to variable 'a' requires holding mutex 'mu' exclusively}}
   }
 
+  // The caller only holds mu if the returned pointer is 1. For any other
+  // non-null pointer, the caller may access 'a' without holding mu.
+  int *badSentinelRangeReturnsGuardedAddr() // expected-note@+1 {{mutex acquired here}}
+      TRY_ACQUIRE_RANGE(1, 1, mu) {
+    return &a; // expected-warning {{returning pointer to variable 'a' requires holding mutex 'mu' exclusively}} expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
+  // The caller holds mu for every non-null return value.
+  int *goodNonNullRangeReturnsGuardedAddr(bool cond)
+      TRY_ACQUIRE_RANGE(1, (__UINTPTR_TYPE__)-1, mu) {
+    if (!cond)
+      return nullptr;
+    mu.Lock();
+    return &a;
+  }
+
   bool badUnguardedAccessInBody(bool cond)
       EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
     bool ok = false;

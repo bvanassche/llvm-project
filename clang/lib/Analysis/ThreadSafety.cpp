@@ -43,6 +43,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/ImmutableMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SetOperations.h"
@@ -1901,10 +1902,11 @@ public:
   mutable bool AssumeDerefNonNull = false;
   std::optional<TrivialInlineBody>
   getCachedTrivialInlineBody(const CallExpr *CallExp) const;
-  void checkTrylockExitOutcome(const FactSet &BaseExpectedExitSet,
-                               const ReturnEvalOutcome &Outcome,
-                               SourceLocation DiagLoc,
-                               ThreadSafetyHandler &ExitHandler);
+  void checkTrylockExitOutcome(
+      const FactSet &BaseExpectedExitSet, const ReturnEvalOutcome &Outcome,
+      SourceLocation DiagLoc, ThreadSafetyHandler &ExitHandler,
+      std::optional<FactSet> *NonNullExpectedSet = nullptr);
+  void intersectExpectedSets(FactSet &Acc, const FactSet &Other);
 
   bool join(const FactEntry &A, const FactEntry &B, SourceLocation JoinLoc,
             LockErrorKind EntryLEK, LockErrorKind ExitLEK,
@@ -7665,9 +7667,30 @@ static bool mayBeUnresolvedAlias(const CapabilityExpr &Held,
          pointsToSameType(ExpectedPtr->getType(), LocalVD->getType());
 }
 
+/// Remove the facts from \p Acc that are not in \p Other. Keep the shared
+/// fact if a capability is held exclusively in one set and shared in the
+/// other one.
+void ThreadSafetyAnalyzer::intersectExpectedSets(FactSet &Acc,
+                                                 const FactSet &Other) {
+  FactSet AccOrig = Acc;
+  for (const auto &Fact : AccOrig) {
+    const FactEntry &AFact = FactMan[Fact];
+    const FactEntry *BFact = Other.findLock(FactMan, AFact);
+    if (!BFact || AFact.negative() != BFact->negative()) {
+      Acc.removeLock(FactMan, AFact);
+      continue;
+    }
+    if (AFact.kind() == LK_Exclusive && BFact->kind() == LK_Shared)
+      if (FactSet::iterator It = Acc.findLockIter(FactMan, AFact);
+          It != Acc.end())
+        Acc.replaceLock(FactMan, It, BFact);
+  }
+}
+
 void ThreadSafetyAnalyzer::checkTrylockExitOutcome(
     const FactSet &BaseExpectedExitSet, const ReturnEvalOutcome &Outcome,
-    SourceLocation DiagLoc, ThreadSafetyHandler &ExitHandler) {
+    SourceLocation DiagLoc, ThreadSafetyHandler &ExitHandler,
+    std::optional<FactSet> *NonNullExpectedSet) {
   if (Outcome.Values.empty())
     return;
 
@@ -7693,6 +7716,20 @@ void ThreadSafetyAnalyzer::checkTrylockExitOutcome(
         Next.push_back({std::move(Out), std::move(P.ExpectedSet)});
     }
     Partitions = std::move(Next);
+  }
+
+  // The caller may only access the pointee of a returned pointer if the
+  // pointer is not null. Collect the capabilities that the caller holds for
+  // every non-null return value.
+  if (NonNullExpectedSet) {
+    for (const ExitPartition &P : Partitions) {
+      if (!P.Vals.mayBeNonZero())
+        continue;
+      if (!*NonNullExpectedSet)
+        *NonNullExpectedSet = P.ExpectedSet;
+      else
+        intersectExpectedSets(**NonNullExpectedSet, P.ExpectedSet);
+    }
   }
 
   for (ExitPartition &P : Partitions) {
@@ -8620,27 +8657,15 @@ void BuildLockset::VisitReturnStmt(const ReturnStmt *S) {
         ReturnType->getPointeeType().isConstQualified() ? AK_Read : AK_Written,
         POK_ReturnByRef);
   } else if (ReturnType->isPointerType()) {
-    if (!Analyzer->CurrentTrylockExitSpecs.empty()) {
-      // A returned pointer through which the caller may access the pointee
-      // is not null. Hence, expect the capabilities that are acquired for
-      // some non-null return value.
-      FactSet NonNullExitSet = FunctionExitFSet;
-      for (const auto &Spec : Analyzer->CurrentTrylockExitSpecs)
-        if (Spec.SuccessSet.mayBeNonZero())
-          Analyzer->addLockToExpectedSet(NonNullExitSet, Spec.Cap, Spec.LK,
-                                         Spec.Loc);
-      Analyzer->checkPtAccess(NonNullExitSet, RetVal,
-                              ReturnType->getPointeeType().isConstQualified()
-                                  ? AK_Read
-                                  : AK_Written,
-                              POK_ReturnPointer);
-    } else {
-      Analyzer->checkPtAccess(FunctionExitFSet, RetVal,
-                              ReturnType->getPointeeType().isConstQualified()
-                                  ? AK_Read
-                                  : AK_Written,
-                              POK_ReturnPointer);
-    }
+    // The capabilities that the caller of a try-acquire function holds
+    // depend on the return value. runAnalysis() checks returned pointers
+    // per return value instead.
+    if (!Analyzer->CurrentTrylockExitSpecs.empty())
+      return;
+    Analyzer->checkPtAccess(
+        FunctionExitFSet, RetVal,
+        ReturnType->getPointeeType().isConstQualified() ? AK_Read : AK_Written,
+        POK_ReturnPointer);
   }
 }
 
@@ -9893,6 +9918,15 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 
   if (CheckingTrylockBody) {
     DedupThreadSafetyHandler DedupHandler(Handler);
+    // For each return statement that returns a pointer, the capabilities
+    // that the caller holds for every non-null return value and the local
+    // variable context of the return statement.
+    const bool ReturnsPointer =
+        CurrentFunction &&
+        CurrentFunction->getReturnType().getCanonicalType()->isPointerType();
+    llvm::MapVector<const ReturnStmt *,
+                    std::pair<std::optional<FactSet>, LocalVarContext>>
+        PtReturnExpectedSets;
 
     for (CFGBlock::const_pred_iterator PI = ExitBlock->pred_begin(),
                                        PE = ExitBlock->pred_end();
@@ -9936,8 +9970,13 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
                     /*ReqAttr=*/false, &DedupHandler);
           applyScopeExitCleanups(Outcome.Lockset, PredBlock,
                                  /*OnlyAfterReturn=*/true);
+          std::optional<FactSet> *NonNullExpectedSet = nullptr;
+          if (ReturnsPointer && RetVal)
+            NonNullExpectedSet =
+                &PtReturnExpectedSets.try_emplace(RS, std::nullopt, EvalCtx)
+                     .first->second.first;
           checkTrylockExitOutcome(ExpectedFunctionExitSet, Outcome, DiagLoc,
-                                  DedupHandler);
+                                  DedupHandler, NonNullExpectedSet);
         }
       };
 
@@ -9993,6 +10032,21 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         // into account whose result is not stored anywhere.
         VerifyReturn(PredInfo.ExitSet, BlockExitValState[PredID]);
       }
+    }
+
+    // Check that the caller holds the capabilities that protect the pointee
+    // of a returned pointer for every non-null value that may be returned.
+    for (const auto &[RS, ExpectedAndCtx] : PtReturnExpectedSets) {
+      const auto &[Expected, Ctx] = ExpectedAndCtx;
+      if (!Expected)
+        continue;
+      LocalVarLookupScope Lookup(*this, Ctx);
+      checkPtAccess(
+          *Expected, RS->getRetValue(),
+          CurrentFunction->getReturnType()->getPointeeType().isConstQualified()
+              ? AK_Read
+              : AK_Written,
+          POK_ReturnPointer);
     }
 
     Handler.leaveFunction(CurrentFunction);
