@@ -1787,13 +1787,15 @@ public:
                                ThreadSafetyHandler &ExitHandler);
 
   bool join(const FactEntry &A, const FactEntry &B, SourceLocation JoinLoc,
-            LockErrorKind EntryLEK);
+            LockErrorKind EntryLEK, LockErrorKind ExitLEK,
+            bool ReportMissingAcquire, ThreadSafetyHandler &H);
 
-  void intersectAndWarn(FactSet &EntrySet, const FactSet &ExitSet,
-                        SourceLocation JoinLoc, LockErrorKind EntryLEK,
-                        LockErrorKind ExitLEK,
-                        const CapExprSet *TrylockRebranchCaps = nullptr,
-                        bool RebranchIgnoresDepth = false);
+  void intersectAndWarn(
+      FactSet &EntrySet, const FactSet &ExitSet, SourceLocation JoinLoc,
+      LockErrorKind EntryLEK, LockErrorKind ExitLEK,
+      llvm::function_ref<bool(const FactEntry &)> IsIgnored = nullptr,
+      bool RebranchIgnoresDepth = false, bool ReportMissingAcquires = false,
+      ThreadSafetyHandler *DiagHandler = nullptr);
 
   void intersectAndWarn(FactSet &EntrySet, const FactSet &ExitSet,
                         SourceLocation JoinLoc, LockErrorKind LEK) {
@@ -6806,7 +6808,7 @@ void ThreadSafetyAnalyzer::checkTrylockExitOutcome(
     Partitions = std::move(Next);
   }
 
-  for (const ExitPartition &P : Partitions) {
+  for (ExitPartition &P : Partitions) {
     // A capability that is held but not expected and that is reached through
     // a local pointer whose value is not known may be the same capability as
     // one that is expected but not held, e.g. 'head->lock' and
@@ -6831,48 +6833,12 @@ void ThreadSafetyAnalyzer::checkTrylockExitOutcome(
       }
     }
 
-    for (const auto &Fact : Outcome.Lockset) {
-      const FactEntry &ExitFact = FactMan[Fact];
-      if (Paired.contains(&ExitFact))
-        continue;
-      if (const FactEntry *EntryFact =
-              P.ExpectedSet.findLock(FactMan, ExitFact)) {
-        unsigned ReentrancyA = getFactReentrancyDepth(*EntryFact);
-        unsigned ReentrancyB = getFactReentrancyDepth(ExitFact);
-
-        if (ReentrancyA != ReentrancyB) {
-          bool MissingAcquire = ReentrancyB < ReentrancyA;
-          ExitHandler.handleMutexHeldEndOfScope(
-              ExitFact.getKind(), ExitFact.toString(),
-              MissingAcquire ? EntryFact->loc() : ExitFact.loc(), DiagLoc,
-              MissingAcquire ? LEK_NotLockedAtEndOfFunction
-                             : LEK_LockedAtEndOfFunction,
-              /*ReentrancyMismatch=*/true);
-        } else if (EntryFact->kind() != ExitFact.kind()) {
-          if (!((EntryFact->managed() || EntryFact->asserted()) &&
-                (ExitFact.managed() || ExitFact.asserted()))) {
-            ExitHandler.handleExclusiveAndShared(
-                ExitFact.getKind(), ExitFact.toString(), ExitFact.loc(),
-                EntryFact->loc());
-          }
-        }
-      } else {
-        ExitFact.handleRemovalFromIntersection(
-            Outcome.Lockset, FactMan, DiagLoc, LEK_LockedAtEndOfFunction,
-            ExitHandler);
-      }
-    }
-
-    for (const auto &Fact : P.ExpectedSet) {
-      const FactEntry &EntryFact = FactMan[Fact];
-      if (Paired.contains(&EntryFact))
-        continue;
-      if (!Outcome.Lockset.findLock(FactMan, EntryFact)) {
-        EntryFact.handleRemovalFromIntersection(P.ExpectedSet, FactMan, DiagLoc,
-                                                LEK_NotLockedAtEndOfFunction,
-                                                ExitHandler);
-      }
-    }
+    intersectAndWarn(
+        P.ExpectedSet, Outcome.Lockset, DiagLoc, LEK_LockedAtEndOfFunction,
+        LEK_NotLockedAtEndOfFunction,
+        [&](const FactEntry &FE) { return Paired.contains(&FE); },
+        /*RebranchIgnoresDepth=*/false, /*ReportMissingAcquires=*/true,
+        &ExitHandler);
   }
 }
 
@@ -7808,19 +7774,29 @@ void BuildLockset::VisitReturnStmt(const ReturnStmt *S) {
 /// Given two facts merging on a join point, possibly warn and decide whether to
 /// keep or replace.
 ///
+/// \param ReportMissingAcquire Whether to report a reentrancy depth of \p B
+/// that is lower than that of \p A as a missing acquire, i.e. at the location
+/// of \p A with \p ExitLEK instead of at the location of \p B with
+/// \p EntryLEK.
+/// \param H The handler that reports diagnostics.
 /// \return  false if we should keep \p A, true if we should take \p B.
 bool ThreadSafetyAnalyzer::join(const FactEntry &A, const FactEntry &B,
-                                SourceLocation JoinLoc,
-                                LockErrorKind EntryLEK) {
+                                SourceLocation JoinLoc, LockErrorKind EntryLEK,
+                                LockErrorKind ExitLEK,
+                                bool ReportMissingAcquire,
+                                ThreadSafetyHandler &H) {
   // Whether we can replace \p A by \p B.
   const bool CanModify = EntryLEK != LEK_LockedSomeLoopIterations;
   unsigned int ReentrancyDepthA = getFactReentrancyDepth(A);
   unsigned int ReentrancyDepthB = getFactReentrancyDepth(B);
 
   if (ReentrancyDepthA != ReentrancyDepthB) {
-    Handler.handleMutexHeldEndOfScope(B.getKind(), B.toString(), B.loc(),
-                                      JoinLoc, EntryLEK,
-                                      /*ReentrancyMismatch=*/true);
+    const bool MissingAcquire =
+        ReportMissingAcquire && ReentrancyDepthB < ReentrancyDepthA;
+    H.handleMutexHeldEndOfScope(B.getKind(), B.toString(),
+                                MissingAcquire ? A.loc() : B.loc(), JoinLoc,
+                                MissingAcquire ? ExitLEK : EntryLEK,
+                                /*ReentrancyMismatch=*/true);
     // Pick the FactEntry with the greater reentrancy depth as the "good"
     // fact to reduce potential later warnings.
     return CanModify && ReentrancyDepthA < ReentrancyDepthB;
@@ -7833,8 +7809,7 @@ bool ThreadSafetyAnalyzer::join(const FactEntry &A, const FactEntry &B,
       if (CanModify || !ShouldTakeB)
         return ShouldTakeB;
     }
-    Handler.handleExclusiveAndShared(B.getKind(), B.toString(), B.loc(),
-                                     A.loc());
+    H.handleExclusiveAndShared(B.getKind(), B.toString(), B.loc(), A.loc());
     // Take the exclusive capability to reduce further warnings.
     return CanModify && B.kind() == LK_Exclusive;
   } else {
@@ -7857,26 +7832,29 @@ bool ThreadSafetyAnalyzer::join(const FactEntry &A, const FactEntry &B,
 /// \param JoinLoc The location of the join point for error reporting
 /// \param EntryLEK The warning if a mutex is missing from \p EntrySet.
 /// \param ExitLEK The warning if a mutex is missing from \p ExitSet.
-/// \param TrylockRebranchCaps Capabilities acquired by a try-lock whose result
-/// the joining block's terminator branches on; differences in these are not
-/// diagnosed because the paths re-diverge at the terminator (but they are
-/// still removed from the intersection, and conditionally re-added on the
-/// outgoing edges by getEdgeLockset()).
-/// \param RebranchIgnoresDepth Whether a reentrancy depth difference of a
-/// re-branched capability is not diagnosed either. Only set at the exit
-/// blocks of a try-acquire function, where the lock state is verified per
-/// path.
+/// \param IsIgnored Returns true for the facts whose differences are not
+/// diagnosed, e.g. the capabilities acquired by a try-lock whose result the
+/// joining block's terminator branches on: the paths re-diverge at the
+/// terminator (but these facts are still removed from the intersection, and
+/// conditionally re-added on the outgoing edges by getEdgeLockset()).
+/// \param RebranchIgnoresDepth Whether a reentrancy depth difference of an
+/// ignored fact is not diagnosed either. Only set at the exit blocks of a
+/// try-acquire function, where the lock state is verified per path.
+/// \param ReportMissingAcquires See the ReportMissingAcquire parameter of
+/// join().
+/// \param DiagHandler The handler that reports diagnostics, or nullptr to use
+/// \c Handler.
 void ThreadSafetyAnalyzer::intersectAndWarn(
     FactSet &EntrySet, const FactSet &ExitSet, SourceLocation JoinLoc,
     LockErrorKind EntryLEK, LockErrorKind ExitLEK,
-    const CapExprSet *TrylockRebranchCaps, bool RebranchIgnoresDepth) {
+    llvm::function_ref<bool(const FactEntry &)> IsIgnored,
+    bool RebranchIgnoresDepth, bool ReportMissingAcquires,
+    ThreadSafetyHandler *DiagHandler) {
   FactSet EntrySetOrig = EntrySet;
+  ThreadSafetyHandler &H = DiagHandler ? *DiagHandler : Handler;
 
-  auto IsTrylockRebranched = [TrylockRebranchCaps](const FactEntry &FE) {
-    return TrylockRebranchCaps &&
-           llvm::any_of(*TrylockRebranchCaps, [&FE](const CapabilityExpr &CE) {
-             return !CE.shouldIgnore() && FE.matches(CE);
-           });
+  auto IsIgnoredFact = [IsIgnored](const FactEntry &FE) {
+    return IsIgnored && IsIgnored(FE);
   };
 
   // Find locks in ExitSet that conflict or are not in EntrySet, and warn.
@@ -7886,8 +7864,7 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
     FactSet::iterator EntryIt = EntrySet.findLockIter(FactMan, ExitFact);
     if (EntryIt != EntrySet.end()) {
       const FactEntry &EntryFact = FactMan[*EntryIt];
-      if (IsTrylockRebranched(ExitFact) &&
-          EntryLEK == LEK_LockedSomePredecessors &&
+      if (IsIgnoredFact(ExitFact) && EntryLEK == LEK_LockedSomePredecessors &&
           EntryFact.loc() == ExitFact.loc() && !EntryFact.managed() &&
           !ExitFact.managed() &&
           (RebranchIgnoresDepth || getFactReentrancyDepth(EntryFact) ==
@@ -7903,13 +7880,14 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
         } else if (EntryFact.asserted() && !ExitFact.asserted()) {
           *EntryIt = Fact;
         }
-      } else if (join(EntryFact, ExitFact, JoinLoc, EntryLEK)) {
+      } else if (join(EntryFact, ExitFact, JoinLoc, EntryLEK, ExitLEK,
+                      ReportMissingAcquires, H)) {
         *EntryIt = Fact;
       }
     } else if ((!ExitFact.managed() || EntryLEK == LEK_LockedAtEndOfFunction) &&
-               !IsTrylockRebranched(ExitFact)) {
+               !IsIgnoredFact(ExitFact)) {
       ExitFact.handleRemovalFromIntersection(ExitSet, FactMan, JoinLoc,
-                                             EntryLEK, Handler);
+                                             EntryLEK, H);
     }
   }
 
@@ -7921,9 +7899,9 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
     if (!ExitFact) {
       if ((!EntryFact->managed() || ExitLEK == LEK_LockedSomeLoopIterations ||
            ExitLEK == LEK_NotLockedAtEndOfFunction) &&
-          !IsTrylockRebranched(*EntryFact))
+          !IsIgnoredFact(*EntryFact))
         EntryFact->handleRemovalFromIntersection(EntrySetOrig, FactMan, JoinLoc,
-                                                 ExitLEK, Handler);
+                                                 ExitLEK, H);
       if (ExitLEK == LEK_LockedSomePredecessors)
         EntrySet.removeLock(FactMan, *EntryFact);
     }
@@ -8487,6 +8465,12 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     // terminator branches on. Computed lazily on the first join.
     CapExprSet TerminatorTrylockCaps;
     bool TerminatorTrylockCapsComputed = false;
+    auto IsTrylockRebranched = [&](const FactEntry &FE) {
+      return llvm::any_of(TerminatorTrylockCaps,
+                          [&FE](const CapabilityExpr &CE) {
+                            return !CE.shouldIgnore() && FE.matches(CE);
+                          });
+    };
     for (CFGBlock::const_pred_iterator PI = CurrBlock->pred_begin(),
          PE  = CurrBlock->pred_end(); PI != PE; ++PI) {
       if (*PI == nullptr ||
@@ -8571,7 +8555,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
           }
           intersectAndWarn(CurrBlockInfo->EntrySet, PrevLockset,
                            CurrBlockInfo->EntryLoc, LEK_LockedSomePredecessors,
-                           LEK_LockedSomePredecessors, &TerminatorTrylockCaps,
+                           LEK_LockedSomePredecessors, IsTrylockRebranched,
                            /*RebranchIgnoresDepth=*/IsPureBlock);
         }
       }
