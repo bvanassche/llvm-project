@@ -21,6 +21,7 @@
 #include "clang/AST/DeclGroup.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
+#include "clang/AST/IgnoreExpr.h"
 #include "clang/AST/OperationKinds.h"
 #include "clang/AST/ParentMap.h"
 #include "clang/AST/Stmt.h"
@@ -2004,21 +2005,7 @@ static bool evalTrylockSuccessBool(const Expr *BrE, const ASTContext &Ctx,
                                    bool &Out) {
   if (!BrE || BrE->isValueDependent() || BrE->isTypeDependent())
     return false;
-  if (auto ICE = BrE->getIntegerConstantExpr(Ctx)) {
-    Out = ICE->getBoolValue();
-    return true;
-  }
-  if (BrE->EvaluateAsBooleanCondition(Out, Ctx))
-    return true;
-  if (const auto *BLE = dyn_cast<CXXBoolLiteralExpr>(BrE->IgnoreParenCasts())) {
-    Out = BLE->getValue();
-    return true;
-  }
-  if (const auto *ILE = dyn_cast<IntegerLiteral>(BrE->IgnoreParenCasts())) {
-    Out = ILE->getValue().getBoolValue();
-    return true;
-  }
-  return false;
+  return BrE->EvaluateAsBooleanCondition(Out, Ctx);
 }
 
 static bool getStaticBooleanValue(Expr *E, bool &TCond) {
@@ -3343,49 +3330,34 @@ public:
 
 } // namespace
 
-static const Expr *stripNoOpExprWrappers(const Expr *E) {
-  while (E) {
-    if (const auto *PE = dyn_cast<ParenExpr>(E)) {
-      E = PE->getSubExpr();
-      continue;
-    }
-    if (const auto *FE = dyn_cast<FullExpr>(E)) {
-      E = FE->getSubExpr();
-      continue;
-    }
-    if (const auto *OVE = dyn_cast<OpaqueValueExpr>(E)) {
-      if (const Expr *Src = OVE->getSourceExpr()) {
-        E = Src;
-        continue;
-      }
-      break;
-    }
-    if (const auto *CE = dyn_cast<CastExpr>(E)) {
-      if (CE->getCastKind() == CK_NoOp) {
-        E = CE->getSubExpr();
-        continue;
-      }
-    }
-    break;
-  }
+static Expr *ignoreNoOpCastSingleStep(Expr *E) {
+  if (auto *CE = dyn_cast<CastExpr>(E); CE && CE->getCastKind() == CK_NoOp)
+    return CE->getSubExpr();
   return E;
 }
 
+static Expr *ignoreFullExprOrOpaqueValueSingleStep(Expr *E) {
+  if (auto *FE = dyn_cast<FullExpr>(E))
+    return FE->getSubExpr();
+  if (auto *OVE = dyn_cast<OpaqueValueExpr>(E))
+    if (Expr *Src = OVE->getSourceExpr())
+      return Src;
+  return E;
+}
+
+static const Expr *stripNoOpExprWrappers(const Expr *E) {
+  if (!E)
+    return nullptr;
+  return IgnoreExprNodes(E, IgnoreParensOnlySingleStep,
+                         ignoreFullExprOrOpaqueValueSingleStep,
+                         ignoreNoOpCastSingleStep);
+}
+
 static const DeclRefExpr *unwrapDirectLValueDRE(const Expr *E) {
-  while (E) {
-    if (const auto *PE = dyn_cast<ParenExpr>(E)) {
-      E = PE->getSubExpr();
-      continue;
-    }
-    if (const auto *CE = dyn_cast<CastExpr>(E)) {
-      if (CE->getCastKind() == CK_NoOp) {
-        E = CE->getSubExpr();
-        continue;
-      }
-    }
-    break;
-  }
-  return dyn_cast_or_null<DeclRefExpr>(E);
+  if (!E)
+    return nullptr;
+  return dyn_cast<DeclRefExpr>(
+      IgnoreExprNodes(E, IgnoreParensOnlySingleStep, ignoreNoOpCastSingleStep));
 }
 
 /// Collect the local variables that are referenced in \p Root other than by
@@ -3789,9 +3761,7 @@ bool ThreadSafetyAnalyzer::isPureExitBlock(const CFGBlock *B,
       if (!CE)
         break;
 
-      unsigned BuiltinID = CE->getBuiltinCallee();
-      if (BuiltinID == Builtin::BI__builtin_expect ||
-          BuiltinID == Builtin::BI__builtin_expect_with_probability)
+      if (isBuiltinExpectCall(CE))
         break;
 
       const auto *Callee = dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl());
@@ -3940,9 +3910,7 @@ const ValueDecl *ThreadSafetyAnalyzer::extractTrackableVarExpr(
       return nullptr;
     }
     if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
-      unsigned BuiltinID = CallExp->getBuiltinCallee();
-      if (BuiltinID == Builtin::BI__builtin_expect ||
-          BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+      if (isBuiltinExpectCall(CallExp)) {
         E = CallExp->getArg(0);
         continue;
       }
@@ -4368,9 +4336,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
   }
 
   if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
-    unsigned BuiltinID = CallExp->getBuiltinCallee();
-    if (BuiltinID == Builtin::BI__builtin_expect ||
-        BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+    if (isBuiltinExpectCall(CallExp)) {
       auto Sub = evaluatePureExprRange(CallExp->getArg(0), State, Depth + 1);
       if (!Sub)
         return std::nullopt;
@@ -5207,9 +5173,7 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
   }
 
   if (const auto *CallExp = dyn_cast<CallExpr>(Cond)) {
-    unsigned BuiltinID = CallExp->getBuiltinCallee();
-    if (BuiltinID == Builtin::BI__builtin_expect ||
-        BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+    if (isBuiltinExpectCall(CallExp)) {
       constrainLeafCondition(State, CallExp->getArg(0), WantTrue, EscapedVars,
                              Depth + 1);
       return;
@@ -5793,9 +5757,7 @@ void ThreadSafetyAnalyzer::constrainDereferencedPointersInStmt(
         return;
       }
       if (const auto *CallExp = dyn_cast<CallExpr>(PtrE)) {
-        unsigned BuiltinID = CallExp->getBuiltinCallee();
-        if (BuiltinID == Builtin::BI__builtin_expect ||
-            BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+        if (isBuiltinExpectCall(CallExp)) {
           PtrE = CallExp->getArg(0);
           continue;
         }
@@ -6182,9 +6144,7 @@ bool ThreadSafetyAnalyzer::exprHasUnmaterializedTrylock(
   if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
     if (CallExp->isUnevaluatedBuiltinCall(*ASTCtx))
       return false;
-    unsigned BuiltinID = CallExp->getBuiltinCallee();
-    if (BuiltinID == Builtin::BI__builtin_expect ||
-        BuiltinID == Builtin::BI__builtin_expect_with_probability)
+    if (isBuiltinExpectCall(CallExp))
       return exprHasUnmaterializedTrylock(CallExp->getArg(0), Ctx, State,
                                           UseStateDefs, Depth + 1);
     if (const auto *Callee =
@@ -6868,9 +6828,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
   }
 
   if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
-    unsigned BuiltinID = CallExp->getBuiltinCallee();
-    if (BuiltinID == Builtin::BI__builtin_expect ||
-        BuiltinID == Builtin::BI__builtin_expect_with_probability) {
+    if (isBuiltinExpectCall(CallExp)) {
       auto ArgDom = getScalarDomain(CallExp->getArg(0)->getType());
       if (!ArgDom) {
         EmitDefault();
