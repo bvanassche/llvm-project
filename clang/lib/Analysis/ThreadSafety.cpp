@@ -3936,6 +3936,40 @@ booleanizeRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
                                                     Src.mayBeNonZero());
 }
 
+/// \p V truncated or extended to the width and signedness of \p Ty.
+static llvm::APSInt truncToType(const llvm::APSInt &V, QualType Ty,
+                                const ASTContext &Ctx) {
+  llvm::APSInt Res = V.extOrTrunc(Ctx.getIntWidth(Ty));
+  Res.setIsUnsigned(Ty->isUnsignedIntegerOrEnumerationType());
+  return Res;
+}
+
+/// The value of \p LV \p Opc \p RV converted to \p ResTy if \p Opc is an
+/// additive or a bitwise operator.
+static std::optional<llvm::APSInt> foldIntBinOp(BinaryOperator::Opcode Opc,
+                                                llvm::APSInt LV,
+                                                llvm::APSInt RV, QualType ResTy,
+                                                const ASTContext &Ctx) {
+  // The operands of compound assignments may have different widths.
+  unsigned W = std::max(LV.getBitWidth(), RV.getBitWidth()) + 1;
+  LV = LV.extend(W);
+  RV = RV.extend(W);
+  switch (Opc) {
+  case BO_Add:
+    return truncToType(LV + RV, ResTy, Ctx);
+  case BO_Sub:
+    return truncToType(LV - RV, ResTy, Ctx);
+  case BO_And:
+    return truncToType(LV & RV, ResTy, Ctx);
+  case BO_Or:
+    return truncToType(LV | RV, ResTy, Ctx);
+  case BO_Xor:
+    return truncToType(LV ^ RV, ResTy, Ctx);
+  default:
+    return std::nullopt;
+  }
+}
+
 static ThreadSafetyAnalyzer::IntRangeSet
 castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
                      QualType DstTy, const ASTContext &Ctx) {
@@ -4008,12 +4042,9 @@ castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
       continue;
     }
     if (llvm::APSInt::compareValues(Hi - Lo, MaxSmallSpan) <= 0) {
-      for (llvm::APSInt V = Lo; V <= Hi; ++V) {
-        llvm::APSInt Trunc = V.extOrTrunc(DstBits);
-        Trunc.setIsUnsigned(DstUnsigned);
-        Res = Res.unionWith(
-            ThreadSafetyAnalyzer::IntRangeSet::single(DstDom, Trunc));
-      }
+      for (llvm::APSInt V = Lo; V <= Hi; ++V)
+        Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
+            DstDom, truncToType(V, DstTy, Ctx)));
       continue;
     }
     return ThreadSafetyAnalyzer::IntRangeSet::full(DstDom);
@@ -4027,7 +4058,6 @@ negateRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src, QualType ResTy,
   if (Src.empty())
     return {};
   auto Dom = ThreadSafetyAnalyzer::IntDomain::forType(ResTy, Ctx);
-  unsigned Bits = Ctx.getIntWidth(ResTy);
   bool IsUnsigned = ResTy->isUnsignedIntegerOrEnumerationType();
   llvm::APSInt MaxSmallSpan(Dom.BitWidth, /*isUnsigned=*/false);
   MaxSmallSpan = 16;
@@ -4043,17 +4073,67 @@ negateRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src, QualType ResTy,
       continue;
     }
     if (llvm::APSInt::compareValues(Hi - Lo, MaxSmallSpan) <= 0) {
-      for (llvm::APSInt V = Lo; V <= Hi; ++V) {
-        llvm::APSInt NegV = (-V).extOrTrunc(Bits);
-        NegV.setIsUnsigned(IsUnsigned);
-        Res =
-            Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(Dom, NegV));
-      }
+      for (llvm::APSInt V = Lo; V <= Hi; ++V)
+        Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
+            Dom, truncToType(-V, ResTy, Ctx)));
       continue;
     }
     return ThreadSafetyAnalyzer::IntRangeSet::full(Dom);
   }
   return Res;
+}
+
+/// Whether applyCast() can compute the values of the cast \p CE from the
+/// values of its operand.
+static bool isRangeMappableCast(const CastExpr *CE) {
+  QualType SubTy = CE->getSubExpr()->getType();
+  QualType DstTy = CE->getType();
+  switch (CE->getCastKind()) {
+  case CK_LValueToRValue:
+  case CK_NoOp:
+  case CK_IntegralToBoolean:
+  case CK_PointerToBoolean:
+  case CK_MemberPointerToBoolean:
+  case CK_BooleanToSignedIntegral:
+    return true;
+  case CK_BitCast:
+  case CK_DerivedToBase:
+  case CK_UncheckedDerivedToBase:
+    return DstTy->isAnyPointerType() && SubTy->isAnyPointerType();
+  case CK_PointerToIntegral:
+    return SubTy->isAnyPointerType() && DstTy->isIntegralOrEnumerationType();
+  case CK_IntegralToPointer:
+    return DstTy->isAnyPointerType() && SubTy->isIntegralOrEnumerationType();
+  case CK_IntegralCast:
+    return SubTy->isIntegralOrEnumerationType() &&
+           DstTy->isIntegralOrEnumerationType();
+  default:
+    return false;
+  }
+}
+
+/// The values in \p Dom, the domain of the type of the cast \p CE, that \p CE
+/// may have if its operand has the values \p Sub. \p CE must satisfy
+/// isRangeMappableCast().
+static ThreadSafetyAnalyzer::IntRangeSet
+applyCast(const CastExpr *CE, const ThreadSafetyAnalyzer::IntRangeSet &Sub,
+          const ThreadSafetyAnalyzer::IntDomain &Dom, const ASTContext &Ctx) {
+  switch (CE->getCastKind()) {
+  case CK_DerivedToBase:
+  case CK_UncheckedDerivedToBase:
+    return castDerivedToBaseRangeSet(Sub, Dom);
+  case CK_PointerToIntegral:
+  case CK_IntegralCast:
+    return castIntegralRangeSet(Sub, CE->getType(), Ctx);
+  case CK_IntegralToPointer:
+    return castIntegralRangeSet(Sub, Ctx.getUIntPtrType(), Ctx);
+  case CK_IntegralToBoolean:
+  case CK_PointerToBoolean:
+  case CK_MemberPointerToBoolean:
+    return booleanizeRangeSet(Sub, Dom);
+  default:
+    return reprojectRangeSet(Sub, Dom);
+  }
 }
 
 /// Whether \p L \p Opc \p R holds for some values of the non-empty sets \p L
@@ -4169,78 +4249,20 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
 
   if (const auto *CE = dyn_cast<CastExpr>(E)) {
     switch (CE->getCastKind()) {
-    case CK_LValueToRValue:
-    case CK_NoOp: {
-      auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-      return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
-                 : std::nullopt;
-    }
     case CK_NullToPointer:
     case CK_NullToMemberPointer:
       return IntRangeSet::single(Dom, llvm::APSInt::get(0));
     case CK_ArrayToPointerDecay:
     case CK_FunctionToPointerDecay:
       return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
-    case CK_BitCast:
-      if (CE->getType()->isAnyPointerType() &&
-          CE->getSubExpr()->getType()->isAnyPointerType()) {
-        auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-        return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
-                   : std::nullopt;
-      }
-      return std::nullopt;
-    case CK_DerivedToBase:
-    case CK_UncheckedDerivedToBase:
-      if (CE->getType()->isAnyPointerType() &&
-          CE->getSubExpr()->getType()->isAnyPointerType()) {
-        auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-        return Sub ? std::optional<IntRangeSet>(
-                         castDerivedToBaseRangeSet(*Sub, Dom))
-                   : std::nullopt;
-      }
-      return std::nullopt;
-    case CK_PointerToIntegral:
-      if (CE->getSubExpr()->getType()->isAnyPointerType() &&
-          CE->getType()->isIntegralOrEnumerationType()) {
-        auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-        return Sub ? std::optional<IntRangeSet>(
-                         castIntegralRangeSet(*Sub, CE->getType(), *ASTCtx))
-                   : std::nullopt;
-      }
-      return std::nullopt;
-    case CK_IntegralToPointer:
-      if (CE->getType()->isAnyPointerType() &&
-          CE->getSubExpr()->getType()->isIntegralOrEnumerationType()) {
-        auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-        return Sub ? std::optional<IntRangeSet>(castIntegralRangeSet(
-                         *Sub, ASTCtx->getUIntPtrType(), *ASTCtx))
-                   : std::nullopt;
-      }
-      return std::nullopt;
-    case CK_IntegralToBoolean:
-    case CK_PointerToBoolean:
-    case CK_MemberPointerToBoolean: {
-      auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-      return Sub ? std::optional<IntRangeSet>(booleanizeRangeSet(*Sub, Dom))
-                 : std::nullopt;
-    }
-    case CK_BooleanToSignedIntegral: {
-      auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-      return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
-                 : std::nullopt;
-    }
-    case CK_IntegralCast: {
-      if (!CE->getSubExpr()->getType()->isIntegralOrEnumerationType() ||
-          !CE->getType()->isIntegralOrEnumerationType())
-        return std::nullopt;
-      auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-      if (!Sub)
-        return std::nullopt;
-      return castIntegralRangeSet(*Sub, CE->getType(), *ASTCtx);
-    }
     default:
-      return std::nullopt;
+      break;
     }
+    if (!isRangeMappableCast(CE))
+      return std::nullopt;
+    auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
+    return Sub ? std::optional(applyCast(CE, *Sub, Dom, *ASTCtx))
+               : std::nullopt;
   }
 
   if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
@@ -4345,11 +4367,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
       llvm::APSInt V;
       if (!Sub || !Sub->isSingleValue(V))
         return std::nullopt;
-      unsigned Bits = ASTCtx->getIntWidth(UO->getType());
-      bool IsUnsigned = UO->getType()->isUnsignedIntegerOrEnumerationType();
-      llvm::APSInt NotV = (~V).extOrTrunc(Bits);
-      NotV.setIsUnsigned(IsUnsigned);
-      return IntRangeSet::single(Dom, NotV);
+      return IntRangeSet::single(Dom, truncToType(~V, UO->getType(), *ASTCtx));
     }
     case UO_LNot: {
       auto Sub = evaluatePureExprRange(UO->getSubExpr(), State, Depth + 1);
@@ -4397,35 +4415,10 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
       auto L = evaluatePureExprRange(BO->getLHS(), State, Depth + 1);
       auto R = evaluatePureExprRange(BO->getRHS(), State, Depth + 1);
       llvm::APSInt LV, RV;
-      if (L && R && L->isSingleValue(LV) && R->isSingleValue(RV)) {
-        std::optional<llvm::APSInt> ResV;
-        switch (BO->getOpcode()) {
-        case BO_Add:
-          ResV = LV + RV;
-          break;
-        case BO_Sub:
-          ResV = LV - RV;
-          break;
-        case BO_And:
-          ResV = LV & RV;
-          break;
-        case BO_Or:
-          ResV = LV | RV;
-          break;
-        case BO_Xor:
-          ResV = LV ^ RV;
-          break;
-        default:
-          break;
-        }
-        if (ResV) {
-          unsigned Bits = ASTCtx->getIntWidth(E->getType());
-          bool IsUnsigned = E->getType()->isUnsignedIntegerOrEnumerationType();
-          llvm::APSInt Trunc = ResV->extOrTrunc(Bits);
-          Trunc.setIsUnsigned(IsUnsigned);
-          return IntRangeSet::single(Dom, Trunc);
-        }
-      }
+      if (L && R && L->isSingleValue(LV) && R->isSingleValue(RV))
+        if (auto ResV =
+                foldIntBinOp(BO->getOpcode(), LV, RV, E->getType(), *ASTCtx))
+          return IntRangeSet::single(Dom, *ResV);
     }
     return std::nullopt;
   }
@@ -5895,17 +5888,11 @@ void ThreadSafetyAnalyzer::updateValueStateForStmtImpl(
         if (L && R && L->isSingleValue(LV) && R->isSingleValue(RV) &&
             (BO->getOpcode() == BO_AddAssign ||
              BO->getOpcode() == BO_SubAssign)) {
-          unsigned W = std::max(LV.getBitWidth(), RV.getBitWidth()) + 1;
-          LV = LV.extend(W);
-          RV = RV.extend(W);
-          llvm::APSInt ResV =
-              (BO->getOpcode() == BO_AddAssign) ? (LV + RV) : (LV - RV);
-          unsigned Bits = ASTCtx->getIntWidth(VD->getType());
-          bool IsUnsigned = VD->getType()->isUnsignedIntegerOrEnumerationType();
-          llvm::APSInt Trunc = ResV.extOrTrunc(Bits);
-          Trunc.setIsUnsigned(IsUnsigned);
-          auto VarDom = *getScalarDomain(VD->getType());
-          State.VarRanges[VD] = IntRangeSet::single(VarDom, Trunc);
+          llvm::APSInt ResV = *foldIntBinOp(
+              BinaryOperator::getOpForCompoundAssignment(BO->getOpcode()), LV,
+              RV, VD->getType(), *ASTCtx);
+          State.VarRanges[VD] =
+              IntRangeSet::single(*getScalarDomain(VD->getType()), ResV);
           return;
         }
       }
@@ -5931,10 +5918,9 @@ void ThreadSafetyAnalyzer::updateValueStateForStmtImpl(
       if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end()) {
         llvm::APSInt V;
         if (It->second.isSingleValue(V)) {
-          llvm::APInt NextV = UO->isIncrementOp() ? (V + 1) : (V - 1);
-          unsigned Bits = ASTCtx->getIntWidth(VD->getType());
-          bool IsUnsigned = VD->getType()->isUnsignedIntegerOrEnumerationType();
-          llvm::APSInt Trunc(NextV.sextOrTrunc(Bits), IsUnsigned);
+          llvm::APSInt Trunc =
+              *foldIntBinOp(UO->isIncrementOp() ? BO_Add : BO_Sub, V,
+                            llvm::APSInt::get(1), VD->getType(), *ASTCtx);
           auto VarDom = *getScalarDomain(VD->getType());
           if (UO->isPrefix())
             State.ExprRanges[stripNoOpExprWrappers(UO)] =
@@ -6229,6 +6215,27 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         {std::move(Values), InLockset, {InPending.begin(), InPending.end()}});
   };
   auto EmitDefault = [&]() { Emit(IntRangeSet::full(TargetDom)); };
+  // Evaluate the subexpression SubE in the domain Dom, starting from the lock
+  // state InLockset and InPending, and add the outcomes to O.
+  auto EvalSub = [&](const Expr *SubE, const IntDomain &Dom,
+                     SmallVectorImpl<ReturnEvalOutcome> &O) {
+    evaluateReturnOutcomes(SubE, Dom, InLockset, InPending, State, Ctx,
+                           UseVarRanges, O, Depth + 1);
+  };
+  // Evaluate the subexpression SubE in the domain SubDom and add its outcomes
+  // to Out after mapping their values with F. Drop outcomes without values.
+  auto MapSub = [&](const Expr *SubE, const std::optional<IntDomain> &SubDom,
+                    llvm::function_ref<IntRangeSet(const IntRangeSet &)> F) {
+    if (!SubDom)
+      return EmitDefault();
+    SmallVector<ReturnEvalOutcome, 2> Sub;
+    EvalSub(SubE, *SubDom, Sub);
+    for (ReturnEvalOutcome &SO : Sub) {
+      SO.Values = reprojectRangeSet(F(SO.Values), TargetDom);
+      if (!SO.Values.empty())
+        Out.push_back(std::move(SO));
+    }
+  };
   // Add a copy of O with the value V to Out.
   auto PushValue = [&](ReturnEvalOutcome O, int V) {
     O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(V));
@@ -6269,133 +6276,27 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
 
   if (const auto *SE = dyn_cast<StmtExpr>(E)) {
     if (const auto *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
-      if (const auto *Last = dyn_cast<Expr>(CS->body_back())) {
-        evaluateReturnOutcomes(Last, TargetDom, InLockset, InPending, State,
-                               Ctx, UseVarRanges, Out, Depth + 1);
-        return;
-      }
+      if (const auto *Last = dyn_cast<Expr>(CS->body_back()))
+        return EvalSub(Last, TargetDom, Out);
     }
     return EmitDefault();
   }
 
   if (const auto *CE = dyn_cast<CastExpr>(E)) {
-    switch (CE->getCastKind()) {
-    case CK_LValueToRValue:
-    case CK_NoOp:
-      evaluateReturnOutcomes(CE->getSubExpr(), TargetDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Out, Depth + 1);
-      return;
-    case CK_BitCast:
-      if (CE->getType()->isAnyPointerType() &&
-          CE->getSubExpr()->getType()->isAnyPointerType()) {
-        evaluateReturnOutcomes(CE->getSubExpr(), TargetDom, InLockset,
-                               InPending, State, Ctx, UseVarRanges, Out,
-                               Depth + 1);
-        return;
-      }
+    if (!isRangeMappableCast(CE))
       return EmitDefault();
-    case CK_DerivedToBase:
-    case CK_UncheckedDerivedToBase:
-      if (CE->getType()->isAnyPointerType() &&
-          CE->getSubExpr()->getType()->isAnyPointerType()) {
-        auto PtrDom = getScalarDomain(CE->getType());
-        if (!PtrDom)
-          return EmitDefault();
-        SmallVector<ReturnEvalOutcome, 2> Sub;
-        evaluateReturnOutcomes(CE->getSubExpr(), *PtrDom, InLockset, InPending,
-                               State, Ctx, UseVarRanges, Sub, Depth + 1);
-        for (auto &SO : Sub) {
-          SO.Values = reprojectRangeSet(
-              castDerivedToBaseRangeSet(SO.Values, *PtrDom), TargetDom);
-          if (!SO.Values.empty())
-            Out.push_back(std::move(SO));
-        }
-        return;
-      }
+    // Evaluate the operand of a cast that preserves the value in TargetDom.
+    CastKind K = CE->getCastKind();
+    if (K == CK_LValueToRValue || K == CK_NoOp || K == CK_BitCast)
+      return EvalSub(CE->getSubExpr(), TargetDom, Out);
+    auto ResDom = getScalarDomain(CE->getType());
+    if (!ResDom)
       return EmitDefault();
-    case CK_PointerToIntegral: {
-      if (!CE->getSubExpr()->getType()->isAnyPointerType() ||
-          !CE->getType()->isIntegralOrEnumerationType())
-        return EmitDefault();
-      auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
-      if (!SubDom)
-        return EmitDefault();
-      SmallVector<ReturnEvalOutcome, 2> Sub;
-      evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Sub, Depth + 1);
-      for (auto &SO : Sub) {
-        SO.Values = reprojectRangeSet(
-            castIntegralRangeSet(SO.Values, CE->getType(), *ASTCtx), TargetDom);
-        if (!SO.Values.empty())
-          Out.push_back(std::move(SO));
-      }
-      return;
-    }
-    case CK_IntegralToPointer: {
-      if (!CE->getType()->isAnyPointerType() ||
-          !CE->getSubExpr()->getType()->isIntegralOrEnumerationType())
-        return EmitDefault();
-      IntDomain SubDom =
-          IntDomain::forType(CE->getSubExpr()->getType(), *ASTCtx);
-      SmallVector<ReturnEvalOutcome, 2> Sub;
-      evaluateReturnOutcomes(CE->getSubExpr(), SubDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Sub, Depth + 1);
-      for (auto &SO : Sub) {
-        SO.Values = reprojectRangeSet(
-            castIntegralRangeSet(SO.Values, ASTCtx->getUIntPtrType(), *ASTCtx),
-            TargetDom);
-        if (!SO.Values.empty())
-          Out.push_back(std::move(SO));
-      }
-      return;
-    }
-    case CK_IntegralToBoolean:
-    case CK_PointerToBoolean:
-    case CK_MemberPointerToBoolean: {
-      auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
-      if (!SubDom)
-        return EmitDefault();
-      SmallVector<ReturnEvalOutcome, 2> Sub;
-      evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Sub, Depth + 1);
-      for (auto &SO : Sub)
-        PushTruthValues(std::move(SO));
-      return;
-    }
-    case CK_BooleanToSignedIntegral: {
-      auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
-      if (!SubDom)
-        return EmitDefault();
-      SmallVector<ReturnEvalOutcome, 2> Sub;
-      evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Sub, Depth + 1);
-      for (auto &SO : Sub) {
-        SO.Values = reprojectRangeSet(SO.Values, TargetDom);
-        if (!SO.Values.empty())
-          Out.push_back(std::move(SO));
-      }
-      return;
-    }
-    case CK_IntegralCast: {
-      if (!CE->getSubExpr()->getType()->isIntegralOrEnumerationType() ||
-          !CE->getType()->isIntegralOrEnumerationType())
-        return EmitDefault();
-      IntDomain SubDom =
-          IntDomain::forType(CE->getSubExpr()->getType(), *ASTCtx);
-      SmallVector<ReturnEvalOutcome, 2> Sub;
-      evaluateReturnOutcomes(CE->getSubExpr(), SubDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Sub, Depth + 1);
-      for (auto &SO : Sub) {
-        SO.Values = reprojectRangeSet(
-            castIntegralRangeSet(SO.Values, CE->getType(), *ASTCtx), TargetDom);
-        if (!SO.Values.empty())
-          Out.push_back(std::move(SO));
-      }
-      return;
-    }
-    default:
-      return EmitDefault();
-    }
+    return MapSub(CE->getSubExpr(),
+                  getScalarDomain(CE->getSubExpr()->getType()),
+                  [&](const IntRangeSet &V) {
+                    return applyCast(CE, V, *ResDom, *ASTCtx);
+                  });
   }
 
   if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
@@ -6439,49 +6340,28 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
   if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
     switch (UO->getOpcode()) {
     case UO_Plus:
-      evaluateReturnOutcomes(UO->getSubExpr(), TargetDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Out, Depth + 1);
-      return;
-    case UO_Minus: {
+      return EvalSub(UO->getSubExpr(), TargetDom, Out);
+    case UO_Minus:
       if (!UO->getType()->isIntegralOrEnumerationType())
         return EmitDefault();
-      SmallVector<ReturnEvalOutcome, 2> Sub;
-      evaluateReturnOutcomes(UO->getSubExpr(), TargetDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Sub, Depth + 1);
-      for (auto &SO : Sub) {
-        SO.Values = reprojectRangeSet(
-            negateRangeSet(SO.Values, UO->getType(), *ASTCtx), TargetDom);
-        if (!SO.Values.empty())
-          Out.push_back(std::move(SO));
-      }
-      return;
-    }
-    case UO_LNot: {
-      auto SubDom = getScalarDomain(UO->getSubExpr()->getType());
-      if (!SubDom)
-        return EmitDefault();
-      SmallVector<ReturnEvalOutcome, 2> Sub;
-      evaluateReturnOutcomes(UO->getSubExpr(), *SubDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Sub, Depth + 1);
-      for (auto &SO : Sub) {
-        if (SO.Values.mayBeZero())
-          PushValue(SO, 1);
-        if (SO.Values.mayBeNonZero())
-          PushValue(std::move(SO), 0);
-      }
-      return;
-    }
+      return MapSub(UO->getSubExpr(), TargetDom, [&](const IntRangeSet &V) {
+        return negateRangeSet(V, UO->getType(), *ASTCtx);
+      });
+    case UO_LNot:
+      return MapSub(UO->getSubExpr(),
+                    getScalarDomain(UO->getSubExpr()->getType()),
+                    [&](const IntRangeSet &V) {
+                      return IntRangeSet::boolSet(TargetDom, V.mayBeNonZero(),
+                                                  V.mayBeZero());
+                    });
     default:
       return EmitDefault();
     }
   }
 
   if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
-    if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign) {
-      evaluateReturnOutcomes(BO->getRHS(), TargetDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Out, Depth + 1);
-      return;
-    }
+    if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign)
+      return EvalSub(BO->getRHS(), TargetDom, Out);
 
     if (BO->isComparisonOp()) {
       auto LDom = getScalarDomain(BO->getLHS()->getType());
@@ -6562,22 +6442,12 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
   }
 
   if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
-    if (isBuiltinExpectCall(CallExp)) {
-      auto ArgDom = getScalarDomain(CallExp->getArg(0)->getType());
-      if (!ArgDom)
-        return EmitDefault();
-      SmallVector<ReturnEvalOutcome, 2> Sub;
-      evaluateReturnOutcomes(CallExp->getArg(0), *ArgDom, InLockset, InPending,
-                             State, Ctx, UseVarRanges, Sub, Depth + 1);
-      for (auto &SO : Sub) {
-        SO.Values = reprojectRangeSet(
-            castIntegralRangeSet(SO.Values, CallExp->getType(), *ASTCtx),
-            TargetDom);
-        if (!SO.Values.empty())
-          Out.push_back(std::move(SO));
-      }
-      return;
-    }
+    if (isBuiltinExpectCall(CallExp))
+      return MapSub(
+          CallExp->getArg(0), getScalarDomain(CallExp->getArg(0)->getType()),
+          [&](const IntRangeSet &V) {
+            return castIntegralRangeSet(V, CallExp->getType(), *ASTCtx);
+          });
 
     const auto *Callee = dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl());
     if (!Callee)
