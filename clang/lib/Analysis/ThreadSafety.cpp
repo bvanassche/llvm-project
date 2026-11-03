@@ -39,6 +39,7 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/Specifiers.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/ImmutableMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetOperations.h"
@@ -48,7 +49,7 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -60,6 +61,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -3163,41 +3165,34 @@ namespace {
 /// while verifying multiple return outcomes/partitions at function exit. Every
 /// callback is forwarded to the wrapped handler unless an identical callback
 /// has already been forwarded.
+///
+/// Only the callbacks that can be reached while verifying the exit outcomes of
+/// a trylock function are overridden: those of the code that adds the pending
+/// trylock acquisitions to the lockset (handleNegativeNotHeld(),
+/// BeforeSet::checkBeforeAfter() and FactEntry::handleLock()) and those of
+/// checkTrylockExitOutcome(). The ThreadSafetyHandler base class silently
+/// drops all other callbacks. Add an override when passing this handler to
+/// other code.
 class DedupThreadSafetyHandler final : public ThreadSafetyHandler {
   ThreadSafetyHandler &Inner;
-  llvm::StringSet<> Emitted;
+  std::set<llvm::FoldingSetNodeID> Emitted;
 
-  // Append a length-prefixed encoding of each argument to Key such that
-  // different argument lists never produce the same key.
-  static void encode(std::string &Key, StringRef Str) {
-    Key += std::to_string(Str.size());
-    Key += ':';
-    Key += Str;
+  static void add(llvm::FoldingSetNodeID &ID, StringRef Str) {
+    ID.AddString(Str);
   }
-  static void encode(std::string &Key, SourceLocation Loc) {
-    encode(Key, std::to_string(Loc.getRawEncoding()));
+  static void add(llvm::FoldingSetNodeID &ID, SourceLocation Loc) {
+    ID.Add(Loc);
   }
-  static void encode(std::string &Key, const void *Ptr) {
-    encode(Key, std::to_string(reinterpret_cast<uintptr_t>(Ptr)));
-  }
-  static void encode(std::string &Key, unsigned long long Val) {
-    encode(Key, std::to_string(Val));
-  }
-  static void encode(std::string &Key, const Name *N) {
-    encode(Key, N ? StringRef(*N) : StringRef("<null>"));
-  }
-  static void encode(std::string &Key, ArrayRef<StringRef> Names) {
-    encode(Key, static_cast<unsigned long long>(Names.size()));
-    for (StringRef N : Names)
-      encode(Key, N);
+  static void add(llvm::FoldingSetNodeID &ID, unsigned long long Val) {
+    ID.AddInteger(Val);
   }
 
   template <typename... Ts>
   bool shouldEmit(StringRef Callback, const Ts &...Args) {
-    std::string Key;
-    encode(Key, Callback);
-    (encode(Key, Args), ...);
-    return Emitted.insert(Key).second;
+    llvm::FoldingSetNodeID ID;
+    add(ID, Callback);
+    (add(ID, Args), ...);
+    return Emitted.insert(ID).second;
   }
 
   template <typename E> static unsigned long long val(E V) {
@@ -3209,25 +3204,12 @@ public:
     setIssueBetaWarnings(Inner.issueBetaWarnings());
   }
 
-  void handleInvalidLockExp(SourceLocation Loc) override {
-    if (shouldEmit("InvalidLockExp", Loc))
-      Inner.handleInvalidLockExp(Loc);
-  }
+  using ThreadSafetyHandler::handleNegativeNotHeld;
 
   void handleUnmatchedUnlock(StringRef Kind, Name LockName, SourceLocation Loc,
                              SourceLocation LocPreviousUnlock) override {
     if (shouldEmit("UnmatchedUnlock", Kind, LockName, Loc, LocPreviousUnlock))
       Inner.handleUnmatchedUnlock(Kind, LockName, Loc, LocPreviousUnlock);
-  }
-
-  void handleIncorrectUnlockKind(StringRef Kind, Name LockName,
-                                 LockKind Expected, LockKind Received,
-                                 SourceLocation LocLocked,
-                                 SourceLocation LocUnlock) override {
-    if (shouldEmit("IncorrectUnlockKind", Kind, LockName, val(Expected),
-                   val(Received), LocLocked, LocUnlock))
-      Inner.handleIncorrectUnlockKind(Kind, LockName, Expected, Received,
-                                      LocLocked, LocUnlock);
   }
 
   void handleDoubleLock(StringRef Kind, Name LockName, SourceLocation LocLocked,
@@ -3256,78 +3238,10 @@ public:
       Inner.handleExclusiveAndShared(Kind, LockName, Loc1, Loc2);
   }
 
-  void handleNoMutexHeld(const NamedDecl *D, ProtectedOperationKind POK,
-                         AccessKind AK, SourceLocation Loc) override {
-    if (shouldEmit("NoMutexHeld", static_cast<const void *>(D), val(POK),
-                   val(AK), Loc))
-      Inner.handleNoMutexHeld(D, POK, AK, Loc);
-  }
-
-  void handleGuardedByAnyReadNotHeld(const NamedDecl *D,
-                                     ProtectedOperationKind POK,
-                                     ArrayRef<StringRef> LockNames,
-                                     SourceLocation Loc) override {
-    if (shouldEmit("GuardedByAnyReadNotHeld", static_cast<const void *>(D),
-                   val(POK), LockNames, Loc))
-      Inner.handleGuardedByAnyReadNotHeld(D, POK, LockNames, Loc);
-  }
-
-  void handleMutexNotHeld(StringRef Kind, const NamedDecl *D,
-                          ProtectedOperationKind POK, Name LockName,
-                          LockKind LK, SourceLocation Loc,
-                          Name *PossibleMatch = nullptr) override {
-    if (shouldEmit("MutexNotHeld", Kind, static_cast<const void *>(D),
-                   val(POK), LockName, val(LK), Loc,
-                   static_cast<const Name *>(PossibleMatch)))
-      Inner.handleMutexNotHeld(Kind, D, POK, LockName, LK, Loc, PossibleMatch);
-  }
-
   void handleNegativeNotHeld(StringRef Kind, Name LockName, Name Neg,
                              SourceLocation Loc) override {
     if (shouldEmit("NegativeNotHeld", Kind, LockName, Neg, Loc))
       Inner.handleNegativeNotHeld(Kind, LockName, Neg, Loc);
-  }
-
-  void handleNegativeNotHeld(const NamedDecl *D, Name LockName,
-                             SourceLocation Loc) override {
-    if (shouldEmit("NegativeNotHeldDecl", static_cast<const void *>(D),
-                   LockName, Loc))
-      Inner.handleNegativeNotHeld(D, LockName, Loc);
-  }
-
-  void handleFunExcludesLock(StringRef Kind, Name FunName, Name LockName,
-                             SourceLocation Loc) override {
-    if (shouldEmit("FunExcludesLock", Kind, FunName, LockName, Loc))
-      Inner.handleFunExcludesLock(Kind, FunName, LockName, Loc);
-  }
-
-  void handleUnmatchedUnderlyingMutexes(SourceLocation Loc, SourceLocation DLoc,
-                                        Name ScopeName, StringRef Kind,
-                                        Name Expected, Name Actual) override {
-    if (shouldEmit("UnmatchedUnderlyingMutexes", Loc, DLoc, ScopeName, Kind,
-                   Expected, Actual))
-      Inner.handleUnmatchedUnderlyingMutexes(Loc, DLoc, ScopeName, Kind,
-                                             Expected, Actual);
-  }
-
-  void handleExpectMoreUnderlyingMutexes(SourceLocation Loc,
-                                         SourceLocation DLoc, Name ScopeName,
-                                         StringRef Kind,
-                                         Name Expected) override {
-    if (shouldEmit("ExpectMoreUnderlyingMutexes", Loc, DLoc, ScopeName, Kind,
-                   Expected))
-      Inner.handleExpectMoreUnderlyingMutexes(Loc, DLoc, ScopeName, Kind,
-                                              Expected);
-  }
-
-  void handleExpectFewerUnderlyingMutexes(SourceLocation Loc,
-                                          SourceLocation DLoc, Name ScopeName,
-                                          StringRef Kind,
-                                          Name Actual) override {
-    if (shouldEmit("ExpectFewerUnderlyingMutexes", Loc, DLoc, ScopeName, Kind,
-                   Actual))
-      Inner.handleExpectFewerUnderlyingMutexes(Loc, DLoc, ScopeName, Kind,
-                                               Actual);
   }
 
   void handleLockAcquiredBefore(StringRef Kind, Name L1Name, Name L2Name,
@@ -3339,14 +3253,6 @@ public:
   void handleBeforeAfterCycle(Name L1Name, SourceLocation Loc) override {
     if (shouldEmit("BeforeAfterCycle", L1Name, Loc))
       Inner.handleBeforeAfterCycle(L1Name, Loc);
-  }
-
-  void enterFunction(const FunctionDecl *FD) override {
-    Inner.enterFunction(FD);
-  }
-
-  void leaveFunction(const FunctionDecl *FD) override {
-    Inner.leaveFunction(FD);
   }
 };
 
