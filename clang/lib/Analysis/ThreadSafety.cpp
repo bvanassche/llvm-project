@@ -1143,6 +1143,15 @@ static unsigned getFactReentrancyDepth(const FactEntry &Fact) {
   return 0;
 }
 
+/// Whether to keep \p B instead of \p A when joining two facts for the same
+/// capability without a diagnostic: the shared fact subsumes the exclusive
+/// fact, and the non-asserted fact is the one to track.
+static bool preferJoinedFact(const FactEntry &A, const FactEntry &B) {
+  if (A.kind() != B.kind())
+    return B.kind() == LK_Shared;
+  return A.asserted() && !B.asserted();
+}
+
 class ScopedLockableFactEntry final
     : public FactEntry,
       private llvm::TrailingObjects<ScopedLockableFactEntry,
@@ -7874,12 +7883,8 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
         // differ if the trylock function has range attributes for different
         // lock kinds. Keep the shared fact; the edges out of this block
         // refine the lock kind.
-        if (EntryFact.kind() != ExitFact.kind()) {
-          if (ExitFact.kind() == LK_Shared)
-            *EntryIt = Fact;
-        } else if (EntryFact.asserted() && !ExitFact.asserted()) {
+        if (preferJoinedFact(EntryFact, ExitFact))
           *EntryIt = Fact;
-        }
       } else if (join(EntryFact, ExitFact, JoinLoc, EntryLEK, ExitLEK,
                       ReportMissingAcquires, H)) {
         *EntryIt = Fact;
@@ -8406,15 +8411,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         continue;
       unsigned DepthA = getFactReentrancyDepth(AFact);
       unsigned DepthB = getFactReentrancyDepth(*BFact);
-      if (DepthA != DepthB) {
-        if (DepthB < DepthA)
-          Acc.replaceLock(FactMan, It, BFact);
-      } else if (AFact.kind() != BFact->kind()) {
-        if (BFact->kind() == LK_Shared)
-          Acc.replaceLock(FactMan, It, BFact);
-      } else if (AFact.asserted() && !BFact->asserted()) {
+      if (DepthA != DepthB ? DepthB < DepthA : preferJoinedFact(AFact, *BFact))
         Acc.replaceLock(FactMan, It, BFact);
-      }
     }
   };
 
