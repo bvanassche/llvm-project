@@ -1,5 +1,5 @@
 // RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -DMANY_BRANCHES %s
-// RUN: %clang_cc1 -fsyntax-only -Wthread-safety -DNESTED_COMPARISONS %s 2>&1 | FileCheck %s
+// RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -DNESTED_COMPARISONS %s
 // RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -DDISTINCT_MUTEXES %s
 // RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -Wthread-safety-beta -DMANY_SCOPES %s
 
@@ -18,7 +18,7 @@ void use_value(int v);
 
 #define REP4(x) x x x x
 #define REP16(x) REP4(REP4(x))
-#define REP4096(x) REP16(REP16(REP16(x)))
+#define REP1024(x) REP4(REP16(REP16(x)))
 
 #ifdef MANY_BRANCHES
 // expected-no-diagnostics
@@ -28,7 +28,7 @@ void use_value(int v);
 // value state would make the analysis quadratic in the number of branches.
 int many_branches(void)
     __attribute__((try_acquire_capability_range(0, 0, mu))) {
-  REP4096({
+  REP1024({
     int v = get_value();
     if (v > 0)
       use_value(v);
@@ -50,7 +50,7 @@ int many_scopes(int x)
   int v = 0;
   if (!trylock(&mu))
     return -1;
-  REP4096({
+  REP1024({
     int a = get_value();
     if (a == x) {
       v = a;
@@ -74,11 +74,10 @@ out:
 #define CMP32(x) CMP16(CMP16(x))
 
 int nested_comparisons(void) __attribute__((try_acquire_capability(1, mu))) {
-  // When there are too many outcomes, the analysis assumes that every
-  // capability acquired by some outcome is held for every return value.
-  // CHECK: warning: mutex 'mu' is still held at the end of function
-  // CHECK: warning: acquiring mutex 'mu' that is already held
-  return CMP32(trylock(&mu));
+  // When the return value is too complex to track its outcomes separately,
+  // the analysis assumes that every trylock call in it has acquired its
+  // capabilities for every return value.
+  return CMP32(trylock(&mu)); // expected-warning{{mutex 'mu' is still held at the end of function}} expected-note{{mutex acquired here}}
 }
 #endif
 

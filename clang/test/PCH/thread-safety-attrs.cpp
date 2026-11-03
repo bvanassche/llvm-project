@@ -118,6 +118,11 @@ public:
    void MyLock() __attribute__((exclusive_lock_function(mu)));
 };
 
+// Trivial inline helpers are expanded when checking trylock results, also if
+// their body is deserialized from a PCH file.
+static inline bool sls_is_zero(int r) { return r == 0; }
+int sls_range_try() __attribute__((try_acquire_capability_range(0, 0, sls_mu)));
+
 #else
 
 MutexWrapper sls_mw;
@@ -350,6 +355,25 @@ void sls_trylock_range_bad() {
     pch_protected = 3;
     sls_mu.Unlock();
   }
+}
+
+void sls_inline_helper_from_pch() {
+  if (sls_is_zero(sls_range_try())) {
+    sls_guardby_var = 1;
+    sls_mu.Unlock();
+  }
+  if (!sls_is_zero(sls_range_try())) {
+    sls_guardby_var = 2; // expected-warning{{writing variable 'sls_guardby_var' requires holding mutex 'sls_mu' exclusively}}
+    return;
+  }
+  sls_mu.Unlock();
+}
+
+int sls_trylock_impl_with_pch_helper(int r)
+    __attribute__((try_acquire_capability_range(0, 0, sls_mu))) { // expected-note{{mutex acquired here}}
+  if (sls_is_zero(r))
+    return 0; // expected-warning{{expecting mutex 'sls_mu' to be held at the end of function}}
+  return 1;
 }
 
 #endif

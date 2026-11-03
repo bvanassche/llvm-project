@@ -503,6 +503,14 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   it is captured by reference. Such a variable may be modified without the
   analysis noticing.
 
+- The success value of `try_acquire_capability` and
+  `try_acquire_shared_capability` may now be any integer constant expression,
+  including a call of a `constexpr` function. Callers may compare the return
+  value of such a function with arbitrary constants and use it in a `switch`
+  statement. Clang now reports an error if the success value is not a constant
+  expression or if the attribute is applied to a function whose return type is
+  not a boolean, integer, enumeration, or pointer type, e.g. `void` or `float`.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed missing `-Wuninitialized-explicit-init` warnings for C file-scope

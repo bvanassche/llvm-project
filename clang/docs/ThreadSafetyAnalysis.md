@@ -473,10 +473,12 @@ a function releases all associated capabilities in whatever mode they're held.
 *Previously:* `EXCLUSIVE_TRYLOCK_FUNCTION`, `SHARED_TRYLOCK_FUNCTION`
 
 These are attributes on a function or method that tries to acquire the given
-capability, and returns a boolean (or integer/pointer) value indicating success
-or failure.
-The first argument must be `true` or `false` (or `1` or `0`), to specify which
-return value indicates success, and the remaining arguments are interpreted in
+capability, and returns a boolean, integer, enumeration, or pointer value
+indicating success or failure. Other return types, e.g. `void` or floating-point
+types, are rejected.
+The first argument must be an integer constant expression, e.g. `true` or
+`false` (or `1` or `0`), to specify which return value indicates success, and
+the remaining arguments are interpreted in
 the same way as `ACQUIRE`. When capability arguments are explicitly provided,
 the analysis checks the definition of the function to verify that the
 capabilities are held on return paths indicating success and are not held on
@@ -510,9 +512,10 @@ void foo() {
 
 ### TRY_ACQUIRE_RANGE(\<low>, \<high>, ...), TRY_ACQUIRE_SHARED_RANGE(\<low>, \<high>, ...)
 
-These are attributes on a function or method that tries to acquire the given
-capability and returns an integer, unscoped enumeration, or pointer value
-indicating success or failure. The first two arguments must be integer constant
+These are attributes on a function, method, function pointer, or function
+reference that tries to acquire the given capability and returns an integer,
+unscoped enumeration, or pointer value indicating success or failure. The first
+two arguments must be integer constant
 expressions specifying the inclusive range `[low, high]` (with `low <= high`) of
 return values that indicate success (pointer return values are compared as
 unsigned integers of type `uintptr_t`), and the remaining arguments are
@@ -527,7 +530,7 @@ function body is not checked.
 Mutex mu;
 int a GUARDED_BY(mu);
 
-int try_lock_or_errno() __attribute__((try_acquire_capability_range(0, __INT_MAX__, mu)));
+int try_lock_or_errno() TRY_ACQUIRE_RANGE(0, __INT_MAX__, mu);
 
 int foo() {
   int ret = try_lock_or_errno();
@@ -821,7 +824,10 @@ determine what data is owned by the enclosing object.
 
 Thread safety analysis is strictly intra-procedural, just like ordinary type
 checking. It relies only on the declared attributes of a function, and will
-not attempt to inline any method calls. As a result, code such as the
+not attempt to inline any method calls. The only exception are trivial `inline`
+or `constexpr` functions without thread safety attributes, e.g. `IS_ERR()`,
+whose return value the analysis evaluates when checking the result of a
+try-acquire function. As a result, code such as the
 following will not work:
 
 ```c++

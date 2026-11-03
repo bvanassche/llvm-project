@@ -134,25 +134,27 @@ void not_escaped(void) {
 }
 
 // Verifying a trylock implementation must not ignore writes through an alias.
+// The value of the trylock result is unknown, so the call may or may not have
+// acquired mu for every return value.
 int impl_addr_taken(void) __attribute__((try_acquire_capability(1, mu))) { // expected-note{{mutex acquired here}}
-  int ok = trylock(&mu);
+  int ok = trylock(&mu); // expected-note{{mutex acquired here}}
   int *p = &ok;
   *p = 1;
-  return ok; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+  return ok; // expected-warning{{expecting mutex 'mu' to be held at the end of function}} expected-warning{{mutex 'mu' is still held at the end of function}}
 }
 
 int impl_captured_by_reference() __attribute__((try_acquire_capability(1, mu))) { // expected-note{{mutex acquired here}}
-  int ok = trylock(&mu);
+  int ok = trylock(&mu); // expected-note{{mutex acquired here}}
   [&] { ok = 1; }();
-  return ok; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+  return ok; // expected-warning{{expecting mutex 'mu' to be held at the end of function}} expected-warning{{mutex 'mu' is still held at the end of function}}
 }
 
-int impl_increment_through_alias(void) // expected-note{{mutex acquired here}}
+int impl_increment_through_alias(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability(1, mu))) {
-  int r = trylock(&mu);
+  int r = trylock(&mu); // expected-note{{mutex acquired here}}
   int *p = &r;
   ++*p;
-  return r; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+  return r; // expected-warning{{expecting mutex 'mu' to be held at the end of function}} expected-warning{{mutex 'mu' is still held at the end of function}}
 }
 
 //===----------------------------------------------------------------------===//
@@ -536,7 +538,7 @@ void test_builtin_constant_p_caller() {
 }
 
 int test_builtin_constant_p_callee(bool unk)
-    __attribute__((try_acquire_capability_range(0, 0, mu))) { // expected-note@-1{{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu))) { // expected-note{{mutex acquired here}}
   int r = cond();
   (void)__builtin_constant_p(r = trylock_zero());
   if (unk)
@@ -559,4 +561,179 @@ int test_stmtexpr_pre_rhs_snapshot() TRY1 { // expected-note{{mutex acquired her
            }) +
            ((ok = 1), 0));
   return y; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+//===----------------------------------------------------------------------===//
+// Trylock implementations whose success value depends on a constexpr member
+// function that is defined later in the class.
+//===----------------------------------------------------------------------===//
+
+struct Mutex mu_other;
+int data_other __attribute__((guarded_by(mu_other)));
+
+struct LateConstexpr {
+  bool try_late() __attribute__((try_acquire_capability(ok(), mu))) { // expected-note{{mutex acquired here}}
+    data_other = 1; // expected-warning{{writing variable 'data_other' requires holding mutex 'mu_other' exclusively}}
+    unlock(&mu); // expected-warning{{releasing mutex 'mu' that was not held}}
+    return true; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+  }
+  static constexpr bool ok() { return true; }
+};
+
+//===----------------------------------------------------------------------===//
+// Trylock results whose use is not modeled.
+//===----------------------------------------------------------------------===//
+
+struct Mutex mu1, mu2;
+int trylock1() __attribute__((try_acquire_capability(1, mu1)));
+int trylock2() __attribute__((try_acquire_capability(1, mu2)));
+
+int result_stored_in_memory(int *out) TRY1 {
+  *out = trylock1(); // expected-note{{mutex acquired here}}
+  return 0; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int result_stored_in_volatile() TRY1 {
+  volatile int v = trylock1(); // expected-note{{mutex acquired here}}
+  return 0; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int result_in_bitwise_or() TRY1 { // expected-note{{mutex acquired here}}
+  return trylock1() | trylock2(); // expected-note 2{{mutex acquired here}} expected-warning{{mutex 'mu1' is still held at the end of function}} expected-warning{{mutex 'mu2' is still held at the end of function}} expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+int result_dropped_on_fallthrough(int c) TRY1 { // expected-note{{mutex acquired here}}
+  if (c) {
+    lock(&mu);
+    return 1;
+  }
+  (void)trylock1(); // expected-note{{mutex acquired here}}
+} // expected-warning{{mutex 'mu1' is still held at the end of function}} expected-warning{{expecting mutex 'mu' to be held at the end of function}} expected-warning{{non-void function does not return a value in all control paths}}
+
+//===----------------------------------------------------------------------===//
+// Paths that are tracked separately until there are too many of them.
+//===----------------------------------------------------------------------===//
+
+#define DEREFS                                                                 \
+  if (m & 1) s += *p0;                                                         \
+  if (m & 2) s += *p1;                                                         \
+  if (m & 4) s += *p2;                                                         \
+  if (m & 8) s += *p3;                                                         \
+  if (m & 16) s += *p4;                                                        \
+  if (m & 32) s += *p5;                                                        \
+  if (m & 64) s += *p6;
+
+int many_deref_paths_valid(int c, int *p0, int *p1, int *p2, int *p3, int *p4,
+                           int *p5, int *p6, unsigned m, int flag)
+    __attribute__((try_acquire_capability_range(0, 0, mu))) {
+  int ret = 1, s = 0;
+  if (c) {
+    lock(&mu);
+    ret = 0;
+  }
+  DEREFS
+  if (flag)
+    s += 1;
+  return ret;
+}
+
+int many_deref_paths_leak(int c, int *p0, int *p1, int *p2, int *p3, int *p4,
+                          int *p5, int *p6, unsigned m, int flag)
+    __attribute__((try_acquire_capability_range(0, 0, mu))) {
+  int ret = 1, s = 0;
+  if (c) {
+    lock(&mu); // expected-note{{mutex acquired here}}
+    ret = 2;
+  }
+  DEREFS
+  if (flag)
+    s += 1;
+  return ret; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+//===----------------------------------------------------------------------===//
+// Irreducible cycles.
+//===----------------------------------------------------------------------===//
+
+int irreducible_inner_cycle(int n, int c) TRY1 { // expected-note{{mutex acquired here}}
+  int ok = 1, z = 0;
+  while (n-- > 0) {
+    if (z == 0)
+      goto L2;
+    else {
+    L1:
+      ok = 0;
+      if (c)
+        goto done;
+    L2:
+      goto L1;
+    }
+  done:;
+  }
+  if (!ok)
+    return 1; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+  lock(&mu);
+  return 1;
+}
+
+int irreducible_keeps_pending(int c) TRY1 {
+  int z = 0;
+  (void)trylock1(); // expected-note{{mutex acquired here}}
+  if (z == 0)
+    goto B2;
+  else {
+  B1:
+    if (c)
+      return 0; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+  B2:
+    goto B1;
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// More trylock calls than can be tracked separately, overlapping exclusive
+// and shared ranges, and the context in which capabilities are resolved.
+//===----------------------------------------------------------------------===//
+
+struct Mutex marr[7];
+int trylock_at(int i) __attribute__((try_acquire_capability(1, marr[i])));
+
+int seven_discarded() TRY1 {
+  (void)trylock(&marr[0]); // expected-note{{mutex acquired here}}
+  (void)trylock(&marr[1]); // expected-note{{mutex acquired here}}
+  (void)trylock(&marr[2]); // expected-note{{mutex acquired here}}
+  (void)trylock(&marr[3]); // expected-note{{mutex acquired here}}
+  (void)trylock(&marr[4]); // expected-note{{mutex acquired here}}
+  (void)trylock(&marr[5]); // expected-note{{mutex acquired here}}
+  (void)trylock(&marr[6]); // expected-note{{mutex acquired here}}
+  // expected-warning-re@+1 7{{mutex 'marr[{{[0-6]}}]' is still held at the end of function}}
+  return 0;
+}
+
+int dual_range() __attribute__((try_acquire_capability_range(1, 2, mu)))
+    __attribute__((try_acquire_shared_capability_range(0, 1, mu)));
+int dual_range_wrapper()
+    __attribute__((try_acquire_capability_range(1, 2, mu)))
+    __attribute__((try_acquire_shared_capability_range(0, 1, mu))) {
+  return dual_range();
+}
+
+int discarded_resolved_at_call() TRY1 {
+  struct Mutex *m = &mu1;
+  (void)trylock(m); // expected-note{{mutex acquired here}}
+  m = nullptr;
+  return 0; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+//===----------------------------------------------------------------------===//
+// Return values that would fork into exponentially many outcomes.
+//===----------------------------------------------------------------------===//
+
+#define T6(b)                                                                  \
+  (trylock(&marr[(b)]), trylock(&marr[(b) + 1]), trylock(&marr[(b) + 2]),      \
+   cond())
+int nested_conditionals() TRY1 {
+  // expected-note@+2 6{{mutex acquired here}}
+  // expected-warning-re@+1 6{{mutex 'marr[{{.*}}]' is still held at the end of function}}
+  return T6(0) ? 0 : T6(3) ? 0 : T6(0) ? 0 : T6(3) ? 0 : T6(0) ? 0 : T6(3) ? 0 : 0;
 }

@@ -10,7 +10,7 @@ struct Mutex mu;
 
 void lock(struct Mutex *m) __attribute__((acquire_capability(m)));
 
-int modified_by_block(void) // expected-note{{mutex acquired here}}
+int modified_by_block(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu))) {
   __block int r = -11;
   void (^blk)(void) = ^{
@@ -20,7 +20,7 @@ int modified_by_block(void) // expected-note{{mutex acquired here}}
   return r; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
 }
 
-int modified_by_block_in_stmt_expr(void) // expected-note{{mutex acquired here}}
+int modified_by_block_in_stmt_expr(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu))) {
   return ({ // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
     __block int r = -11;

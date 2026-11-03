@@ -853,7 +853,7 @@ out:
 }
 
 // Incrementing a _Bool sets it to 1.
-int c_trylock_bool_increment_bad(void) // expected-note{{mutex acquired here}}
+int c_trylock_bool_increment_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability(1, mu1))) {
   _Bool ok = 1;
   ok++;
@@ -911,7 +911,7 @@ int c_shared_trylock_valid(int cond)
   return 1;
 }
 
-int c_shared_trylock_bad(void) // expected-note{{mutex acquired here}}
+int c_shared_trylock_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_shared_capability(1, mu1))) {
   return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
@@ -930,7 +930,7 @@ int *c_ptr_trylock_valid(int cond)
   return &work_data;
 }
 
-int *c_ptr_trylock_bad(int cond) // expected-note{{mutex acquired here}}
+int *c_ptr_trylock_bad(int cond) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability(1, mu1))) {
   if (!cond)
     return (void *)0;
@@ -939,7 +939,7 @@ int *c_ptr_trylock_bad(int cond) // expected-note{{mutex acquired here}}
 
 #ifdef __SIZEOF_INT128__
 // Range arithmetic on __int128 values uses wider integers than on other types.
-int c_int128_narrowing_bad(void) // expected-note{{mutex acquired here}}
+int c_int128_narrowing_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   __int128 big = (__int128)1 << 40;
   int x = 0;
@@ -959,7 +959,7 @@ int c_cleanup_outer_guard_valid(int cond)
   return 0;
 }
 
-int c_cleanup_releases_target_bad(void) // expected-note{{mutex acquired here}}
+int c_cleanup_releases_target_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   mutex_exclusive_lock(&mu1);
   struct Mutex *const __attribute__((unused, cleanup(unlock_scope))) scope = &mu1;
@@ -986,7 +986,7 @@ fail_unlock:
   return ret;
 }
 
-int c_trylock_open_coded_err_ptr_unchecked_bad(void) // expected-note{{mutex acquired here}}
+int c_trylock_open_coded_err_ptr_unchecked_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   void *obj = c_find_obj();
   // obj may be NULL, so the return value may be 0.
@@ -1031,18 +1031,18 @@ int c_stmtexpr_condition_valid(void)
   return ret;
 }
 
-int c_stmtexpr_init_assign_bad(void) // expected-note{{mutex acquired here}}
+int c_stmtexpr_init_assign_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   // The initializer of 'd' assigns 0 to 'r'.
   return ({ int r = -11; int d = (r = 0); (void)d; r; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
 
-int c_stmtexpr_nested_assign_bad(void) // expected-note{{mutex acquired here}}
+int c_stmtexpr_nested_assign_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   return ({ int r = -11, d; d = (r = 0); r; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
 
-int c_stmtexpr_comma_init_bad(void) // expected-note{{mutex acquired here}}
+int c_stmtexpr_comma_init_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   return ({ int r = -11; int d = (r = 0, r); d; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
@@ -1174,7 +1174,7 @@ int c_budget_unrelated_addrof_valid(void)
   return 0;
 }
 
-int c_trylock_ptr_err_unchecked_bad(void) // expected-note{{mutex acquired here}}
+int c_trylock_ptr_err_unchecked_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   // Without c_is_err(obj), obj may be NULL, so c_ptr_err(obj) may return 0!
   void *obj = c_lookup_obj();
@@ -1209,7 +1209,7 @@ int c_redecl_reentrant_delegate(int ok)
 
 int c_redecl_reentrant_trylock_bad(void)
     __attribute__((try_acquire_shared_capability_range(0, 0, crmu)));
-int c_redecl_reentrant_trylock_bad(void) // expected-note{{mutex acquired here}}
+int c_redecl_reentrant_trylock_bad(void) // expected-note@-1 {{mutex acquired here}}
     __attribute__((try_acquire_shared_capability_range(0, 0, crmu))) {
   return 0; // expected-warning{{expecting mutex 'crmu' to be held at the end of function}}
 }
@@ -1269,7 +1269,7 @@ int c_loop_invariant_ret_valid(int fatal)
   return ret;
 }
 
-int c_coupled_loop_vars_bad(int n) // expected-note{{mutex acquired here}}
+int c_coupled_loop_vars_bad(int n) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   int v1 = -1, v2 = -1;
   for (int i = 0; i < n; ++i) {
@@ -1397,7 +1397,7 @@ struct CGroupObj *c_ptr_range_lock_live_leak_bad(void)
   return (struct CGroupObj *)(__INTPTR_TYPE__)-16; // expected-warning{{mutex 'mu1' is still held at the end of function}}
 }
 
-struct CGroupObj *c_ptr_range_lock_live_missing_bad(void) // expected-note{{mutex acquired here}}
+struct CGroupObj *c_ptr_range_lock_live_missing_bad(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1))) {
   return (struct CGroupObj *)0; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
@@ -1585,7 +1585,7 @@ void *c_delegate_err_cast_valid(int ok)
   return p;
 }
 
-int c_delegate_opaque_helper_bad(int ok) // expected-note{{mutex acquired here}}
+int c_delegate_opaque_helper_bad(int ok) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   return c_opaque_err_or_zero(c_ptr_range_lock_live(ok)); // \
     // expected-note{{mutex acquired here}} \
@@ -1714,7 +1714,7 @@ int *c_addrof_deref_null(void)
   return &*p;
 }
 
-int c_addrof_deref_branch(void) // expected-note{{mutex acquired here}}
+int c_addrof_deref_branch(void) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability(1, mu1))) {
   int *p = 0;
   if (&*p == 0)

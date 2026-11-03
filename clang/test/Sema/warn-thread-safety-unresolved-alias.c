@@ -1,4 +1,5 @@
 // RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -Wthread-safety-beta %s
+// RUN: %clang_cc1 -fsyntax-only -verify=expected,nobeta -Wthread-safety %s
 
 // Local pointer variables whose value the analysis cannot resolve, e.g.
 // because the value has been loaded by inline assembly as in the arm64
@@ -39,17 +40,40 @@ void name_of_alias(struct req *r) {
   spin_lock(&head->lock); // expected-note{{spinlock acquired here}}
 } // expected-warning{{spinlock 'head->lock' is still held at the end of function}}
 
-// The analysis cannot tell whether head->lock is r->head->lock.
+// The analysis cannot tell whether head->lock is r->head->lock. Without
+// -Wthread-safety-beta, local variables are never resolved, so the pair is
+// reported.
 int trylock_through_alias(struct req *r)
-    __attribute__((try_acquire_capability(1, &r->head->lock))) {
+    __attribute__((try_acquire_capability(1, &r->head->lock))) { // nobeta-note{{spinlock acquired here}}
   struct wq *head = load_acquire_asm(&r->head);
   if (head) {
-    spin_lock(&head->lock);
+    spin_lock(&head->lock); // nobeta-note{{spinlock acquired here}}
     if (!busy(r))
-      return 1;
+      return 1; // nobeta-warning{{spinlock 'head->lock' is still held at the end of function}} nobeta-warning{{expecting spinlock 'r->head->lock' to be held at the end of function}}
     spin_unlock(&head->lock);
   }
   return 0;
+}
+
+// A local pointer to a capability of another type or reached through other
+// fields is not the expected capability.
+struct other {
+  struct spinlock other_lock;
+};
+struct other *gother;
+int trylock_through_other_field(struct req *r)
+    __attribute__((try_acquire_capability(1, &r->head->lock))) { // expected-note{{spinlock acquired here}}
+  struct other *o = load_acquire_asm(&gother);
+  spin_lock(&o->other_lock); // expected-note{{spinlock acquired here}}
+  return 1; // expected-warning{{spinlock 'o->other_lock' is still held at the end of function}} expected-warning{{expecting spinlock 'r->head->lock' to be held at the end of function}}
+}
+
+struct spinlock global_lock;
+int trylock_global_through_local(struct req *r)
+    __attribute__((try_acquire_capability(1, global_lock))) { // expected-note{{spinlock acquired here}}
+  struct wq *w = load_acquire_asm(&r->head);
+  spin_lock(&w->lock); // expected-note{{spinlock acquired here}}
+  return 1; // expected-warning{{spinlock 'w->lock' is still held at the end of function}} expected-warning{{expecting spinlock 'global_lock' to be held at the end of function}}
 }
 
 // But a capability that is held on a failure path is still reported.

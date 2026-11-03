@@ -9595,7 +9595,7 @@ class BodyCheckSuite {
   // Invalid implementations
   //===--------------------------------------------------------------------===//
 
-  bool badSuccessWithoutLock() // expected-note {{mutex acquired here}}
+  bool badSuccessWithoutLock() // expected-note@+1 {{mutex acquired here}}
       EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
     return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
@@ -9618,7 +9618,7 @@ class BodyCheckSuite {
     return false; // expected-warning {{mutex 'mu' is still held at the end of function}}
   }
 
-  int badInvertedTryAcquire(bool cond) // expected-note {{mutex acquired here}}
+  int badInvertedTryAcquire(bool cond) // expected-note@+1 {{mutex acquired here}}
       EXCLUSIVE_TRYLOCK_FUNCTION(false, mu) {
     if (cond) {
       mu.Lock(); // expected-note {{mutex acquired here}}
@@ -9627,24 +9627,24 @@ class BodyCheckSuite {
     return 0; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
-  bool badSharedWithoutLock() // expected-note {{mutex acquired here}}
+  bool badSharedWithoutLock() // expected-note@+1 {{mutex acquired here}}
       SHARED_TRYLOCK_FUNCTION(true, mu) {
     return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
-  bool badWrongLockKindSharedInsteadOfExcl() // expected-note {{the other acquisition of mutex 'mu' is here}}
+  bool badWrongLockKindSharedInsteadOfExcl() // expected-note@+1 {{the other acquisition of mutex 'mu' is here}}
       EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
     mu.ReaderLock(); // expected-warning {{mutex 'mu' is acquired exclusively and shared in the same scope}}
     return true;
   }
 
-  bool badWrongLockKindExclInsteadOfShared() // expected-note {{the other acquisition of mutex 'mu' is here}}
+  bool badWrongLockKindExclInsteadOfShared() // expected-note@+1 {{the other acquisition of mutex 'mu' is here}}
       SHARED_TRYLOCK_FUNCTION(true, mu) {
     mu.Lock(); // expected-warning {{mutex 'mu' is acquired exclusively and shared in the same scope}}
     return true;
   }
 
-  int badRangeSuccessWithoutLock() // expected-note {{mutex acquired here}}
+  int badRangeSuccessWithoutLock() // expected-note@+1 {{mutex acquired here}}
       TRY_ACQUIRE_RANGE(0, 0, mu) {
     return 0; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
@@ -9659,7 +9659,7 @@ class BodyCheckSuite {
     return cond ? 0 : 1; // expected-warning {{mutex 'mu' is still held at the end of function}}
   }
 
-  int badSharedRangeWithoutLock() // expected-note {{mutex acquired here}}
+  int badSharedRangeWithoutLock() // expected-note@+1 {{mutex acquired here}}
       TRY_ACQUIRE_SHARED_RANGE(1, 10, mu) {
     return 5; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
@@ -9669,7 +9669,7 @@ class BodyCheckSuite {
     return low ? 0 : 11; // expected-warning {{mutex 'mu' is still held at the end of function}}
   }
 
-  int badStackedModeSwapped(bool excl) // expected-note 2 {{the other acquisition of mutex 'mu' is here}}
+  int badStackedModeSwapped(bool excl) // expected-note@+1 {{the other acquisition of mutex 'mu' is here}} expected-note@+2 {{the other acquisition of mutex 'mu' is here}}
       TRY_ACQUIRE_RANGE(1, 1, mu)
       TRY_ACQUIRE_SHARED_RANGE(2, 2, mu) {
     if (excl) {
@@ -9693,13 +9693,13 @@ class BodyCheckSuite {
     return true;
   }
 
-  bool badScopedGuardReleasesTarget() // expected-note {{mutex acquired here}}
+  bool badScopedGuardReleasesTarget() // expected-note@+1 {{mutex acquired here}}
       EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
     TryMutexGuard guard(&mu);
     return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
-  int badUnlockedAfterSuccess() // expected-note {{mutex acquired here}}
+  int badUnlockedAfterSuccess() // expected-note@+1 {{mutex acquired here}}
       TRY_ACQUIRE_RANGE(0, 0, mu) {
     int err = delegateZero();
     if (err == 0)
@@ -9707,7 +9707,7 @@ class BodyCheckSuite {
     return err; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
-  int badUnknownReturnUnlocked(int unknown) // expected-note {{mutex acquired here}}
+  int badUnknownReturnUnlocked(int unknown) // expected-note@+1 {{mutex acquired here}}
       TRY_ACQUIRE_RANGE(0, 0, mu) {
     return unknown; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
@@ -9717,24 +9717,24 @@ class BodyCheckSuite {
     return unknown; // expected-warning {{mutex 'mu' is still held at the end of function}}
   }
 
-  bool badShortCircuitOr(bool shortcut) // expected-note {{mutex acquired here}}
+  bool badShortCircuitOr(bool shortcut) // expected-note@+1 {{mutex acquired here}}
       EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
     return shortcut || mu.TryLock(); // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
-  bool badShortCircuitOrViaVar(bool shortcut) // expected-note {{mutex acquired here}}
+  bool badShortCircuitOrViaVar(bool shortcut) // expected-note@+1 {{mutex acquired here}}
       EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
     bool ok = shortcut || mu.TryLock();
     return ok; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
-  int badNarrowingTruncation() // expected-note {{mutex acquired here}}
+  int badNarrowingTruncation() // expected-note@+1 {{mutex acquired here}}
       TRY_ACQUIRE_RANGE(0, 0, mu) {
     // A non-zero failure value such as 256 truncates to 0!
     return (signed char)trylockWideZero(mu); // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
-  int badIncompleteRangeCheck() // expected-note {{mutex acquired here}}
+  int badIncompleteRangeCheck() // expected-note@+1 {{mutex acquired here}}
       TRY_ACQUIRE_RANGE(0, 0, mu) {
     int err = delegateZero();
     if (err < 0)
@@ -9743,7 +9743,7 @@ class BodyCheckSuite {
     return 0; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
-  int badMutatedSourceVar() // expected-note {{mutex acquired here}}
+  int badMutatedSourceVar() // expected-note@+1 {{mutex acquired here}}
       TRY_ACQUIRE_RANGE(0, 0, mu) {
     int x = -1;
     int y = x + 1; // y is 0, while mu is not locked!
@@ -9751,7 +9751,7 @@ class BodyCheckSuite {
     return y; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
-  int badLoopMutation(int n) // expected-note {{mutex acquired here}}
+  int badLoopMutation(int n) // expected-note@+1 {{mutex acquired here}}
       TRY_ACQUIRE_RANGE(0, 0, mu) {
     int err = -16;
     for (int i = 0; i < n; ++i) {

@@ -55,7 +55,7 @@ public:
     return true;
   }
 
-  bool tryLockBad() // expected-note {{mutex acquired here}}
+  bool tryLockBad() // expected-note@+1 {{mutex acquired here}}
       __attribute__((try_acquire_capability(true, mu))) {
     return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
@@ -70,7 +70,7 @@ public:
   }
 
   template <int Lo, int Hi>
-  int tryRangeBad() // expected-note {{mutex acquired here}}
+  int tryRangeBad() // expected-note@+1 {{mutex acquired here}}
       __attribute__((try_acquire_shared_capability_range(Lo, Hi, mu))) {
     return Hi; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
@@ -110,7 +110,7 @@ CapMutex globalMu;
 
 // Explicit instantiation definitions are verified too.
 template <int Lo, int Hi>
-int tryRangeBounds(bool cond) // expected-note {{mutex acquired here}}
+int tryRangeBounds(bool cond) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(Lo, Hi, globalMu))) {
   if (!cond)
     return Hi + 1;
@@ -120,7 +120,7 @@ template int tryRangeBounds<0, 1>(bool); // expected-note {{in instantiation of 
 
 // A capability whose type depends on a template parameter.
 template <typename Mu>
-int tryRangeDepCap(Mu &mu, bool cond) // expected-note {{mutex acquired here}}
+int tryRangeDepCap(Mu &mu, bool cond) // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, mu))) {
   if (cond) {
     mu.Lock();
@@ -141,7 +141,7 @@ int tryRangeNonDep(bool cond)
   return -1;
 }
 template <typename T>
-int tryRangeNonDepBad() // expected-note {{mutex acquired here}}
+int tryRangeNonDepBad() // expected-note@+1 {{mutex acquired here}}
     __attribute__((try_acquire_capability_range(0, 0, globalMu))) {
   return 0; // expected-warning {{expecting mutex 'globalMu' to be held at the end of function}}
 }
@@ -173,7 +173,7 @@ struct LateSiblingConstexpr {
   CapMutex otherMu;
   int guarded __attribute__((guarded_by(otherMu)));
 
-  bool tryLate(bool cond) // expected-note {{mutex acquired here}}
+  bool tryLate(bool cond) // expected-note@+1 {{mutex acquired here}}
       __attribute__((try_acquire_capability(ok(), mu))) {
     guarded = 1; // expected-warning {{writing variable 'guarded' requires holding mutex 'otherMu' exclusively}}
     mu.Unlock(); // expected-warning {{releasing mutex 'mu' that was not held}}
