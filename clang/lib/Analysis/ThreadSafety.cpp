@@ -3729,6 +3729,35 @@ static bool isStraightLineStmtExprSubStmt(const Stmt *S, bool IsRoot = false) {
   return true;
 }
 
+/// If the statement expression \p SE is straight-line code that ends in an
+/// expression and that only modifies the local variables it declares
+/// (\p LocalDecls) and variables that escape (\p Escaped), returns that
+/// expression. Otherwise returns nullptr.
+static const Expr *
+analyzeStmtExpr(const StmtExpr *SE,
+                llvm::SmallPtrSetImpl<const ValueDecl *> &LocalDecls,
+                llvm::SmallPtrSetImpl<const ValueDecl *> &Escaped) {
+  const CompoundStmt *CS = SE->getSubStmt();
+  if (!CS || CS->body_empty() || !isStraightLineStmtExprSubStmt(CS, true))
+    return nullptr;
+  const auto *LastExpr = dyn_cast<Expr>(CS->body_back());
+  if (!LastExpr)
+    return nullptr;
+
+  for (const Stmt *S : CS->body())
+    if (const auto *DS = dyn_cast<DeclStmt>(S))
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D); VD && VD->hasLocalStorage())
+          LocalDecls.insert(cast<ValueDecl>(VD->getCanonicalDecl()));
+
+  llvm::SmallPtrSet<const ValueDecl *, 4> Modified;
+  scanTrylockVars(CS, Escaped, Modified);
+  for (const ValueDecl *MVD : Modified)
+    if (!Escaped.contains(MVD) && !LocalDecls.contains(MVD))
+      return nullptr;
+  return LastExpr;
+}
+
 bool ThreadSafetyAnalyzer::isPureExitBlock(const CFGBlock *B,
                                            const CapExprSet &TargetCaps) {
   unsigned CtxIdx = BlockInfo[B->getBlockID()].EntryIndex;
@@ -4470,56 +4499,35 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
   }
 
   if (const auto *SE = dyn_cast<StmtExpr>(E)) {
-    const CompoundStmt *CS = SE->getSubStmt();
-    if (!CS || CS->body_empty() || !isStraightLineStmtExprSubStmt(CS, true))
-      return std::nullopt;
-    const auto *LastExpr = dyn_cast<Expr>(CS->body_back());
+    llvm::SmallPtrSet<const ValueDecl *, 4> LocalDecls, SEEscaped;
+    const Expr *LastExpr = analyzeStmtExpr(SE, LocalDecls, SEEscaped);
     if (!LastExpr)
       return std::nullopt;
 
-    llvm::SmallPtrSet<const ValueDecl *, 4> LocalDecls;
-    for (const Stmt *S : CS->body())
-      if (const auto *DS = dyn_cast<DeclStmt>(S))
-        for (const Decl *D : DS->decls())
-          if (const auto *VD = dyn_cast<VarDecl>(D);
-              VD && VD->hasLocalStorage())
-            LocalDecls.insert(cast<ValueDecl>(VD->getCanonicalDecl()));
-
-    llvm::SmallPtrSet<const ValueDecl *, 4> SEEscaped, SEModified;
-    scanTrylockVars(CS, SEEscaped, SEModified);
-    for (const ValueDecl *MVD : SEModified)
-      if (!SEEscaped.contains(MVD) && !LocalDecls.contains(MVD))
-        return std::nullopt;
-
     TrylockValueState SubState = State;
-    for (const Stmt *S : llvm::drop_end(CS->body())) {
+    // Assign the value of RHS to the local variable VD. RHS may modify local
+    // variables, e.g. 'int d = (r = 0, r);' or 'd = (r = 0);'. Evaluating it
+    // would use stale values, so forget the modified variables and VD instead.
+    auto AssignLocal = [&](const ValueDecl *VD, const Expr *RHS) {
+      llvm::SmallPtrSet<const ValueDecl *, 4> RHSEsc, RHSMod;
+      scanTrylockVars(RHS, RHSEsc, RHSMod);
+      for (const ValueDecl *MVD : RHSMod)
+        SubState.VarRanges.erase(MVD);
+      auto VDom = getScalarDomain(VD->getType());
+      auto R = RHSMod.empty() ? evaluatePureExprRange(RHS, SubState, Depth + 1)
+                              : std::nullopt;
+      if (VDom && R)
+        SubState.VarRanges[VD] = reprojectRangeSet(*R, *VDom);
+      else
+        SubState.VarRanges.erase(VD);
+    };
+    for (const Stmt *S : llvm::drop_end(SE->getSubStmt()->body())) {
       if (const auto *DS = dyn_cast<DeclStmt>(S)) {
         for (const Decl *D : DS->decls()) {
           const auto *VD = dyn_cast<VarDecl>(D);
-          if (!VD || !VD->hasLocalStorage())
-            continue;
-          const auto *CanonVD = cast<ValueDecl>(VD->getCanonicalDecl());
-          if (SEEscaped.contains(CanonVD) || !VD->getInit())
-            continue;
-          // The initializer may modify local variables, e.g.
-          // 'int d = (r = 0, r);'. Evaluating such an initializer would use
-          // stale values, so forget the modified variables and the
-          // initialized variable instead.
-          llvm::SmallPtrSet<const ValueDecl *, 4> InitEsc, InitMod;
-          scanTrylockVars(VD->getInit(), InitEsc, InitMod);
-          if (!InitMod.empty()) {
-            for (const ValueDecl *MVD : InitMod)
-              SubState.VarRanges.erase(MVD);
-            SubState.VarRanges.erase(CanonVD);
-            continue;
-          }
-          auto VDom = getScalarDomain(VD->getType());
-          auto InitR =
-              evaluatePureExprRange(VD->getInit(), SubState, Depth + 1);
-          if (VDom && InitR)
-            SubState.VarRanges[CanonVD] = reprojectRangeSet(*InitR, *VDom);
-          else
-            SubState.VarRanges.erase(CanonVD);
+          if (VD && VD->hasLocalStorage() && VD->getInit() &&
+              !SEEscaped.contains(cast<ValueDecl>(VD->getCanonicalDecl())))
+            AssignLocal(cast<ValueDecl>(VD->getCanonicalDecl()), VD->getInit());
         }
         continue;
       }
@@ -4531,23 +4539,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
           const auto *CanonVD =
               cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
           if (LocalDecls.contains(CanonVD) && !SEEscaped.contains(CanonVD)) {
-            // The right-hand side may modify local variables, e.g.
-            // 'd = (r = 0);'. Forget these and the assigned variable.
-            llvm::SmallPtrSet<const ValueDecl *, 4> RHSEsc, RHSMod;
-            scanTrylockVars(BO->getRHS(), RHSEsc, RHSMod);
-            if (!RHSMod.empty()) {
-              for (const ValueDecl *MVD : RHSMod)
-                SubState.VarRanges.erase(MVD);
-              SubState.VarRanges.erase(CanonVD);
-              continue;
-            }
-            auto VDom = getScalarDomain(CanonVD->getType());
-            auto RHSR =
-                evaluatePureExprRange(BO->getRHS(), SubState, Depth + 1);
-            if (VDom && RHSR)
-              SubState.VarRanges[CanonVD] = reprojectRangeSet(*RHSR, *VDom);
-            else
-              SubState.VarRanges.erase(CanonVD);
+            AssignLocal(CanonVD, BO->getRHS());
             continue;
           }
         }
@@ -5184,26 +5176,10 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
   }
 
   if (const auto *SE = dyn_cast<StmtExpr>(Cond)) {
-    const CompoundStmt *CS = SE->getSubStmt();
-    if (!CS || CS->body_empty() || !isStraightLineStmtExprSubStmt(CS, true))
-      return;
-    const auto *LastExpr = dyn_cast<Expr>(CS->body_back());
+    llvm::SmallPtrSet<const ValueDecl *, 4> LocalDecls, SEEscaped;
+    const Expr *LastExpr = analyzeStmtExpr(SE, LocalDecls, SEEscaped);
     if (!LastExpr)
       return;
-
-    llvm::SmallPtrSet<const ValueDecl *, 4> LocalDecls;
-    for (const Stmt *S : CS->body())
-      if (const auto *DS = dyn_cast<DeclStmt>(S))
-        for (const Decl *D : DS->decls())
-          if (const auto *VD = dyn_cast<VarDecl>(D);
-              VD && VD->hasLocalStorage())
-            LocalDecls.insert(cast<ValueDecl>(VD->getCanonicalDecl()));
-
-    llvm::SmallPtrSet<const ValueDecl *, 4> SEEscaped, SEModified;
-    scanTrylockVars(CS, SEEscaped, SEModified);
-    for (const ValueDecl *MVD : SEModified)
-      if (!SEEscaped.contains(MVD) && !LocalDecls.contains(MVD))
-        return;
 
     auto UsesAnyLocalDecl = [&](auto &Self, const Stmt *S) -> bool {
       if (!S)
@@ -5229,7 +5205,7 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
       if (LocalDecls.contains(TargetVD) && !SEEscaped.contains(TargetVD)) {
         const Expr *AssignedRHS = nullptr;
         unsigned AssignCount = 0;
-        for (const Stmt *S : llvm::drop_end(CS->body())) {
+        for (const Stmt *S : llvm::drop_end(SE->getSubStmt()->body())) {
           if (const auto *DS = dyn_cast<DeclStmt>(S)) {
             for (const Decl *D : DS->decls()) {
               const auto *VD = dyn_cast<VarDecl>(D);
