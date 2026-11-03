@@ -54,11 +54,16 @@ void Func18(void) __attribute__((release_capability())) {} // expected-warning {
 void Func19(void) __attribute__((release_shared_capability())) {} // expected-warning {{'release_shared_capability' attribute without capability arguments can only be applied to non-static methods of a class}}
 void Func20(void) __attribute__((release_generic_capability())) {} // expected-warning {{'release_generic_capability' attribute without capability arguments can only be applied to non-static methods of a class}}
 
-void Func21(void) __attribute__((try_acquire_capability(1))) {} // expected-warning {{'try_acquire_capability' attribute without capability arguments can only be applied to non-static methods of a class}}
-void Func22(void) __attribute__((try_acquire_shared_capability(1))) {} // expected-warning {{'try_acquire_shared_capability' attribute without capability arguments can only be applied to non-static methods of a class}}
+int Func21(void) __attribute__((try_acquire_capability(1))) { return 0; } // expected-warning {{'try_acquire_capability' attribute without capability arguments can only be applied to non-static methods of a class}}
+int Func22(void) __attribute__((try_acquire_shared_capability(1))) { return 0; } // expected-warning {{'try_acquire_shared_capability' attribute without capability arguments can only be applied to non-static methods of a class}}
 
-void Func23(void) __attribute__((try_acquire_capability(1, GUI))) {}
-void Func24(void) __attribute__((try_acquire_shared_capability(1, GUI))) {}
+int Func23(void) __attribute__((try_acquire_capability(1, GUI))) { return 0; }
+int Func24(void) __attribute__((try_acquire_shared_capability(1, GUI))) { return 0; }
+void Func23Void(void) __attribute__((try_acquire_capability(1, GUI))); // expected-error {{'try_acquire_capability' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'void'}}
+float Func24Float(void) __attribute__((try_acquire_shared_capability(1, GUI))); // expected-error {{'try_acquire_shared_capability' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'float'}}
+struct NotACapability Func23Struct(void) __attribute__((try_acquire_capability(1, GUI))); // expected-error {{'try_acquire_capability' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'struct NotACapability'}}
+enum IncompleteEnum;
+enum IncompleteEnum Func23IncEnum(void) __attribute__((try_acquire_capability(1, GUI)));
 
 void Func25(void) __attribute__((try_acquire_capability())) {} // expected-error {{'try_acquire_capability' attribute takes at least 1 argument}}
 void Func26(void) __attribute__((try_acquire_shared_capability())) {} // expected-error {{'try_acquire_shared_capability' attribute takes at least 1 argument}}
@@ -82,10 +87,13 @@ int FuncRange9(void) __attribute__((try_acquire_shared_capability_range(0, "bad"
 int FuncRange10(void) __attribute__((try_acquire_capability_range(2, 1, GUI))); // expected-error {{'try_acquire_capability_range' attribute range [2, 1] is empty}}
 int FuncRange11(void) __attribute__((try_acquire_shared_capability_range(0, -1, GUI))); // expected-error {{'try_acquire_shared_capability_range' attribute range [0, -1] is empty}}
 int FuncRange12(void) __attribute__((try_acquire_capability_range(0, 1, BadCapability))); // expected-warning {{'try_acquire_capability_range' attribute requires arguments whose type is annotated with 'capability' attribute; type here is 'struct NotACapability'}}
-void FuncRange13(void) __attribute__((try_acquire_capability_range(0, 0, GUI))); // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'void'}}
+void FuncRange13(void) __attribute__((try_acquire_capability_range(0, 0, GUI))); // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'void'}}
+_Bool FuncRange13Bool(void) __attribute__((try_acquire_capability_range(0, 1, GUI))); // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is '_Bool'}}
+float FuncRange13Float(void) __attribute__((try_acquire_capability_range(0, 1, GUI))); // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'float'}}
 unsigned char FuncRange14(void) __attribute__((try_acquire_capability_range(256, 512, GUI))); // expected-warning {{'try_acquire_capability_range' attribute range [256, 512] does not contain any value of return type 'unsigned char'}}
 void *FuncRange15(void) __attribute__((try_acquire_capability_range(1, (__UINTPTR_TYPE__)-4096, GUI)));
 void *FuncRange16(void) __attribute__((try_acquire_capability_range(-2, -1, GUI))); // expected-warning {{'try_acquire_capability_range' attribute range [-2, -1] does not contain any value of return type 'void *'}}
+enum IncompleteEnum FuncRange17(void) __attribute__((try_acquire_capability_range(0, 1, GUI)));
 
 // Test that boolean logic works with capability attributes
 void Func27(void) __attribute__((requires_capability(!GUI)));

@@ -2,7 +2,7 @@
 // RUN: %clang_cc1 -include %s -fsyntax-only -verify -Wthread-safety -std=c++11 %s
 
 // Test with pch.
-// RUN: %clang_cc1 -emit-pch -o %t %s -std=c++11
+// RUN: %clang_cc1 -emit-pch -o %t %s -Wthread-safety -std=c++11
 // RUN: %clang_cc1 -include-pch %t -fsyntax-only -verify -Wthread-safety -std=c++11 %s
 
 #ifndef HEADER

@@ -1371,6 +1371,23 @@ public:
   sema::AnalysisBasedWarnings AnalysisWarnings;
   threadSafety::BeforeSet *ThreadSafetyDeclCache;
 
+  struct DelayedThreadSafetyDecl {
+    const Decl *D;
+    bool IssueBeta;
+    bool Verbose;
+  };
+  SmallVector<std::pair<Decl *, Attr *>, 4> DelayedTryAcquireAttrs;
+  SmallVector<DelayedThreadSafetyDecl, 4> DelayedThreadSafetyDecls;
+
+  bool hasDelayedTryAcquireAttrs() const {
+    return !DelayedTryAcquireAttrs.empty();
+  }
+  void deferThreadSafetyAnalysis(const Decl *D, bool IssueBeta, bool Verbose) {
+    DelayedThreadSafetyDecls.push_back({D, IssueBeta, Verbose});
+  }
+  void finishDelayedThreadSafetyChecks(bool Force = false);
+  void checkDeducedFunctionThreadSafetyAttrs(FunctionDecl *FD);
+
   /// Callback to the parser to parse templated functions when needed.
   typedef void LateTemplateParserCB(void *P, LateParsedTemplate &LPT);
   LateTemplateParserCB *LateTemplateParser;
@@ -14392,7 +14409,8 @@ public:
 
   /// Recheck instantiated thread-safety attributes that could not be validated
   /// on the dependent pattern declaration.
-  bool checkInstantiatedThreadSafetyAttrs(const Decl *D, const Attr *A);
+  bool checkInstantiatedThreadSafetyAttrs(Decl *D, Attr *A,
+                                          const Attr *TmplAttr = nullptr);
 
   void InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
                         const Decl *Pattern, Decl *Inst,

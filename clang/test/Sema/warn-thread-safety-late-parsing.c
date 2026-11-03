@@ -3,8 +3,8 @@
 // parameter declared later in the same prototype. Without it, those forward
 // references are errors.
 //
-// RUN: %clang_cc1 -fexperimental-late-parse-attributes -fsyntax-only -verify=both %s
-// RUN: %clang_cc1 -fsyntax-only -verify=both,early %s
+// RUN: %clang_cc1 -fexperimental-late-parse-attributes -Wthread-safety -fsyntax-only -verify=both %s
+// RUN: %clang_cc1 -Wthread-safety -fsyntax-only -verify=both,early %s
 
 #define REQUIRES(...)     __attribute__((requires_capability(__VA_ARGS__)))
 #define ACQUIRE(...)      __attribute__((acquire_capability(__VA_ARGS__)))

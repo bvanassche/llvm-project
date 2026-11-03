@@ -9334,6 +9334,7 @@ bool Sema::CheckExplicitlyDefaultedComparison(Scope *S, FunctionDecl *FD,
       return true;
     Context.adjustDeducedFunctionResultType(
         FD, SubstAutoType(FD->getDeclaredReturnType(), Cat));
+    checkDeducedFunctionThreadSafetyAttrs(FD);
   }
 
   // C++2a [dcl.fct.def.default]p3 [P2002R0]:
@@ -14789,6 +14790,7 @@ void Sema::ActOnFinishCXXMemberDecls() {
 }
 
 void Sema::ActOnFinishCXXNonNestedClass() {
+  finishDelayedThreadSafetyChecks();
   referenceDLLExportedClassMethods();
 
   if (!DelayedDllExportMemberFunctions.empty()) {

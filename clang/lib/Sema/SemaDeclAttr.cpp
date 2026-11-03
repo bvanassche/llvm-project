@@ -168,83 +168,89 @@ bool Sema::checkStringLiteralArgumentAttr(const ParsedAttr &AL, unsigned ArgNum,
 }
 
 /// Check if the passed-in expression is of type int or bool.
-static bool isIntOrBool(Expr *Exp) {
+static bool isIntOrBool(const Expr *Exp) {
+  if (Exp->isTypeDependent())
+    return true;
   QualType QT = Exp->getType();
   return QT->isBooleanType() || QT->isIntegerType();
 }
 
-/// Call \p Fn for every function that \p E calls or references.
-static void forEachReferencedFunction(
+/// Visit functions and variables referenced by \p E for constant evaluation.
+static void forEachReferencedConstantDecl(
     const Stmt *E,
-    llvm::function_ref<void(const FunctionDecl *, SourceLocation)> Fn) {
+    llvm::function_ref<void(const FunctionDecl *, SourceLocation)> FnCB,
+    llvm::function_ref<void(const VarDecl *, SourceLocation)> VarCB) {
   if (!E)
     return;
   if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
     if (const auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl()))
-      Fn(FD, DRE->getLocation());
+      FnCB(FD, DRE->getLocation());
+    else if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+      VarCB(VD, DRE->getLocation());
   } else if (const auto *ME = dyn_cast<MemberExpr>(E)) {
     if (const auto *FD = dyn_cast<FunctionDecl>(ME->getMemberDecl()))
-      Fn(FD, ME->getMemberLoc());
+      FnCB(FD, ME->getMemberLoc());
+    else if (const auto *VD = dyn_cast<VarDecl>(ME->getMemberDecl()))
+      VarCB(VD, ME->getMemberLoc());
   } else if (const auto *CE = dyn_cast<CXXConstructExpr>(E)) {
-    Fn(CE->getConstructor(), CE->getLocation());
+    FnCB(CE->getConstructor(), CE->getLocation());
+    if (const CXXDestructorDecl *DD =
+            CE->getConstructor()->getParent()->getDestructor())
+      FnCB(DD, CE->getLocation());
+  } else if (const auto *BTE = dyn_cast<CXXBindTemporaryExpr>(E)) {
+    if (const CXXDestructorDecl *DD = BTE->getTemporary()->getDestructor())
+      FnCB(DD, BTE->getBeginLoc());
   }
   for (const Stmt *Child : E->children())
-    forEachReferencedFunction(Child, Fn);
+    forEachReferencedConstantDecl(Child, FnCB, VarCB);
 }
 
 /// Attribute arguments are parsed in an unevaluated context. Hence, constexpr
-/// functions referenced by a thread safety attribute argument that must be a
-/// constant have not been instantiated. Mark the constexpr functions
-/// referenced by such an argument in a constant-evaluated context such that
-/// the argument can be evaluated. Other functions are left alone: these
-/// cannot occur in a constant expression and marking them would instantiate
-/// and odr-use them.
+/// functions, destructors, and variable templates referenced by a thread
+/// safety attribute argument that must be a constant have not been
+/// instantiated. Mark them referenced in a constant-evaluated context such that
+/// the argument can be evaluated, without instantiating or odr-using
+/// non-constant declarations.
 static void markThreadSafetyConstantArgReferenced(Sema &S, const Expr *Arg) {
   if (!Arg || Arg->isTypeDependent() || Arg->isValueDependent())
     return;
   EnterExpressionEvaluationContext ConstantEvaluated(
       S, Sema::ExpressionEvaluationContext::ConstantEvaluated);
-  forEachReferencedFunction(
-      Arg, [&](const FunctionDecl *FD, SourceLocation Loc) {
+  forEachReferencedConstantDecl(
+      Arg,
+      [&](const FunctionDecl *FD, SourceLocation Loc) {
         if (FD->isConstexpr())
           S.MarkFunctionReferenced(Loc, const_cast<FunctionDecl *>(FD));
+      },
+      [&](const VarDecl *VD, SourceLocation Loc) {
+        if (VD->mightBeUsableInConstantExpressions(S.Context))
+          S.MarkVariableReferenced(Loc, const_cast<VarDecl *>(VD));
       });
 }
 
-/// Returns whether \p Arg calls a constexpr function that has not been defined
-/// yet. That happens for constexpr member functions that are referenced by an
-/// attribute of a member of the same class: such attributes are parsed before
-/// the member function bodies. The analysis evaluates \p Arg once the bodies
-/// are available, so do not diagnose \p Arg as not being a constant.
-static bool callsUndefinedConstexprFunction(const Expr *Arg) {
+/// Returns whether \p Arg calls an inline constexpr member function whose body
+/// has not been parsed yet. That happens when a class member's attribute
+/// references a constexpr method of an enclosing or current class whose inline
+/// body is lexed later in the class definition; Sema re-validates the attribute
+/// once the inline method bodies have been parsed.
+static bool callsPendingInlineConstexprFunction(const Expr *Arg) {
   bool Result = false;
-  forEachReferencedFunction(Arg, [&](const FunctionDecl *FD, SourceLocation) {
-    // Not isDefined(): that also returns true for member functions whose
-    // body will be parsed later.
-    if (FD->isConstexpr() && !FD->hasBody())
-      Result = true;
-  });
+  forEachReferencedConstantDecl(
+      Arg,
+      [&](const FunctionDecl *FD, SourceLocation) {
+        if (!FD->isConstexpr() || FD->hasBody())
+          return;
+        if (FD->willHaveBody()) {
+          Result = true;
+          return;
+        }
+        if (const FunctionDecl *Pattern = FD->getTemplateInstantiationPattern();
+            Pattern && !Pattern->hasBody() && Pattern->willHaveBody())
+          Result = true;
+      },
+      [](const VarDecl *, SourceLocation) {});
   return Result;
 }
-
-/// Check that the success value of a try_acquire_capability or
-/// try_acquire_shared_capability attribute is a constant. The analysis
-/// ignores attributes with a success value that cannot be evaluated.
-static void checkTryAcquireCapabilitySuccessValue(Sema &S,
-                                                  const AttributeCommonInfo &AL,
-                                                  const Expr *Arg) {
-  if (!Arg || Arg->isTypeDependent() || Arg->isValueDependent())
-    return;
-  markThreadSafetyConstantArgReferenced(S, Arg);
-  bool Result;
-  if (Arg->isIntegerConstantExpr(S.Context) ||
-      Arg->EvaluateAsBooleanCondition(Result, S.Context) ||
-      callsUndefinedConstexprFunction(Arg))
-    return;
-  S.Diag(AL.getLoc(), diag::warn_thread_attribute_success_value_not_constant)
-      << AL << Arg->getSourceRange();
-}
-
 
 // Check to see if the type is a smart pointer of some kind.  We assume
 // it's a smart pointer if it defines both operator-> and operator*.
@@ -563,10 +569,33 @@ static bool checkThreadSafetyAttrSubject(Sema &S, Decl *D, const ParsedAttr &AL,
   return checkThreadSafetyValueDeclIsFunPtr(S, VD, AL);
 }
 
-static bool
-checkTryAcquireCapabilityRangeArg(Sema &S, const AttributeCommonInfo &AL,
-                                  const Expr *Arg, unsigned ArgNum,
-                                  std::optional<llvm::APSInt> &Val) {
+static std::optional<llvm::APSInt>
+evalTryAcquireCapabilityRangeArg(const Expr *Arg, const ASTContext &Ctx) {
+  if (auto Val = Arg->getIntegerConstantExpr(Ctx))
+    return Val;
+  // Attribute arguments are parsed in an unevaluated context without an
+  // enclosing ExprWithCleanups, which makes isCXX11ConstantExpr() reject
+  // temporaries with constexpr destructors. Fall back to constant RValue
+  // evaluation in C++11 and later while rejecting any notes or UB, matching
+  // Sema::VerifyIntegerConstantExpression().
+  if (!Ctx.getLangOpts().CPlusPlus11 ||
+      !Arg->getType()->isIntegralOrUnscopedEnumerationType())
+    return std::nullopt;
+  Expr::EvalResult EvalResult;
+  SmallVector<PartialDiagnosticAt, 4> Notes;
+  EvalResult.Diag = &Notes;
+  if (Arg->EvaluateAsInt(EvalResult, Ctx, Expr::SE_NoSideEffects,
+                         /*InConstantContext=*/true) &&
+      !EvalResult.HasUndefinedBehavior && Notes.empty())
+    return EvalResult.Val.getInt();
+  return std::nullopt;
+}
+
+static bool checkTryAcquireCapabilityRangeArg(Sema &S,
+                                              const AttributeCommonInfo &AL,
+                                              const Expr *Arg, unsigned ArgNum,
+                                              std::optional<llvm::APSInt> &Val,
+                                              bool *DeferredConstexpr) {
   if (!Arg->isTypeDependent() &&
       (Arg->getType()->isBooleanType() ||
        !Arg->getType()->isIntegralOrUnscopedEnumerationType())) {
@@ -580,12 +609,12 @@ checkTryAcquireCapabilityRangeArg(Sema &S, const AttributeCommonInfo &AL,
     return true;
 
   markThreadSafetyConstantArgReferenced(S, Arg);
-  Val = Arg->getIntegerConstantExpr(S.Context);
+  Val = evalTryAcquireCapabilityRangeArg(Arg, S.Context);
   if (!Val) {
-    // The analysis evaluates the bound once the constexpr functions it calls
-    // have been defined.
-    if (callsUndefinedConstexprFunction(Arg))
+    if (DeferredConstexpr && callsPendingInlineConstexprFunction(Arg)) {
+      *DeferredConstexpr = true;
       return true;
+    }
     S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
         << AL << ArgNum << AANT_ArgumentIntegerConstant
         << Arg->getSourceRange();
@@ -595,13 +624,11 @@ checkTryAcquireCapabilityRangeArg(Sema &S, const AttributeCommonInfo &AL,
   return true;
 }
 
-/// Returns the return type of the function, Objective-C method, function
-/// pointer or function reference D, or a null type if D is none of these.
+/// Returns the return type of the function, function pointer, or function
+/// reference D, or a null type if D is none of these.
 static QualType getThreadSafetyAttrReturnType(const Decl *D) {
   if (const auto *FD = dyn_cast<FunctionDecl>(D))
     return FD->getReturnType();
-  if (const auto *MD = dyn_cast<ObjCMethodDecl>(D))
-    return MD->getReturnType();
   if (const auto *VD = dyn_cast<ValueDecl>(D)) {
     QualType T = VD->getType().getNonReferenceType();
     if (const auto *PT = T->getAs<PointerType>())
@@ -612,37 +639,80 @@ static QualType getThreadSafetyAttrReturnType(const Decl *D) {
   return QualType();
 }
 
-static bool checkTryAcquireCapabilityRangeBounds(Sema &S, const Decl *D,
-                                                 const AttributeCommonInfo &AL,
-                                                 const Expr *FirstExpr,
-                                                 const Expr *LastExpr) {
-  std::optional<llvm::APSInt> FirstVal, LastVal;
-  if (!checkTryAcquireCapabilityRangeArg(S, AL, FirstExpr, 1, FirstVal) ||
-      !checkTryAcquireCapabilityRangeArg(S, AL, LastExpr, 2, LastVal))
-    return false;
+static bool isTryAcquireCapabilityReturnType(QualType RetTy) {
+  return RetTy->isIntegralOrEnumerationType() || RetTy->isEnumeralType() ||
+         RetTy->isAnyPointerType();
+}
 
-  if (FirstVal && LastVal &&
-      llvm::APSInt::compareValues(*FirstVal, *LastVal) > 0) {
-    S.Diag(AL.getLoc(), diag::err_attribute_empty_range)
-        << AL << toString(*FirstVal, 10) << toString(*LastVal, 10)
-        << FirstExpr->getSourceRange() << LastExpr->getSourceRange();
-    return false;
-  }
+static bool isTryAcquireCapabilityRangeReturnType(QualType RetTy) {
+  return (!RetTy->isBooleanType() &&
+          RetTy->isIntegralOrUnscopedEnumerationType()) ||
+         RetTy->isAnyPointerType();
+}
 
-  // The analysis compares the return value with the range. Hence, the return
-  // type must be an integer, unscoped enumeration, or pointer type and the
-  // range must contain at least one value of the return type (with pointers
-  // modeled in the uintptr_t domain).
+static bool checkTryAcquireCapabilityReturnType(Sema &S, const Decl *D,
+                                                const AttributeCommonInfo &AL) {
   QualType RetTy = getThreadSafetyAttrReturnType(D);
   if (RetTy.isNull() || RetTy->isDependentType() || RetTy->isUndeducedType())
     return true;
-  if (!RetTy->isIntegralOrUnscopedEnumerationType() &&
-      !RetTy->isAnyPointerType()) {
-    S.Diag(AL.getLoc(), diag::warn_thread_attribute_range_return_type)
+  if (!isTryAcquireCapabilityReturnType(RetTy)) {
+    S.Diag(AL.getLoc(), diag::err_thread_attribute_trylock_return_type)
+        << AL << RetTy;
+    return false;
+  }
+  return true;
+}
+
+/// Check the return type and success value of a try_acquire_capability or
+/// try_acquire_shared_capability attribute.
+static bool checkTryAcquireCapabilitySuccessValue(
+    Sema &S, const Decl *D, const AttributeCommonInfo &AL, const Expr *Arg,
+    bool *DeferredConstexpr = nullptr) {
+  if (!Arg)
+    return false;
+  if (!isIntOrBool(Arg)) {
+    S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
+        << AL << 1 << AANT_ArgumentIntOrBool << Arg->getSourceRange();
+    return false;
+  }
+  if (!checkTryAcquireCapabilityReturnType(S, D, AL))
+    return false;
+  if (Arg->isTypeDependent() || Arg->isValueDependent())
+    return true;
+
+  markThreadSafetyConstantArgReferenced(S, Arg);
+  Expr::EvalResult EvalResult;
+  if (Arg->EvaluateAsInt(EvalResult, S.Context, Expr::SE_NoSideEffects,
+                         /*InConstantContext=*/true))
+    return true;
+  if (DeferredConstexpr && callsPendingInlineConstexprFunction(Arg)) {
+    *DeferredConstexpr = true;
+    return true;
+  }
+  S.Diag(AL.getLoc(), diag::warn_thread_attribute_success_value_not_constant)
+      << AL << Arg->getSourceRange();
+  return false;
+}
+
+static bool checkTryAcquireCapabilityRangeReturnType(
+    Sema &S, const Decl *D, const AttributeCommonInfo &AL,
+    const Expr *FirstExpr, const Expr *LastExpr,
+    std::optional<llvm::APSInt> FirstVal, std::optional<llvm::APSInt> LastVal) {
+  // The analysis compares the return value with the range. Hence, the return
+  // type must be a non-boolean integer, unscoped enumeration, or pointer type
+  // and the range must contain at least one value of the return type (with
+  // pointers modeled in the uintptr_t domain).
+  QualType RetTy = getThreadSafetyAttrReturnType(D);
+  if (RetTy.isNull() || RetTy->isDependentType() || RetTy->isUndeducedType())
+    return true;
+  if (!isTryAcquireCapabilityRangeReturnType(RetTy)) {
+    S.Diag(AL.getLoc(), diag::err_thread_attribute_range_return_type)
         << AL << RetTy;
     return false;
   }
   if (FirstVal && LastVal) {
+    if (const auto *ED = RetTy->getAsEnumDecl(); ED && !ED->isComplete())
+      return true;
     QualType BoundTy =
         RetTy->isAnyPointerType() ? S.Context.getUIntPtrType() : RetTy;
     unsigned Width = S.Context.getIntWidth(BoundTy);
@@ -657,46 +727,179 @@ static bool checkTryAcquireCapabilityRangeBounds(Sema &S, const Decl *D,
       return false;
     }
   }
-
   return true;
 }
 
-bool Sema::checkInstantiatedThreadSafetyAttrs(const Decl *D, const Attr *A) {
+static bool checkTryAcquireCapabilityRangeBounds(
+    Sema &S, const Decl *D, const AttributeCommonInfo &AL,
+    const Expr *FirstExpr, const Expr *LastExpr,
+    bool *DeferredConstexpr = nullptr) {
+  std::optional<llvm::APSInt> FirstVal, LastVal;
+  if (!checkTryAcquireCapabilityRangeArg(S, AL, FirstExpr, 1, FirstVal,
+                                         DeferredConstexpr) ||
+      !checkTryAcquireCapabilityRangeArg(S, AL, LastExpr, 2, LastVal,
+                                         DeferredConstexpr))
+    return false;
+
+  if (FirstVal && LastVal &&
+      llvm::APSInt::compareValues(*FirstVal, *LastVal) > 0) {
+    S.Diag(AL.getLoc(), diag::err_attribute_empty_range)
+        << AL << toString(*FirstVal, 10) << toString(*LastVal, 10)
+        << FirstExpr->getSourceRange() << LastExpr->getSourceRange();
+    return false;
+  }
+
+  return checkTryAcquireCapabilityRangeReturnType(S, D, AL, FirstExpr, LastExpr,
+                                                  FirstVal, LastVal);
+}
+
+static bool threadSafetyAttrHasCapArgs(const Attr *A) {
+  if (const auto *AC = dyn_cast<AcquireCapabilityAttr>(A))
+    return AC->args_size() != 0;
+  if (const auto *TAC = dyn_cast<TryAcquireCapabilityAttr>(A))
+    return TAC->args_size() != 0;
+  if (const auto *TACR = dyn_cast<TryAcquireCapabilityRangeAttr>(A))
+    return TACR->args_size() != 0;
+  if (const auto *RC = dyn_cast<ReleaseCapabilityAttr>(A))
+    return RC->args_size() != 0;
+  if (const auto *ASC = dyn_cast<AssertCapabilityAttr>(A))
+    return ASC->args_size() != 0;
+  if (const auto *RQC = dyn_cast<RequiresCapabilityAttr>(A))
+    return RQC->args_size() != 0;
+  if (const auto *LE = dyn_cast<LocksExcludedAttr>(A))
+    return LE->args_size() != 0;
+  return false;
+}
+
+bool Sema::checkInstantiatedThreadSafetyAttrs(Decl *D, Attr *A,
+                                              const Attr *TmplAttr) {
   if (!isa<AssertCapabilityAttr, AcquireCapabilityAttr,
            TryAcquireCapabilityAttr, TryAcquireCapabilityRangeAttr,
            ReleaseCapabilityAttr, RequiresCapabilityAttr, LocksExcludedAttr,
            LockReturnedAttr>(A))
     return true;
 
-  if (const auto *TAC = dyn_cast<TryAcquireCapabilityAttr>(A))
-    checkTryAcquireCapabilitySuccessValue(*this, *TAC, TAC->getSuccessValue());
-
-  if (const auto *TACR = dyn_cast<TryAcquireCapabilityRangeAttr>(A)) {
-    if (TACR->getFirstSuccessValue() && TACR->getLastSuccessValue() &&
-        !checkTryAcquireCapabilityRangeBounds(*this, D, *TACR,
-                                              TACR->getFirstSuccessValue(),
-                                              TACR->getLastSuccessValue()))
+  bool DeferredConstexpr = false;
+  if (const auto *TAC = dyn_cast<TryAcquireCapabilityAttr>(A)) {
+    if (!checkTryAcquireCapabilitySuccessValue(
+            *this, D, *TAC, TAC->getSuccessValue(), &DeferredConstexpr))
       return false;
   }
 
-  const auto *VD = dyn_cast<ValueDecl>(D);
-  if (!VD)
-    return true;
-
-  // Parameters of template functions need to be re-checked during
-  // instantiation because their types might have been dependent.
-  // lock_returned does not apply to scoped_lockable references.
-  if (const auto *PVD = dyn_cast<ParmVarDecl>(VD);
-      PVD && !isa<LockReturnedAttr>(A)) {
-    if (isCallbackOrDependent(PVD->getType()))
-      return true;
-    return checkFunParamsAreScopedLockable(*this, PVD, *A);
+  if (const auto *TACR = dyn_cast<TryAcquireCapabilityRangeAttr>(A)) {
+    if (TACR->getFirstSuccessValue() && TACR->getLastSuccessValue() &&
+        !checkTryAcquireCapabilityRangeBounds(
+            *this, D, *TACR, TACR->getFirstSuccessValue(),
+            TACR->getLastSuccessValue(), &DeferredConstexpr))
+      return false;
   }
 
-  if (isa<FunctionDecl>(VD))
-    return true;
+  if (const auto *VD = dyn_cast<ValueDecl>(D)) {
+    // Parameters of template functions need to be re-checked during
+    // instantiation because their types might have been dependent.
+    // Only acquire/release/requires/locks_excluded apply to scoped_lockable
+    // references; the others require function pointers or references.
+    if (const auto *PVD = dyn_cast<ParmVarDecl>(VD);
+        PVD && isa<AcquireCapabilityAttr, ReleaseCapabilityAttr,
+                   RequiresCapabilityAttr, LocksExcludedAttr>(A)) {
+      if (!isCallbackOrDependent(PVD->getType()) &&
+          !checkFunParamsAreScopedLockable(*this, PVD, *A))
+        return false;
+    } else if (!isa<FunctionDecl>(VD) &&
+               !checkThreadSafetyValueDeclIsFunPtr(*this, VD, *A)) {
+      return false;
+    }
+  }
 
-  return checkThreadSafetyValueDeclIsFunPtr(*this, VD, *A);
+  // An explicit variadic capability pack (e.g. mus...) that expanded to zero
+  // arguments acquires no capabilities and must not be mistaken for an
+  // implicit 'this' capability argument.
+  if (TmplAttr && threadSafetyAttrHasCapArgs(TmplAttr) &&
+      !threadSafetyAttrHasCapArgs(A))
+    return false;
+
+  if (DeferredConstexpr)
+    DelayedTryAcquireAttrs.push_back({D, A});
+  return true;
+}
+
+void Sema::finishDelayedThreadSafetyChecks(bool Force) {
+  if (!DelayedTryAcquireAttrs.empty()) {
+    SmallVector<std::pair<Decl *, Attr *>, 4> WorkList;
+    std::swap(DelayedTryAcquireAttrs, WorkList);
+    for (auto [D, A] : WorkList) {
+      if (!D->hasAttrs() || !llvm::is_contained(D->getAttrs(), A))
+        continue;
+      bool StillDeferred = false;
+      bool Valid = true;
+      if (const auto *TAC = dyn_cast<TryAcquireCapabilityAttr>(A)) {
+        Valid = checkTryAcquireCapabilitySuccessValue(
+            *this, D, *TAC, TAC->getSuccessValue(),
+            Force ? nullptr : &StillDeferred);
+      } else if (const auto *TACR =
+                     dyn_cast<TryAcquireCapabilityRangeAttr>(A)) {
+        Valid = checkTryAcquireCapabilityRangeBounds(
+            *this, D, *TACR, TACR->getFirstSuccessValue(),
+            TACR->getLastSuccessValue(), Force ? nullptr : &StillDeferred);
+      }
+      if (StillDeferred) {
+        DelayedTryAcquireAttrs.push_back({D, A});
+      } else if (!Valid) {
+        for (Decl *Redecl : D->redecls())
+          if (Redecl->hasAttrs())
+            llvm::erase_if(Redecl->getAttrs(), [&](const Attr *RA) {
+              return RA == A || (RA->getKind() == A->getKind() &&
+                                 RA->getRange() == A->getRange());
+            });
+      }
+    }
+  }
+
+  if ((Force || DelayedTryAcquireAttrs.empty()) &&
+      !DelayedThreadSafetyDecls.empty()) {
+    SmallVector<DelayedThreadSafetyDecl, 4> Decls;
+    std::swap(DelayedThreadSafetyDecls, Decls);
+    for (const DelayedThreadSafetyDecl &Entry : Decls)
+      AnalysisWarnings.IssueDelayedThreadSafetyWarnings(
+          Entry.D, Entry.IssueBeta, Entry.Verbose);
+  }
+}
+
+void Sema::checkDeducedFunctionThreadSafetyAttrs(FunctionDecl *FD) {
+  if (!FD || !FD->hasAttrs())
+    return;
+  QualType RetTy = FD->getReturnType();
+  if (RetTy.isNull() || RetTy->isDependentType() || RetTy->isUndeducedType())
+    return;
+
+  SmallVector<Attr *, 2> InvalidAttrs;
+  for (Attr *A : FD->getAttrs()) {
+    if (const auto *TAC = dyn_cast<TryAcquireCapabilityAttr>(A)) {
+      if (!checkTryAcquireCapabilityReturnType(*this, FD, *TAC))
+        InvalidAttrs.push_back(A);
+    } else if (const auto *TACR = dyn_cast<TryAcquireCapabilityRangeAttr>(A)) {
+      const Expr *FirstE = TACR->getFirstSuccessValue();
+      const Expr *LastE = TACR->getLastSuccessValue();
+      std::optional<llvm::APSInt> FirstVal, LastVal;
+      if (FirstE && !FirstE->isTypeDependent() && !FirstE->isValueDependent())
+        FirstVal = evalTryAcquireCapabilityRangeArg(FirstE, Context);
+      if (LastE && !LastE->isTypeDependent() && !LastE->isValueDependent())
+        LastVal = evalTryAcquireCapabilityRangeArg(LastE, Context);
+      if (!checkTryAcquireCapabilityRangeReturnType(*this, FD, *TACR, FirstE,
+                                                    LastE, FirstVal, LastVal))
+        InvalidAttrs.push_back(A);
+    }
+  }
+
+  for (Attr *Invalid : InvalidAttrs) {
+    for (Decl *Redecl : FD->redecls()) {
+      if (Redecl->hasAttrs())
+        llvm::erase_if(Redecl->getAttrs(), [&](const Attr *RA) {
+          return RA == Invalid || (RA->getKind() == Invalid->getKind() &&
+                                   RA->getRange() == Invalid->getRange());
+        });
+    }
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -856,19 +1059,18 @@ static void handleAllocSizeAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 /// which has two success value arguments.
 static bool checkTryLockFunAttrCommon(Sema &S, Decl *D, const ParsedAttr &AL,
                                       SmallVectorImpl<Expr *> &Args,
-                                      unsigned NumSuccessArgs) {
+                                      unsigned NumSuccessArgs,
+                                      bool &DeferredConstexpr) {
   if (!AL.checkAtLeastNumArgs(S, NumSuccessArgs))
     return false;
 
   if (NumSuccessArgs == 1) {
-    if (!isIntOrBool(AL.getArgAsExpr(0))) {
-      S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
-          << AL << 1 << AANT_ArgumentIntOrBool;
+    if (!checkTryAcquireCapabilitySuccessValue(S, D, AL, AL.getArgAsExpr(0),
+                                               &DeferredConstexpr))
       return false;
-    }
-    checkTryAcquireCapabilitySuccessValue(S, AL, AL.getArgAsExpr(0));
   } else if (!checkTryAcquireCapabilityRangeBounds(S, D, AL, AL.getArgAsExpr(0),
-                                                   AL.getArgAsExpr(1))) {
+                                                   AL.getArgAsExpr(1),
+                                                   &DeferredConstexpr)) {
     return false;
   }
 
@@ -7123,17 +7325,22 @@ static void handleTryAcquireCapabilityAttr(Sema &S, Decl *D,
     return;
 
   bool IsRange = AL.getKind() == ParsedAttr::AT_TryAcquireCapabilityRange;
+  bool DeferredConstexpr = false;
   SmallVector<Expr *, 2> Args;
-  if (!checkTryLockFunAttrCommon(S, D, AL, Args, IsRange ? 2 : 1))
+  if (!checkTryLockFunAttrCommon(S, D, AL, Args, IsRange ? 2 : 1,
+                                 DeferredConstexpr))
     return;
 
-  if (IsRange)
-    D->addAttr(::new (S.Context) TryAcquireCapabilityRangeAttr(
-        S.Context, AL, AL.getArgAsExpr(0), AL.getArgAsExpr(1), Args.data(),
-        Args.size()));
-  else
-    D->addAttr(::new (S.Context) TryAcquireCapabilityAttr(
-        S.Context, AL, AL.getArgAsExpr(0), Args.data(), Args.size()));
+  Attr *NewAttr =
+      IsRange
+          ? static_cast<Attr *>(::new (S.Context) TryAcquireCapabilityRangeAttr(
+                S.Context, AL, AL.getArgAsExpr(0), AL.getArgAsExpr(1),
+                Args.data(), Args.size()))
+          : static_cast<Attr *>(::new (S.Context) TryAcquireCapabilityAttr(
+                S.Context, AL, AL.getArgAsExpr(0), Args.data(), Args.size()));
+  D->addAttr(NewAttr);
+  if (DeferredConstexpr)
+    S.DelayedTryAcquireAttrs.push_back({D, NewAttr});
 }
 
 static void handleReleaseCapabilityAttr(Sema &S, Decl *D,
@@ -7863,15 +8070,21 @@ ProcessDeclAttribute(Sema &S, Decl *D, const ParsedAttr &AL,
     }
   }
 
-  // The bounds of a try_acquire_capability_range attribute must be integer
-  // constants. Reject pack expansions in the bound positions since these
-  // would delay the arguments and bypass the range validation.
-  if (AL.getKind() == ParsedAttr::AT_TryAcquireCapabilityRange) {
-    for (unsigned I = 0, E = std::min(AL.getNumArgs(), 2u); I != E; ++I) {
+  // The success values and bounds of try_acquire_capability and
+  // try_acquire_capability_range attributes must be single constant
+  // expressions. Reject pack expansions in those positions since they would
+  // delay the arguments and bypass validation.
+  if (AL.getKind() == ParsedAttr::AT_TryAcquireCapability ||
+      AL.getKind() == ParsedAttr::AT_TryAcquireCapabilityRange) {
+    bool IsRange = AL.getKind() == ParsedAttr::AT_TryAcquireCapabilityRange;
+    unsigned NumSuccessArgs = IsRange ? 2u : 1u;
+    for (unsigned I = 0, E = std::min(AL.getNumArgs(), NumSuccessArgs); I != E;
+         ++I) {
       if (!AL.isArgExpr(I) || !isa<PackExpansionExpr>(AL.getArgAsExpr(I)))
         continue;
       S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
-          << AL << I + 1 << AANT_ArgumentIntegerConstant
+          << AL << I + 1
+          << (IsRange ? AANT_ArgumentIntegerConstant : AANT_ArgumentIntOrBool)
           << AL.getArgAsExpr(I)->getSourceRange();
       return;
     }

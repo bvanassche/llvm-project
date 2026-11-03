@@ -1,6 +1,7 @@
 // RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety %s
 // RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -std=c++98 %s
 // RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -std=c++11 %s
+// RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -std=c++20 %s
 
 #define LOCKABLE            __attribute__ ((lockable))
 #define REENTRANT_CAPABILITY __attribute__ ((reentrant_capability))
@@ -782,9 +783,9 @@ template int slf_variadic_template<Mutex, UnlockableMu>(Mutex&, UnlockableMu&);
 void etf_function() __attribute__((exclusive_trylock_function)); // \
   // expected-error {{'exclusive_trylock_function' attribute takes at least 1 argument}}
 
-void etf_function_args() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu2);
+int etf_function_args() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu2);
 
-void etf_function_arg() EXCLUSIVE_TRYLOCK_FUNCTION(1); // \
+int etf_function_arg() EXCLUSIVE_TRYLOCK_FUNCTION(1); // \
   // expected-warning {{'exclusive_trylock_function' attribute without capability arguments can only be applied to non-static methods of a class}}
 
 int etf_testfn(int y) EXCLUSIVE_TRYLOCK_FUNCTION(1); // \
@@ -803,7 +804,7 @@ class EtfFoo {
  private:
   int test_field EXCLUSIVE_TRYLOCK_FUNCTION(1); // \
     // expected-warning {{'exclusive_trylock_function' attribute on a field requires the field to be of function pointer type}}
-  void test_method() EXCLUSIVE_TRYLOCK_FUNCTION(1); // \
+  int test_method() EXCLUSIVE_TRYLOCK_FUNCTION(1); // \
     // expected-warning {{'exclusive_trylock_function' attribute without capability arguments refers to 'this', but 'EtfFoo' isn't annotated with 'capability' or 'scoped_lockable' attribute}}
 };
 
@@ -890,9 +891,9 @@ template int etf_variadic_template<Mutex, UnlockableMu>(Mutex&, UnlockableMu&);
 void stf_function() __attribute__((shared_trylock_function));  // \
   // expected-error {{'shared_trylock_function' attribute takes at least 1 argument}}
 
-void stf_function_args() SHARED_TRYLOCK_FUNCTION(1, mu2);
+int stf_function_args() SHARED_TRYLOCK_FUNCTION(1, mu2);
 
-void stf_function_arg() SHARED_TRYLOCK_FUNCTION(1); // \
+int stf_function_arg() SHARED_TRYLOCK_FUNCTION(1); // \
   // expected-warning {{'shared_trylock_function' attribute without capability arguments can only be applied to non-static methods of a class}}
 
 int stf_testfn(int y) SHARED_TRYLOCK_FUNCTION(1); // \
@@ -915,7 +916,7 @@ class StfFoo {
  private:
   int test_field SHARED_TRYLOCK_FUNCTION(1); // \
     // expected-warning {{'shared_trylock_function' attribute on a field requires the field to be of function pointer type}}
-  void test_method() SHARED_TRYLOCK_FUNCTION(1); // \
+  int test_method() SHARED_TRYLOCK_FUNCTION(1); // \
     // expected-warning {{'shared_trylock_function' attribute without capability arguments refers to 'this', but 'StfFoo' isn't annotated with 'capability' or 'scoped_lockable' attribute}}
 };
 
@@ -1786,7 +1787,7 @@ void (*fp_assert)(void) ASSERT_EXCLUSIVE_LOCK(mu1);
 Mutex *(*fp_returned)(void) LOCK_RETURNED(&mu1);
 void (*fp_shared_lock)(void) SHARED_LOCK_FUNCTION(mu1);
 void (*fp_shared_require)(void) SHARED_LOCKS_REQUIRED(mu1);
-void (*fp_shared_trylock)(void) SHARED_TRYLOCK_FUNCTION(true, mu1);
+bool (*fp_shared_trylock)(void) SHARED_TRYLOCK_FUNCTION(true, mu1);
 
 struct FPFields {
   void (*lock)(void) EXCLUSIVE_LOCK_FUNCTION(mu1);
@@ -1959,13 +1960,29 @@ unsigned tacr_ret_unsigned() TRY_ACQUIRE_RANGE(-1, 0, mu1);
 void *tacr_ret_ptr() TRY_ACQUIRE_RANGE(1, 1, mu1);
 void *(*tacr_fp_ret_ptr)(void) TRY_ACQUIRE_RANGE(0, (__UINTPTR_TYPE__)-4096, mu1);
 void tacr_ret_void() TRY_ACQUIRE_RANGE(0, 0, mu1); // \
-  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'void'}}
+  // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'void'}}
+bool tacr_ret_bool() TRY_ACQUIRE_RANGE(0, 1, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'bool'}}
 double tacr_ret_double() TRY_ACQUIRE_RANGE(0, 1, mu1); // \
-  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'double'}}
+  // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'double'}}
 int RangeNonLockable::*tacr_ret_memptr() TRY_ACQUIRE_RANGE(0, 1, mu1); // \
-  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'int RangeNonLockable::*'}}
+  // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'int RangeNonLockable::*'}}
 void (*tacr_fp_ret_void)(void) TRY_ACQUIRE_RANGE(0, 0, mu1); // \
-  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'void'}}
+  // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'void'}}
+void tac_ret_void() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu1); // \
+  // expected-error {{'exclusive_trylock_function' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'void'}}
+float tac_ret_float() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu1); // \
+  // expected-error {{'exclusive_trylock_function' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'float'}}
+double tac_ret_double() SHARED_TRYLOCK_FUNCTION(1, mu1); // \
+  // expected-error {{'shared_trylock_function' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'double'}}
+RangeNonLockable tac_ret_struct() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu1); // \
+  // expected-error {{'exclusive_trylock_function' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'RangeNonLockable'}}
+int RangeNonLockable::*tac_ret_memptr() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu1); // \
+  // expected-error {{'exclusive_trylock_function' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'int RangeNonLockable::*'}}
+void (*tac_fp_ret_void)(void) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu1); // \
+  // expected-error {{'exclusive_trylock_function' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'void'}}
+RangeEnum tac_ret_enum() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu1);
+void *tac_ret_ptr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu1);
 unsigned tacr_ret_unsigned_neg() TRY_ACQUIRE_RANGE(-2, -1, mu1); // \
   // expected-warning {{'try_acquire_capability_range' attribute range [-2, -1] does not contain any value of return type 'unsigned int'}}
 void *tacr_ret_ptr_neg() TRY_ACQUIRE_RANGE(-2, -1, mu1); // \
@@ -1979,7 +1996,7 @@ signed char tacr_ret_schar() TRY_ACQUIRE_SHARED_RANGE(128, 300, mu1); // \
 // tests that verify the implementation of template trylock functions.
 template <typename T>
 T tacr_template_ret() TRY_ACQUIRE_RANGE(0, 0, mu1) { return T(); } // \
-  // expected-warning {{'try_acquire_capability_range' attribute only applies to functions that return an integer, unscoped enumeration, or pointer type; type here is 'double'}}
+  // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'double'}}
 template int tacr_template_ret<int>();
 template void *tacr_template_ret<void *>();
 template double tacr_template_ret<double>(); // \
@@ -2071,6 +2088,74 @@ int StaticThisCheck::s5() TRY_ACQUIRE_RANGE(this->bound(), 1, mu1) { return 0; }
   // expected-error {{invalid use of 'this' outside of a non-static member function}}
 int StaticThisCheck::s6() TRY_ACQUIRE_RANGE(0, bound(), mu1) { return 0; } // \
   // expected-error {{call to non-static member function without an object argument}}
+
+int side_effect_fn();
+int etf_side_effect_comma() EXCLUSIVE_TRYLOCK_FUNCTION((side_effect_fn(), 1), mu1); // \
+  // expected-warning {{'exclusive_trylock_function' attribute success value is not a constant expression; ignoring the attribute}}
+
+ScopedEnum tac_ret_scoped_enum() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu1);
+ScopedEnum tacr_ret_scoped_enum() TRY_ACQUIRE_RANGE(0, 1, mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'ScopedEnum'}}
+
+template <int... Bs>
+int tac_pack_success() EXCLUSIVE_TRYLOCK_FUNCTION(Bs..., mu1); // \
+  // expected-error {{'exclusive_trylock_function' attribute requires parameter 1 to be int or bool}}
+
+class SCOPED_LOCKABLE ScopedLockForParam {};
+template <typename T>
+struct DependentRangeParam {
+  void f(T p TRY_ACQUIRE_RANGE(0, 1, mu1)); // \
+    // expected-warning {{'try_acquire_capability_range' attribute on a variable requires the variable to be of function pointer type}}
+};
+DependentRangeParam<GoodTryLockRangeFn> dep_range_param_ok;
+DependentRangeParam<ScopedLockForParam &> dep_range_param_bad; // \
+  // expected-note {{in instantiation of template class 'TryAcquireRangeParsing::DependentRangeParam<TryAcquireRangeParsing::ScopedLockForParam &>' requested here}}
+
+constexpr int fwd_lo();
+constexpr int fwd_hi();
+int tacr_fwd_constexpr(int x) TRY_ACQUIRE_RANGE(fwd_lo() + x, fwd_hi(), mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 1 to be an integer constant}}
+int tacr_fwd_constexpr_undef() TRY_ACQUIRE_RANGE(0, fwd_hi(), mu1); // \
+  // expected-error {{'try_acquire_capability_range' attribute requires parameter 2 to be an integer constant}}
+constexpr int fwd_lo() { return 10; }
+constexpr int fwd_hi() { return 5; }
+
+struct LateInvalidMemberBound {
+  Mutex mu;
+  int tryLockBadRange() TRY_ACQUIRE_RANGE(badLo(), badHi(), mu); // \
+    // expected-error {{'try_acquire_capability_range' attribute range [10, 5] is empty}}
+  int tryLockBadVal(int p) EXCLUSIVE_TRYLOCK_FUNCTION(badOk() && p, mu); // \
+    // expected-warning {{'exclusive_trylock_function' attribute success value is not a constant expression; ignoring the attribute}}
+  static constexpr int badLo() { return 10; }
+  static constexpr int badHi() { return 5; }
+  static constexpr bool badOk() { return true; }
+};
+
+#if __cplusplus >= 201402L
+template <typename T> constexpr T kZeroTmpl = 0;
+int tacr_var_tmpl() TRY_ACQUIRE_RANGE(kZeroTmpl<int>, kZeroTmpl<int> + 1, mu1);
+bool tac_var_tmpl() EXCLUSIVE_TRYLOCK_FUNCTION(!kZeroTmpl<int>, mu1);
+
+auto tacr_auto_ok() TRY_ACQUIRE_RANGE(0, 1, mu1) { return 0; }
+auto tacr_auto_double() TRY_ACQUIRE_RANGE(0, 1, mu1) { return 3.14; } // \
+  // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'double'}}
+auto tacr_auto_bool() TRY_ACQUIRE_RANGE(0, 1, mu1) { return true; } // \
+  // expected-error {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'bool'}}
+auto tac_auto_void() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu1) {} // \
+  // expected-error {{'exclusive_trylock_function' attribute only applies to functions and function pointers or references that return a boolean, integer, enumeration, or pointer type; type here is 'void'}}
+auto tacr_auto_out_of_range() TRY_ACQUIRE_RANGE(200, 300, mu1) { return (signed char)0; } // \
+  // expected-warning {{'try_acquire_capability_range' attribute range [200, 300] does not contain any value of return type 'signed char'}}
+#endif
+
+#if __cplusplus >= 202002L
+template <typename T>
+struct ConstexprDtorBox {
+  T v;
+  constexpr ~ConstexprDtorBox() {}
+};
+int tacr_constexpr_dtor()
+    TRY_ACQUIRE_RANGE(kZeroTmpl<int>, ConstexprDtorBox<int>{1}.v, mu1);
+#endif
 #endif
 
 } // namespace TryAcquireRangeParsing

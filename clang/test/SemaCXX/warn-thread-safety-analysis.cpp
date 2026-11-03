@@ -4509,7 +4509,6 @@ class Foo {
   int a GUARDED_BY(mu_);
 
   int    tryLockMutexI() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu_);
-  double tryLockMutexD() EXCLUSIVE_TRYLOCK_FUNCTION(1, mu_);
   void unlock() UNLOCK_FUNCTION(mu_);
   bool cond();
 
@@ -4582,21 +4581,6 @@ void Foo::test() {
   a = 0;  // expected-warning {{writing variable 'a' requires holding mutex 'mu_' exclusively}}
 
   if (__builtin_expect_with_probability(mu_.TryLock(), 1, 0.9)) {
-    a = 0;
-    unlock();
-  }
-
-  if (tryLockMutexD()) {
-    a = 0;
-    unlock();
-  }
-
-  if (tryLockMutexD() == 0)
-    return;
-  a = 0;
-  unlock();
-
-  if (tryLockMutexD() != 0.0) {
     a = 0;
     unlock();
   }

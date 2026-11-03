@@ -8275,9 +8275,10 @@ TEST_P(ImportAttributes, ImportAcquireCapability) {
 TEST_P(ImportAttributes, ImportTryAcquireCapability) {
   TryAcquireCapabilityAttr *FromAttr, *ToAttr;
   importAttr<FunctionDecl>(
-      "void test(int A1, int A2) __attribute__((try_acquire_capability(1, A1, "
+      "int test(int A1, int A2) __attribute__((try_acquire_capability(1, A1, "
       "A2)));",
       FromAttr, ToAttr);
+  EXPECT_EQ(FromAttr->isShared(), ToAttr->isShared());
   checkImported(FromAttr->getSuccessValue(), ToAttr->getSuccessValue());
   checkImportVariadicArg(FromAttr->args(), ToAttr->args());
 }
@@ -8288,10 +8289,24 @@ TEST_P(ImportAttributes, ImportTryAcquireCapabilityRange) {
       "int test(int A1, int A2) "
       "__attribute__((try_acquire_capability_range(0, 1, A1, A2)));",
       FromAttr, ToAttr);
+  EXPECT_FALSE(ToAttr->isShared());
   checkImported(FromAttr->getFirstSuccessValue(),
                 ToAttr->getFirstSuccessValue());
   checkImported(FromAttr->getLastSuccessValue(), ToAttr->getLastSuccessValue());
   checkImportVariadicArg(FromAttr->args(), ToAttr->args());
+
+  TryAcquireCapabilityRangeAttr *FromShared, *ToShared;
+  importAttr<CXXMethodDecl>(
+      "struct __attribute__((capability(\"mutex\"))) S { "
+      "int test() __attribute__((try_acquire_shared_capability_range(0, 1))); "
+      "};",
+      FromShared, ToShared);
+  EXPECT_TRUE(ToShared->isShared());
+  EXPECT_EQ(0u, ToShared->args_size());
+  checkImported(FromShared->getFirstSuccessValue(),
+                ToShared->getFirstSuccessValue());
+  checkImported(FromShared->getLastSuccessValue(),
+                ToShared->getLastSuccessValue());
 }
 
 TEST_P(ImportAttributes, ImportReleaseCapability) {

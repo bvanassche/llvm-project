@@ -1,4 +1,5 @@
 // RUN: %clang_cc1 -std=c++11 %s -verify -Wthread-safety-analysis
+// RUN: %clang_cc1 -std=c++20 %s -verify -Wthread-safety-analysis
 
 class Mutex {
 public:
@@ -146,5 +147,78 @@ int tryRangeNonDepBad() // expected-note {{mutex acquired here}}
 }
 template int tryRangeNonDep<int>(bool);
 template int tryRangeNonDepBad<int>(); // expected-note {{in instantiation of function template specialization 'TryAcquireTemplateTests::tryRangeNonDepBad<int>' requested here}}
+
+struct VariadicHelper {
+  template <typename... Mus>
+  int lockAllRange(Mus &...mus)
+      __attribute__((try_acquire_capability_range(0, 0, mus...))) {
+    return 0;
+  }
+  template <typename... Mus>
+  bool lockAllBool(Mus &...mus)
+      __attribute__((try_acquire_capability(true, mus...))) {
+    return true;
+  }
+};
+
+void testEmptyVariadicPack(VariadicHelper &h) {
+  if (h.lockAllRange() == 0) {
+  }
+  if (h.lockAllBool()) {
+  }
+}
+
+struct LateSiblingConstexpr {
+  CapMutex mu;
+  CapMutex otherMu;
+  int guarded __attribute__((guarded_by(otherMu)));
+
+  bool tryLate(bool cond) // expected-note {{mutex acquired here}}
+      __attribute__((try_acquire_capability(ok(), mu))) {
+    guarded = 1; // expected-warning {{writing variable 'guarded' requires holding mutex 'otherMu' exclusively}}
+    mu.Unlock(); // expected-warning {{releasing mutex 'mu' that was not held}}
+    if (cond)
+      return true; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+    return false;
+  }
+
+  void callLate() {
+    if (tryLate(false)) {
+      mu.Unlock();
+    }
+  }
+
+  static constexpr bool ok() { return true; }
+};
+
+#if __cplusplus >= 202002L
+template <typename T>
+constexpr T kZeroVarTmpl = 0;
+
+template <typename T>
+struct ConstexprDtorBox {
+  T v;
+  constexpr ~ConstexprDtorBox() {}
+};
+
+template <typename T>
+int tryConstexprDtorRange(bool ok)
+    __attribute__((try_acquire_capability_range(kZeroVarTmpl<T>,
+                                                ConstexprDtorBox<T>{1}.v,
+                                                globalMu))) {
+  if (ok) {
+    globalMu.Lock();
+    return 1;
+  }
+  return -1;
+}
+
+void callConstexprDtorRange() {
+  int r = tryConstexprDtorRange<int>(true);
+  if (r >= 0 && r <= 1) {
+    globalMu.Unlock();
+  }
+}
+#endif
 
 } // namespace TryAcquireTemplateTests

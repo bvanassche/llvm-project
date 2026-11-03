@@ -2164,7 +2164,31 @@ static bool evalTrylockSuccessBool(const Expr *BrE, const ASTContext &Ctx,
                                    bool &Out) {
   if (!BrE || BrE->isValueDependent() || BrE->isTypeDependent())
     return false;
-  return BrE->EvaluateAsBooleanCondition(Out, Ctx);
+  Expr::EvalResult EvalResult;
+  if (!BrE->EvaluateAsInt(EvalResult, Ctx, Expr::SE_NoSideEffects,
+                          /*InConstantContext=*/true))
+    return false;
+  Out = EvalResult.Val.getInt().getBoolValue();
+  return true;
+}
+
+static std::optional<llvm::APSInt>
+evalTrylockRangeBound(const Expr *E, const ASTContext &Ctx) {
+  if (!E || E->isValueDependent() || E->isTypeDependent())
+    return std::nullopt;
+  if (auto Val = E->getIntegerConstantExpr(Ctx))
+    return Val;
+  if (!Ctx.getLangOpts().CPlusPlus11 ||
+      !E->getType()->isIntegralOrUnscopedEnumerationType())
+    return std::nullopt;
+  Expr::EvalResult EvalResult;
+  SmallVector<PartialDiagnosticAt, 4> Notes;
+  EvalResult.Diag = &Notes;
+  if (E->EvaluateAsInt(EvalResult, Ctx, Expr::SE_NoSideEffects,
+                       /*InConstantContext=*/true) &&
+      !EvalResult.HasUndefinedBehavior && Notes.empty())
+    return EvalResult.Val.getInt();
+  return std::nullopt;
 }
 
 static bool getStaticBooleanValue(Expr *E, bool &TCond) {
@@ -2275,10 +2299,8 @@ ThreadSafetyAnalyzer::getTrylockSuccessSet(const Attr *A,
     return IntRangeSet::truthSet(Dom, SuccBool);
   }
   const auto *RA = cast<TryAcquireCapabilityRangeAttr>(A);
-  if (!RA->getFirstSuccessValue() || !RA->getLastSuccessValue())
-    return std::nullopt;
-  auto First = RA->getFirstSuccessValue()->getIntegerConstantExpr(*ASTCtx);
-  auto Last = RA->getLastSuccessValue()->getIntegerConstantExpr(*ASTCtx);
+  auto First = evalTrylockRangeBound(RA->getFirstSuccessValue(), *ASTCtx);
+  auto Last = evalTrylockRangeBound(RA->getLastSuccessValue(), *ASTCtx);
   if (!First || !Last)
     return std::nullopt;
   return IntRangeSet::closedRange(Dom, *First, *Last);
@@ -2295,7 +2317,9 @@ void ThreadSafetyAnalyzer::getAcquiredTrylockCaps(const AcquiredTrylockKey &Key,
 
 static bool isRangeTrylockReturnType(QualType Ty) {
   return !Ty.isNull() && !Ty->isDependentType() &&
-         (Ty->isIntegralOrEnumerationType() || Ty->isAnyPointerType());
+         ((!Ty->isBooleanType() && !Ty->isScopedEnumeralType() &&
+           Ty->isIntegralOrEnumerationType()) ||
+          Ty->isAnyPointerType());
 }
 
 /// Whether the trylock attribute \p A applies to a call that returns \p RetTy.
@@ -3955,6 +3979,8 @@ static std::optional<ThreadSafetyAnalyzer::IntDomain>
 getScalarDomainForType(QualType Ty, const ASTContext &Ctx) {
   using IntDomain = ThreadSafetyAnalyzer::IntDomain;
   if (Ty.isNull() || Ty->isDependentType())
+    return std::nullopt;
+  if (const auto *ED = Ty->getAsEnumDecl(); ED && !ED->isComplete())
     return std::nullopt;
   if (Ty->isIntegralOrEnumerationType())
     return IntDomain::forType(Ty, Ctx);

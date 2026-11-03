@@ -17057,6 +17057,7 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body, bool IsInstantiation,
           const auto *Proto = FD->getType()->castAs<FunctionProtoType>();
           FD->setType(Context.getFunctionType(RetType, Proto->getParamTypes(),
                                               Proto->getExtProtoInfo()));
+          checkDeducedFunctionThreadSafetyAttrs(FD);
         }
       }
 

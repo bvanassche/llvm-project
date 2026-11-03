@@ -127,6 +127,11 @@ public:
   // normal IssueWarnings path.
   void IssueWarningsForImplicitFunction(const Decl *D);
 
+  // Run deferred thread-safety analysis once inline constexpr sibling methods
+  // referenced by class-member try_acquire attributes have been parsed.
+  void IssueDelayedThreadSafetyWarnings(const Decl *D, bool IssueBeta,
+                                        bool Verbose);
+
   void registerVarDeclWarning(VarDecl *VD, PossiblyUnreachableDiag PUD);
 
   void issueWarningsForRegisteredVarDecl(VarDecl *VD);

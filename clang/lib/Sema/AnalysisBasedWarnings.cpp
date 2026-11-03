@@ -3089,6 +3089,8 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   if (!TU)
     return; // This is unexpected, give up quietly.
 
+  S.finishDelayedThreadSafetyChecks(/*Force=*/true);
+
   DiagnosticsEngine &Diags = S.getDiagnostics();
 
   if (S.hasUncompilableErrorOccurred() || Diags.getIgnoreAllWarnings())
@@ -3165,6 +3167,32 @@ void clang::sema::AnalysisBasedWarnings::IssueWarningsForImplicitFunction(
     lifetimes::runLifetimeSafetyAnalysis(AC, &SemaHelper,
                                          lifetimes::GetLifetimeSafetyOpts(S, D),
                                          LSStats, S.CollectStats);
+}
+
+void clang::sema::AnalysisBasedWarnings::IssueDelayedThreadSafetyWarnings(
+    const Decl *D, bool IssueBeta, bool Verbose) {
+  if (!D || !D->getBody() || shouldSkipAnalysisForDecl(S, D) ||
+      S.hasUncompilableErrorOccurred())
+    return;
+
+  AnalysisDeclContext AC(/*AnalysisDeclContextManager=*/nullptr, D);
+  AC.getCFGBuildOptions().PruneTriviallyFalseEdges = true;
+  AC.getCFGBuildOptions().AddEHEdges = false;
+  AC.getCFGBuildOptions().AddInitializers = true;
+  AC.getCFGBuildOptions().AddImplicitDtors = true;
+  AC.getCFGBuildOptions().AddParameterLifetimes = true;
+  AC.getCFGBuildOptions().AddTemporaryDtors = true;
+  AC.getCFGBuildOptions().AddCXXNewAllocator = false;
+  AC.getCFGBuildOptions().AddCXXDefaultInitExprInCtors = true;
+  AC.getCFGBuildOptions().setAllAlwaysAdd();
+
+  SourceLocation FL = AC.getDecl()->getLocation();
+  SourceLocation FEL = AC.getDecl()->getEndLoc();
+  threadSafety::ThreadSafetyReporter Reporter(S, FL, FEL);
+  Reporter.setIssueBetaWarnings(IssueBeta);
+  Reporter.setVerbose(Verbose);
+  threadSafety::runThreadSafetyAnalysis(AC, Reporter, &S.ThreadSafetyDeclCache);
+  Reporter.emitDiagnostics();
 }
 
 void clang::sema::AnalysisBasedWarnings::IssueWarnings(
@@ -3270,17 +3298,23 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
 
   // Check for thread safety violations
   if (P.enableThreadSafetyAnalysis) {
-    SourceLocation FL = AC.getDecl()->getLocation();
-    SourceLocation FEL = AC.getDecl()->getEndLoc();
-    threadSafety::ThreadSafetyReporter Reporter(S, FL, FEL);
-    if (!Diags.isIgnored(diag::warn_thread_safety_beta, D->getBeginLoc()))
-      Reporter.setIssueBetaWarnings(true);
-    if (!Diags.isIgnored(diag::warn_thread_safety_verbose, D->getBeginLoc()))
-      Reporter.setVerbose(true);
+    bool IssueBeta =
+        !Diags.isIgnored(diag::warn_thread_safety_beta, D->getBeginLoc());
+    bool Verbose =
+        !Diags.isIgnored(diag::warn_thread_safety_verbose, D->getBeginLoc());
+    if (S.hasDelayedTryAcquireAttrs()) {
+      S.deferThreadSafetyAnalysis(D, IssueBeta, Verbose);
+    } else {
+      SourceLocation FL = AC.getDecl()->getLocation();
+      SourceLocation FEL = AC.getDecl()->getEndLoc();
+      threadSafety::ThreadSafetyReporter Reporter(S, FL, FEL);
+      Reporter.setIssueBetaWarnings(IssueBeta);
+      Reporter.setVerbose(Verbose);
 
-    threadSafety::runThreadSafetyAnalysis(AC, Reporter,
-                                          &S.ThreadSafetyDeclCache);
-    Reporter.emitDiagnostics();
+      threadSafety::runThreadSafetyAnalysis(AC, Reporter,
+                                            &S.ThreadSafetyDeclCache);
+      Reporter.emitDiagnostics();
+    }
   }
 
   // Check for violations of consumed properties.
