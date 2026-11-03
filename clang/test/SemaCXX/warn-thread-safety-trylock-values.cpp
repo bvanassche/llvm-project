@@ -1,4 +1,5 @@
 // RUN: %clang_cc1 -fsyntax-only -verify -std=c++17 -Wthread-safety -Wthread-safety-beta %s
+// RUN: %clang_cc1 -fsyntax-only -verify -std=c++20 -Wthread-safety -Wthread-safety-beta %s
 
 // Tests for the values of local variables that hold trylock results.
 
@@ -281,3 +282,180 @@ int too_many_paths_valid(int x) TRY1 {
 out:
   return 1;
 }
+
+//===----------------------------------------------------------------------===//
+// Reassigned variables on the right-hand side of && and ||.
+//===----------------------------------------------------------------------===//
+
+int trylock_zero() __attribute__((try_acquire_capability(0, mu)));
+
+void logical_rhs_reassign_caller() {
+  int rc = cond();
+  if (rc <= 0 && (rc = trylock_zero()) >= 0) {
+    data = 1; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+    unlock(&mu); // expected-warning{{releasing mutex 'mu' that was not held}}
+  }
+  int rc2 = cond();
+  bool ok = (rc2 <= 0 && (rc2 = trylock_zero()) >= 0);
+  if (ok) {
+    data = 2; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+    unlock(&mu); // expected-warning{{releasing mutex 'mu' that was not held}}
+  }
+  int rc3 = cond();
+  if (!(rc3 > 0 || (rc3 = trylock_zero()) < 0)) {
+    data = 3; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+    unlock(&mu); // expected-warning{{releasing mutex 'mu' that was not held}}
+  }
+}
+
+int logical_rhs_reassign_callee() TRY1 { // expected-note{{mutex acquired here}}
+  int ok = cond();
+  if (!ok && (ok = cond()))
+    return ok; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+  return 0;
+}
+
+int logical_rhs_reassign_negated() TRY1 { // expected-note{{mutex acquired here}}
+  int ok = 0;
+  if (!((ok == 1) || ((ok = 1) && cond())))
+    return ok; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+  return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// Unscoped enum promotion, scoped enum class, Derived-to-Base, and wide ints.
+//===----------------------------------------------------------------------===//
+
+enum UnscopedStatus { US_OK = 0, US_BUSY = 1 };
+UnscopedStatus try_unscoped_zero()
+    __attribute__((try_acquire_capability(false, mu)));
+UnscopedStatus try_unscoped_pos()
+    __attribute__((try_acquire_capability_range(0, 0x7fffffff, mu)));
+
+void test_unscoped_enum_promotion() {
+  if (try_unscoped_zero() <= 0) {
+    data = 1; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+    unlock(&mu); // expected-warning{{releasing mutex 'mu' that was not held}}
+  }
+  UnscopedStatus s = try_unscoped_pos();
+  if (s < 0)
+    return;
+  data = 2;
+  unlock(&mu);
+}
+
+int delegate_unscoped_enum_pos()
+    __attribute__((try_acquire_capability_range(0, 0, mu))) {
+  int s = try_unscoped_pos();
+  if (s < 0)
+    return -1;
+  return 0;
+}
+
+struct BaseObj {
+  int a;
+};
+struct DerivedObj : BaseObj {
+  int b;
+};
+DerivedObj *try_derived_obj() __attribute__((try_acquire_capability(true, mu)));
+
+void test_derived_to_base_caller() {
+  BaseObj *p = try_derived_obj();
+  if (p) {
+    data = 1;
+    unlock(&mu);
+  }
+  BaseObj *q = try_derived_obj();
+  if (q != nullptr) {
+    data = 2;
+    unlock(&mu);
+  }
+  BaseObj *r = try_derived_obj();
+  if (r == nullptr)
+    return;
+  data = 3;
+  unlock(&mu);
+}
+
+enum class ScopedStatus { Ok = 0, Busy = 1 };
+
+ScopedStatus try_scoped_status(bool ok)
+    __attribute__((try_acquire_capability(false, mu))) {
+  if (ok) {
+    lock(&mu);
+    return ScopedStatus::Ok;
+  }
+  return ScopedStatus::Busy;
+}
+
+void test_scoped_status_caller(bool ok) {
+  if (try_scoped_status(ok) == ScopedStatus::Ok) {
+    data = 1;
+    unlock(&mu);
+  }
+  switch (try_scoped_status(ok)) {
+  case ScopedStatus::Ok:
+    data = 2;
+    unlock(&mu);
+    break;
+  case ScopedStatus::Busy:
+    break;
+  }
+}
+
+_BitInt(65) try_bitint65() __attribute__((try_acquire_capability_range(0, 0, mu)));
+_BitInt(128) try_bitint128()
+    __attribute__((try_acquire_capability_range((_BitInt(128))1 << 100,
+                                                (_BitInt(128))1 << 105, mu)));
+
+void test_bitint_caller() {
+  _BitInt(65) a = try_bitint65();
+  if (a == 0) {
+    data = 1;
+    unlock(&mu);
+  }
+  _BitInt(128) b = try_bitint128();
+  if (b == ((_BitInt(128))1 << 100)) {
+    data = 2;
+    unlock(&mu);
+  }
+}
+
+#ifdef __SIZEOF_INT128__
+__int128 try_int128()
+    __attribute__((try_acquire_capability_range((__int128)1 << 100,
+                                                (__int128)1 << 105, mu)));
+
+void test_int128_caller() {
+  __int128 v = try_int128();
+  if (v >= ((__int128)1 << 100) && v <= ((__int128)1 << 105)) {
+    data = 1;
+    unlock(&mu);
+  }
+}
+#endif
+
+#if __cplusplus >= 202002L
+namespace std {
+struct strong_ordering {
+  signed char v;
+  static const strong_ordering less;
+  static const strong_ordering equal;
+  static const strong_ordering greater;
+  friend constexpr bool operator==(strong_ordering, strong_ordering) = default;
+  friend constexpr bool operator<(strong_ordering a, int) { return a.v < 0; }
+};
+inline constexpr strong_ordering strong_ordering::less{-1};
+inline constexpr strong_ordering strong_ordering::equal{0};
+inline constexpr strong_ordering strong_ordering::greater{1};
+} // namespace std
+
+int test_spaceship_in_trylock(int a, int b) TRY1 {
+  if ((a <=> b) == std::strong_ordering::equal) {
+    lock(&mu);
+    return 1;
+  }
+  return 0;
+}
+#endif

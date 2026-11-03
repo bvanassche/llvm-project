@@ -537,6 +537,12 @@ public:
 
   Context getEmptyContext() { return ContextFactory.getEmptyMap(); }
 
+  Context clearDefinitionIfSet(const NamedDecl *D, Context Ctx) {
+    if (const unsigned *DefID = Ctx.lookup(D); DefID && *DefID != 0)
+      return clearDefinition(D, Ctx);
+    return Ctx;
+  }
+
   /// Return the next context after processing S.  This function is used by
   /// clients of the class to get the appropriate context when traversing the
   /// CFG.  It must be called for every assignment, increment/decrement,
@@ -1585,11 +1591,20 @@ public:
   // chains of logical operators on variables linear instead of exponential.
   llvm::DenseMap<std::pair<const Stmt *, const void *>, TrylockRangeCondResult>
       RangeCondCache;
+  llvm::DenseMap<std::pair<const CFGBlock *, const void *>,
+                 TrylockRangeCondResult>
+      TerminatorCondCache;
+  const PostOrderCFGView *CurrentSortedGraph = nullptr;
+  bool BuiltLogicalOpTermBlock = false;
+  llvm::DenseMap<const BinaryOperator *, unsigned> LogicalOpTermBlock;
+  LocalVarContext getLogicalOpLHSContext(const BinaryOperator *BOP,
+                                         LocalVarContext C);
   TrylockRangeCondResult evaluateTerminatorTrylockCond(const Stmt *Cond,
                                                        LocalVarContext C);
   bool getTerminatorTrylockCond(const CFGBlock *Block,
                                 TrylockRangeCondResult &Res,
-                                const SwitchCaseTable *&Table);
+                                const SwitchCaseTable *&Table,
+                                SmallVectorImpl<const CastExpr *> &SwitchCasts);
 
   void getEdgeLockset(
       FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
@@ -2173,13 +2188,14 @@ static bool evalTrylockSuccessBool(const Expr *BrE, const ASTContext &Ctx,
 }
 
 static std::optional<llvm::APSInt>
-evalTrylockRangeBound(const Expr *E, const ASTContext &Ctx) {
-  if (!E || E->isValueDependent() || E->isTypeDependent())
+getIntegralOrEnumConstantExpr(const Expr *E, const ASTContext &Ctx) {
+  if (!E || E->isValueDependent() || E->isTypeDependent() ||
+      !E->getType()->isIntegralOrEnumerationType())
     return std::nullopt;
-  if (auto Val = E->getIntegerConstantExpr(Ctx))
-    return Val;
-  if (!Ctx.getLangOpts().CPlusPlus11 ||
-      !E->getType()->isIntegralOrUnscopedEnumerationType())
+  if (E->getType()->isIntegralOrUnscopedEnumerationType())
+    if (auto Val = E->getIntegerConstantExpr(Ctx))
+      return Val;
+  if (!Ctx.getLangOpts().CPlusPlus)
     return std::nullopt;
   Expr::EvalResult EvalResult;
   SmallVector<PartialDiagnosticAt, 4> Notes;
@@ -2189,6 +2205,13 @@ evalTrylockRangeBound(const Expr *E, const ASTContext &Ctx) {
       !EvalResult.HasUndefinedBehavior && Notes.empty())
     return EvalResult.Val.getInt();
   return std::nullopt;
+}
+
+static std::optional<llvm::APSInt>
+evalTrylockRangeBound(const Expr *E, const ASTContext &Ctx) {
+  if (!E || !E->getType()->isIntegralOrUnscopedEnumerationType())
+    return std::nullopt;
+  return getIntegralOrEnumConstantExpr(E, Ctx);
 }
 
 static bool getStaticBooleanValue(Expr *E, bool &TCond) {
@@ -2347,8 +2370,9 @@ static const NamedDecl *getTrylockCallee(const CallExpr *CallExp) {
 }
 
 /// The domain of the values returned by the trylock call \p CallExp. Values of
-/// a type without an integer domain, e.g. a floating-point type, are modeled as
-/// zero (0) or non-zero (1).
+/// The integer domain of the result of the trylock call \p CallExp. Results of
+/// an unsupported return type during error recovery are modeled as zero (0) or
+/// non-zero (1).
 ThreadSafetyAnalyzer::IntDomain
 ThreadSafetyAnalyzer::getTrylockCallDomain(const CallExpr *CallExp) const {
   if (auto Dom = getScalarDomain(CallExp->getType()))
@@ -2361,13 +2385,10 @@ static bool isValuePreservingIntegralCast(QualType SrcTy, QualType DstTy,
   if (!SrcTy->isIntegralOrEnumerationType() ||
       !DstTy->isIntegralOrEnumerationType() || DstTy->isBooleanType())
     return false;
-  // Integral promotion of an enumeration type preserves all values of that
-  // enumeration, even if the promoted type is signed while the underlying type
-  // is unsigned.
-  if (const auto *ET = SrcTy->getAs<EnumType>())
-    if (const EnumDecl *ED = ET->getDecl()->getDefinition();
-        ED && Ctx.hasSameType(ED->getPromotionType(), DstTy))
-      return true;
+  if (const auto *ED = SrcTy->getAsEnumDecl(); ED && !ED->isComplete())
+    return false;
+  if (const auto *ED = DstTy->getAsEnumDecl(); ED && !ED->isComplete())
+    return false;
   unsigned SrcBits = Ctx.getIntWidth(SrcTy);
   unsigned DstBits = Ctx.getIntWidth(DstTy);
   if (DstBits < SrcBits)
@@ -2632,8 +2653,10 @@ ThreadSafetyAnalyzer::getSwitchCaseTable(const SwitchStmt *SS,
     const auto *CS = dyn_cast<CaseStmt>(SC);
     if (!CS)
       continue;
-    auto Lo = CS->getLHS()->getIntegerConstantExpr(*ASTCtx);
-    auto Hi = CS->getRHS() ? CS->getRHS()->getIntegerConstantExpr(*ASTCtx) : Lo;
+    auto Lo = getIntegralOrEnumConstantExpr(CS->getLHS(), *ASTCtx);
+    auto Hi = CS->getRHS()
+                  ? getIntegralOrEnumConstantExpr(CS->getRHS(), *ASTCtx)
+                  : Lo;
     if (!Lo || !Hi) {
       Table.Valid = false;
       break;
@@ -2711,6 +2734,11 @@ castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
                      QualType DstTy, const ASTContext &Ctx);
 
 static const Expr *stripNoOpExprWrappers(const Expr *E);
+static void
+scanTrylockVars(const Stmt *Root,
+                llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
+                llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars,
+                bool CallArgsAreTransient = false);
 
 static bool isBuiltinExpectCall(const CallExpr *CallExp) {
   unsigned BuiltinID = CallExp->getBuiltinCallee();
@@ -2718,28 +2746,70 @@ static bool isBuiltinExpectCall(const CallExpr *CallExp) {
          BuiltinID == Builtin::BI__builtin_expect_with_probability;
 }
 
-/// Whether \p CE converts a pointer into a signed integer as wide as a
-/// pointer, e.g. (intptr_t)ptr or (long)ptr.
-static bool isSignedPointerToIntptrCast(const CastExpr *CE,
-                                        const ASTContext &Ctx) {
-  return CE->getCastKind() == CK_PointerToIntegral &&
-         CE->getSubExpr()->getType()->isAnyPointerType() &&
-         CE->getType()->isSignedIntegerOrEnumerationType() &&
-         Ctx.getIntWidth(CE->getType()) ==
-             Ctx.getIntWidth(Ctx.getUIntPtrType());
+/// Whether \p CE is a same-width non-boolean integral or pointer-integer cast
+/// that induces a bijection between the bit patterns of its source and
+/// destination types, e.g. (intptr_t)ptr or C++ promotion of an unsigned
+/// unscoped enum to int.
+static bool isBijectiveReinterpretCast(const CastExpr *CE,
+                                       const ASTContext &Ctx) {
+  QualType SubTy = CE->getSubExpr()->getType();
+  QualType DstTy = CE->getType();
+  if (SubTy.isNull() || DstTy.isNull() || SubTy->isDependentType() ||
+      DstTy->isDependentType() || SubTy->isBooleanType() ||
+      DstTy->isBooleanType())
+    return false;
+  if (const auto *ED = SubTy->getAsEnumDecl(); ED && !ED->isComplete())
+    return false;
+  if (const auto *ED = DstTy->getAsEnumDecl(); ED && !ED->isComplete())
+    return false;
+  switch (CE->getCastKind()) {
+  case CK_IntegralCast:
+    return SubTy->isIntegralOrEnumerationType() &&
+           DstTy->isIntegralOrEnumerationType() &&
+           Ctx.getIntWidth(SubTy) == Ctx.getIntWidth(DstTy);
+  case CK_PointerToIntegral:
+    return SubTy->isAnyPointerType() && DstTy->isIntegralOrEnumerationType() &&
+           Ctx.getIntWidth(DstTy) == Ctx.getIntWidth(Ctx.getUIntPtrType());
+  case CK_IntegralToPointer:
+    return DstTy->isAnyPointerType() && SubTy->isIntegralOrEnumerationType() &&
+           Ctx.getIntWidth(SubTy) == Ctx.getIntWidth(Ctx.getUIntPtrType());
+  default:
+    return false;
+  }
 }
 
-/// Translate the comparison (signed)ptr Op K, where the cast satisfies
-/// isSignedPointerToIntptrCast(), into the set of pointer values in \p Dom.
-static ThreadSafetyAnalyzer::IntRangeSet signedPointerCmpRangeSet(
+/// Translate the comparison CE Op K, where \p CE satisfies
+/// isBijectiveReinterpretCast(), into the set of operand values in \p Dom.
+static ThreadSafetyAnalyzer::IntRangeSet bijectiveCastCmpRangeSet(
     const CastExpr *CE, BinaryOperator::Opcode Op, const llvm::APSInt &K,
     const ThreadSafetyAnalyzer::IntDomain &Dom, const ASTContext &Ctx) {
-  auto SignedDom = ThreadSafetyAnalyzer::IntDomain::forType(CE->getType(), Ctx);
+  QualType DstScalarTy =
+      CE->getType()->isAnyPointerType() ? Ctx.getUIntPtrType() : CE->getType();
+  QualType SrcScalarTy = CE->getSubExpr()->getType()->isAnyPointerType()
+                             ? Ctx.getUIntPtrType()
+                             : CE->getSubExpr()->getType();
+  auto DstDom = ThreadSafetyAnalyzer::IntDomain::forType(DstScalarTy, Ctx);
   return reprojectRangeSet(
       castIntegralRangeSet(
-          ThreadSafetyAnalyzer::IntRangeSet::forComparison(SignedDom, Op, K),
-          Ctx.getUIntPtrType(), Ctx),
+          ThreadSafetyAnalyzer::IntRangeSet::forComparison(DstDom, Op, K),
+          SrcScalarTy, Ctx),
       Dom);
+}
+
+static ThreadSafetyAnalyzer::IntRangeSet mapRangeBackwardThroughBijectiveCasts(
+    ThreadSafetyAnalyzer::IntRangeSet S, ArrayRef<const CastExpr *> Casts,
+    const ThreadSafetyAnalyzer::IntDomain &TargetDom, const ASTContext &Ctx) {
+  for (const CastExpr *CE : Casts) {
+    QualType DstScalarTy = CE->getType()->isAnyPointerType()
+                               ? Ctx.getUIntPtrType()
+                               : CE->getType();
+    QualType SrcScalarTy = CE->getSubExpr()->getType()->isAnyPointerType()
+                               ? Ctx.getUIntPtrType()
+                               : CE->getSubExpr()->getType();
+    auto DstDom = ThreadSafetyAnalyzer::IntDomain::forType(DstScalarTy, Ctx);
+    S = castIntegralRangeSet(reprojectRangeSet(S, DstDom), SrcScalarTy, Ctx);
+  }
+  return reprojectRangeSet(S, TargetDom);
 }
 
 /// Skip the expressions that do not change the value of \p E: parentheses,
@@ -2821,7 +2891,7 @@ bool ThreadSafetyAnalyzer::isGuaranteedZeroOrOneExpr(const Expr *E,
     if (Leaf->getType()->isBooleanType())
       return true;
     if (Leaf->getType()->isIntegralOrEnumerationType())
-      if (auto ICE = Leaf->getIntegerConstantExpr(*ASTCtx))
+      if (auto ICE = getIntegralOrEnumConstantExpr(Leaf, *ASTCtx))
         return *ICE == 0 || *ICE == 1;
     return std::nullopt;
   };
@@ -2848,8 +2918,39 @@ bool ThreadSafetyAnalyzer::isGuaranteedZeroOrOneExpr(const Expr *E,
   if (const auto *UOP = dyn_cast<UnaryOperator>(E))
     return UOP->getOpcode() == UO_LNot;
   if (const auto *BOP = dyn_cast<BinaryOperator>(E))
-    return BOP->isComparisonOp() || BOP->isLogicalOp();
+    return BOP->isRelationalOp() || BOP->isEqualityOp() || BOP->isLogicalOp();
   return false;
+}
+
+LocalVarContext
+ThreadSafetyAnalyzer::getLogicalOpLHSContext(const BinaryOperator *BOP,
+                                             LocalVarContext C) {
+  if (!BOP || C.isEmpty())
+    return C;
+  if (InlineDepth == 0 && CurrentSortedGraph) {
+    if (!BuiltLogicalOpTermBlock) {
+      BuiltLogicalOpTermBlock = true;
+      for (const CFGBlock *B : *CurrentSortedGraph) {
+        if (const auto *TermBO =
+                dyn_cast_or_null<BinaryOperator>(B->getTerminatorStmt());
+            TermBO && TermBO->isLogicalOp()) {
+          auto [It, Inserted] =
+              LogicalOpTermBlock.try_emplace(TermBO, B->getBlockID());
+          if (!Inserted && It->second != B->getBlockID())
+            It->second = ~0u;
+        }
+      }
+    }
+    if (auto It = LogicalOpTermBlock.find(BOP);
+        It != LogicalOpTermBlock.end() && It->second < BlockInfo.size())
+      return BlockInfo[It->second].ExitContext;
+  }
+  llvm::SmallPtrSet<const ValueDecl *, 4> Esc, Mod;
+  scanTrylockVars(BOP->getRHS(), Esc, Mod);
+  for (const ValueDecl *VD : Mod)
+    if (const auto *ND = dyn_cast<NamedDecl>(VD))
+      C = LocalVarMap.clearDefinitionIfSet(ND, C);
+  return C;
 }
 
 ThreadSafetyAnalyzer::TrylockRangeCondResult
@@ -2861,6 +2962,10 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCond(const Stmt *Cond,
   if (auto It = RangeCondCache.find(Key); It != RangeCondCache.end())
     return It->second;
   TrylockRangeCondResult Res = evaluateTrylockRangeCondImpl(Cond, C);
+  if (Res.Call) {
+    Res.TrueSet.widen(MaxStateRangeIntervals);
+    Res.FalseSet.widen(MaxStateRangeIntervals);
+  }
   RangeCondCache.try_emplace(Key, Res);
   return Res;
 }
@@ -2885,9 +2990,17 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
     case CK_FloatingComplexToBoolean:
     case CK_IntegralComplexToBoolean:
     case CK_FixedPointToBoolean:
+    case CK_BooleanToSignedIntegral:
       return evaluateTrylockRangeCond(CE->getSubExpr(), C);
+    case CK_DerivedToBase:
+    case CK_UncheckedDerivedToBase:
+      if (CE->getType()->isAnyPointerType() &&
+          CE->getSubExpr()->getType()->isAnyPointerType())
+        return evaluateTrylockRangeCond(CE->getSubExpr(), C);
+      return {};
     default:
-      if (isValuePreservingCast(CE, *ASTCtx))
+      if (isValuePreservingCast(CE, *ASTCtx) ||
+          isBijectiveReinterpretCast(CE, *ASTCtx))
         return evaluateTrylockRangeCond(CE->getSubExpr(), C);
       return {};
     }
@@ -2943,7 +3056,7 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
       auto EvalConstSide =
           [&](const Expr *ConstSide) -> std::optional<llvm::APSInt> {
         if (ConstSide->getType()->isIntegralOrEnumerationType())
-          return ConstSide->getIntegerConstantExpr(*ASTCtx);
+          return getIntegralOrEnumConstantExpr(ConstSide, *ASTCtx);
         if (ConstSide->getType()->isAnyPointerType() ||
             ConstSide->getType()->isNullPtrType()) {
           TrylockValueState EmptyState;
@@ -2954,13 +3067,6 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
           }
           return std::nullopt;
         }
-        // The values of other types are modeled as zero or non-zero. Hence
-        // only an (in)equality comparison with zero can be evaluated.
-        bool NonZero = true;
-        if ((BOP->getOpcode() == BO_EQ || BOP->getOpcode() == BO_NE) &&
-            !ConstSide->isValueDependent() &&
-            ConstSide->EvaluateAsBooleanCondition(NonZero, *ASTCtx) && !NonZero)
-          return llvm::APSInt::get(0);
         return std::nullopt;
       };
       const CallExpr *CallExp = nullptr;
@@ -3005,35 +3111,36 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
           return Res;
       }
 
-      // Recognize pointer-to-intptr_t casts such as ((long)ptr < 0).
-      auto EvalSignedIntPtrCmp =
-          [&](const Expr *PtrSide, const Expr *ConstSide,
+      // Recognize bijective same-width casts such as ((long)ptr < 0) or C++
+      // promotion of an unsigned unscoped enum to int.
+      auto EvalBijectiveCastCmp =
+          [&](const Expr *CastSide, const Expr *ConstSide,
               BinaryOperator::Opcode SideOp) -> TrylockRangeCondResult {
         auto K = EvalConstSide(ConstSide);
         if (!K)
           return {};
         LocalVarContext SubCtx = C;
         const auto *CE = dyn_cast_or_null<CastExpr>(
-            skipValuePreservingWrappers(PtrSide, &SubCtx));
-        if (!CE || !isSignedPointerToIntptrCast(CE, *ASTCtx))
+            skipValuePreservingWrappers(CastSide, &SubCtx));
+        if (!CE || !isBijectiveReinterpretCast(CE, *ASTCtx))
           return {};
-        const CallExpr *PtrCall =
+        const CallExpr *SubCall =
             unwrapTrylockValueExpr(CE->getSubExpr(), SubCtx);
-        const NamedDecl *Callee = getTrylockCallee(PtrCall);
+        const NamedDecl *Callee = getTrylockCallee(SubCall);
         if (!Callee)
           return {};
-        IntDomain Dom = getTrylockCallDomain(PtrCall);
+        IntDomain Dom = getTrylockCallDomain(SubCall);
         IntRangeSet TrueSet =
-            signedPointerCmpRangeSet(CE, SideOp, *K, Dom, *ASTCtx);
+            bijectiveCastCmpRangeSet(CE, SideOp, *K, Dom, *ASTCtx);
         IntRangeSet FalseSet = TrueSet.complement(Dom);
-        return {PtrCall, Callee, std::move(Dom), std::move(TrueSet),
+        return {SubCall, Callee, std::move(Dom), std::move(TrueSet),
                 std::move(FalseSet)};
       };
-      if (auto Res = EvalSignedIntPtrCmp(BOP->getLHS(), BOP->getRHS(),
-                                         BOP->getOpcode());
+      if (auto Res = EvalBijectiveCastCmp(BOP->getLHS(), BOP->getRHS(),
+                                          BOP->getOpcode());
           Res.Call)
         return Res;
-      if (auto Res = EvalSignedIntPtrCmp(
+      if (auto Res = EvalBijectiveCastCmp(
               BOP->getRHS(), BOP->getLHS(),
               BinaryOperator::reverseComparisonOp(BOP->getOpcode()));
           Res.Call)
@@ -3042,13 +3149,13 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
       if (BOP->getOpcode() == BO_EQ || BOP->getOpcode() == BO_NE) {
         auto EvalBoolEq = [&](const Expr *BoolSide,
                               const Expr *ConstSide) -> TrylockRangeCondResult {
-          auto K = ConstSide->getIntegerConstantExpr(*ASTCtx);
+          auto K = EvalConstSide(ConstSide);
           if (!K)
             return {};
           // Evaluate the trylock condition first such that conditions that
           // are unrelated to range trylocks do not expand inline helpers.
           auto Res = evaluateTrylockRangeCond(BoolSide, C);
-          if (!Res.Call || !isGuaranteedZeroOrOneExpr(BoolSide, C))
+          if (!Res.Call || (*K != 0 && !isGuaranteedZeroOrOneExpr(BoolSide, C)))
             return {};
           if (*K == 1) {
             if (BOP->getOpcode() == BO_NE)
@@ -3080,7 +3187,8 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
       auto RHSRes = evaluateTrylockRangeCond(BOP->getRHS(), C);
       if (!RHSRes.Call)
         return {};
-      auto LHSRes = evaluateTrylockRangeCond(BOP->getLHS(), C);
+      LocalVarContext LHSCtx = getLogicalOpLHSContext(BOP, C);
+      auto LHSRes = evaluateTrylockRangeCond(BOP->getLHS(), LHSCtx);
       IntRangeSet FullDom = IntRangeSet::full(RHSRes.Dom);
       const IntRangeSet &LHSTrue =
           (LHSRes.Call == RHSRes.Call) ? LHSRes.TrueSet : FullDom;
@@ -3130,7 +3238,8 @@ ThreadSafetyAnalyzer::evaluateTerminatorTrylockCond(const Stmt *Cond,
   auto Res = evaluateTerminatorTrylockCond(BOP->getRHS(), C);
   if (!Res.Call)
     return {};
-  auto LHSRes = evaluateTrylockRangeCond(BOP->getLHS(), C);
+  LocalVarContext LHSCtx = getLogicalOpLHSContext(BOP, C);
+  auto LHSRes = evaluateTrylockRangeCond(BOP->getLHS(), LHSCtx);
   if (LHSRes.Call == Res.Call) {
     const IntRangeSet &Known =
         BOP->getOpcode() == BO_LAnd ? LHSRes.TrueSet : LHSRes.FalseSet;
@@ -3141,6 +3250,8 @@ ThreadSafetyAnalyzer::evaluateTerminatorTrylockCond(const Stmt *Cond,
       Res.TrueSet = std::move(T);
     if (IntRangeSet F = Known.intersect(Res.FalseSet); !F.empty())
       Res.FalseSet = std::move(F);
+    Res.TrueSet.widen(MaxStateRangeIntervals);
+    Res.FalseSet.widen(MaxStateRangeIntervals);
   }
   return Res;
 }
@@ -3178,8 +3289,10 @@ getSwitchEdgeSet(const CFGBlock *Pred,
 /// are taken.
 bool ThreadSafetyAnalyzer::getTerminatorTrylockCond(
     const CFGBlock *Block, TrylockRangeCondResult &Res,
-    const SwitchCaseTable *&Table) {
+    const SwitchCaseTable *&Table,
+    SmallVectorImpl<const CastExpr *> &SwitchCasts) {
   Table = nullptr;
+  SwitchCasts.clear();
   const Stmt *Term = Block->getTerminatorStmt();
   if (!Term || isa<IndirectGotoStmt>(Term))
     return false;
@@ -3191,18 +3304,42 @@ bool ThreadSafetyAnalyzer::getTerminatorTrylockCond(
 
   const LocalVarContext &LVarCtx = BlockInfo[Block->getBlockID()].ExitContext;
   if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
-    Res.Call = unwrapTrylockValueExpr(SS->getCond(), LVarCtx);
+    const Expr *Cond = SS->getCond();
+    auto CondDom = Cond ? getScalarDomain(Cond->getType()) : std::nullopt;
+    if (!CondDom)
+      return false;
+    LocalVarContext SubCtx = LVarCtx;
+    const Expr *E = Cond;
+    while ((E = skipValuePreservingWrappers(E, &SubCtx))) {
+      if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
+        Res.Call = CallExp;
+        break;
+      }
+      const auto *CE = dyn_cast<CastExpr>(E);
+      if (!CE || !isBijectiveReinterpretCast(CE, *ASTCtx))
+        break;
+      SwitchCasts.push_back(CE);
+      E = CE->getSubExpr();
+    }
     Res.Callee = getTrylockCallee(Res.Call);
     if (!Res.Callee)
       return false;
     Res.Dom = getTrylockCallDomain(Res.Call);
-    Table = &getSwitchCaseTable(SS, Res.Dom);
+    Table = &getSwitchCaseTable(SS, *CondDom);
     return Table->Valid;
   }
   const Stmt *Cond = Block->getTerminatorCondition();
   if (!Cond)
     return false;
+  std::pair<const CFGBlock *, const void *> CacheKey(
+      Block, LVarCtx.getRootWithoutRetain());
+  if (auto It = TerminatorCondCache.find(CacheKey);
+      It != TerminatorCondCache.end()) {
+    Res = It->second;
+    return Res.Call;
+  }
   Res = evaluateTerminatorTrylockCond(Cond, LVarCtx);
+  TerminatorCondCache.try_emplace(CacheKey, Res);
   return Res.Call;
 }
 
@@ -3218,14 +3355,16 @@ void ThreadSafetyAnalyzer::getEdgeLockset(
 
   TrylockRangeCondResult Cond;
   const SwitchCaseTable *Table;
-  if (!getTerminatorTrylockCond(PredBlock, Cond, Table))
+  SmallVector<const CastExpr *, 2> SwitchCasts;
+  if (!getTerminatorTrylockCond(PredBlock, Cond, Table, SwitchCasts))
     return;
   IntRangeSet EdgeSet;
   if (Table) {
     auto SwitchEdgeSet = getSwitchEdgeSet(PredBlock, *Table, CurrBlock);
     if (!SwitchEdgeSet)
       return;
-    EdgeSet = std::move(*SwitchEdgeSet);
+    EdgeSet = mapRangeBackwardThroughBijectiveCasts(*SwitchEdgeSet, SwitchCasts,
+                                                    Cond.Dom, *ASTCtx);
   } else {
     auto [IsTrue, IsFalse] = getBranchEdgeKinds(PredBlock, CurrBlock);
     if (IsTrue)
@@ -3266,13 +3405,16 @@ void ThreadSafetyAnalyzer::getTerminatorTrylockCaps(const CFGBlock *Block,
                                                     CapExprSet &Caps) {
   TrylockRangeCondResult Cond;
   const SwitchCaseTable *Table;
-  if (!getTerminatorTrylockCond(Block, Cond, Table))
+  SmallVector<const CastExpr *, 2> SwitchCasts;
+  if (!getTerminatorTrylockCond(Block, Cond, Table, SwitchCasts))
     return;
   SmallVector<IntRangeSet, 4> BranchSets;
   if (Table) {
     for (const auto &[CS, CaseSet] : Table->CaseSets)
-      BranchSets.push_back(CaseSet);
-    BranchSets.push_back(Table->DefaultSet);
+      BranchSets.push_back(mapRangeBackwardThroughBijectiveCasts(
+          CaseSet, SwitchCasts, Cond.Dom, *ASTCtx));
+    BranchSets.push_back(mapRangeBackwardThroughBijectiveCasts(
+        Table->DefaultSet, SwitchCasts, Cond.Dom, *ASTCtx));
   } else {
     BranchSets.push_back(std::move(Cond.TrueSet));
     BranchSets.push_back(std::move(Cond.FalseSet));
@@ -3433,7 +3575,7 @@ static void
 scanTrylockVars(const Stmt *Root,
                 llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
                 llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars,
-                bool CallArgsAreTransient = false) {
+                bool CallArgsAreTransient) {
   if (!Root)
     return;
 
@@ -3511,11 +3653,12 @@ scanTrylockVars(const Stmt *Root,
     }
 
     if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {
-      if (InNestedClosure || !SafeDREs.contains(DRE)) {
-        const ValueDecl *VD =
-            cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
-        EscapedVars.insert(VD);
-        ModifiedVars.insert(VD);
+      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+        if (InNestedClosure || !SafeDREs.contains(DRE)) {
+          const ValueDecl *CanonVD = cast<ValueDecl>(VD->getCanonicalDecl());
+          EscapedVars.insert(CanonVD);
+          ModifiedVars.insert(CanonVD);
+        }
       }
     }
 
@@ -4418,7 +4561,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
     return reprojectRangeSet(It->second, Dom);
 
   if (E->getType()->isIntegralOrEnumerationType()) {
-    if (auto ICE = E->getIntegerConstantExpr(*ASTCtx))
+    if (auto ICE = getIntegralOrEnumConstantExpr(E, *ASTCtx))
       return IntRangeSet::single(Dom, *ICE);
   }
 
@@ -4549,7 +4692,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
     if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign)
       return evaluatePureExprRange(BO->getRHS(), State, Depth + 1);
 
-    if (BO->isComparisonOp()) {
+    if (BO->isRelationalOp() || BO->isEqualityOp()) {
       auto L = evaluatePureExprRange(BO->getLHS(), State, Depth + 1);
       auto R = evaluatePureExprRange(BO->getRHS(), State, Depth + 1);
       if (!L || !R)
@@ -4928,29 +5071,29 @@ bool ThreadSafetyAnalyzer::constrainExprComparison(
       return false;
 
     if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      if (isBijectiveReinterpretCast(CE, *ASTCtx)) {
+        if (const ValueDecl *VD =
+                extractTrackableVarExpr(CE->getSubExpr(), EscapedVars)) {
+          if (auto VarDom = getScalarDomain(VD->getType())) {
+            restrictVarRange(State, VD, *VarDom,
+                             bijectiveCastCmpRangeSet(CE, EffectiveOp, KVal,
+                                                      *VarDom, *ASTCtx));
+            return true;
+          }
+        }
+      }
       // A narrowing integral cast preserves the value if the operand fits.
       if (CE->getCastKind() == CK_IntegralCast &&
           CE->getType()->isIntegralOrEnumerationType() &&
           !CE->getType()->isBooleanType() &&
           CE->getSubExpr()->getType()->isIntegralOrEnumerationType()) {
-        IntDomain DstDom = IntDomain::forType(CE->getType(), *ASTCtx);
+        auto DstDom = getScalarDomain(CE->getType());
         auto SubR = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-        if (SubR && SubR->subsetOf(DstDom.Lo, DstDom.Hi)) {
+        if (DstDom && SubR && SubR->subsetOf(DstDom->Lo, DstDom->Hi)) {
           E = CE->getSubExpr();
           continue;
         }
         return false;
-      }
-      if (isSignedPointerToIntptrCast(CE, *ASTCtx)) {
-        const ValueDecl *VD =
-            extractTrackableVarExpr(CE->getSubExpr(), EscapedVars);
-        auto VarDom = VD ? getScalarDomain(VD->getType()) : std::nullopt;
-        if (!VarDom)
-          return false;
-        restrictVarRange(
-            State, VD, *VarDom,
-            signedPointerCmpRangeSet(CE, EffectiveOp, KVal, *VarDom, *ASTCtx));
-        return true;
       }
       return false;
     }
@@ -5165,6 +5308,20 @@ ThreadSafetyAnalyzer::evaluateInlineCallRangeCond(
           std::move(FalseSet)};
 }
 
+static bool
+exprReferencesAnyVar(const Stmt *S,
+                     const llvm::SmallPtrSetImpl<const ValueDecl *> &Vars) {
+  if (!S || Vars.empty())
+    return false;
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(S))
+    if (Vars.contains(cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl())))
+      return true;
+  for (const Stmt *Child : S->children())
+    if (Child && exprReferencesAnyVar(Child, Vars))
+      return true;
+  return false;
+}
+
 void ThreadSafetyAnalyzer::constrainLeafCondition(
     TrylockValueState &State, const Expr *Cond, bool WantTrue,
     const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
@@ -5199,7 +5356,8 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
       return;
     case CK_IntegralCast:
       if (isValuePreservingIntegralCast(CE->getSubExpr()->getType(),
-                                        CE->getType(), *ASTCtx))
+                                        CE->getType(), *ASTCtx) ||
+          isBijectiveReinterpretCast(CE, *ASTCtx))
         constrainLeafCondition(State, CE->getSubExpr(), WantTrue, EscapedVars,
                                Depth + 1);
       return;
@@ -5212,6 +5370,9 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
                                Depth + 1);
       return;
     default:
+      if (isBijectiveReinterpretCast(CE, *ASTCtx))
+        constrainLeafCondition(State, CE->getSubExpr(), WantTrue, EscapedVars,
+                               Depth + 1);
       return;
     }
   }
@@ -5295,19 +5456,6 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
     if (!LastExpr)
       return;
 
-    auto UsesAnyLocalDecl = [&](auto &Self, const Stmt *S) -> bool {
-      if (!S)
-        return false;
-      if (const auto *DRE = dyn_cast<DeclRefExpr>(S))
-        if (LocalDecls.contains(
-                cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl())))
-          return true;
-      for (const Stmt *Child : S->children())
-        if (Child && Self(Self, Child))
-          return true;
-      return false;
-    };
-
     const Expr *UnwrappedLast = stripNoOpExprWrappers(LastExpr);
     if (const auto *L2R = dyn_cast<CastExpr>(UnwrappedLast);
         L2R && L2R->getCastKind() == CK_LValueToRValue)
@@ -5355,14 +5503,14 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
             return;
         }
         if (AssignCount == 1 && AssignedRHS &&
-            !UsesAnyLocalDecl(UsesAnyLocalDecl, AssignedRHS))
+            !exprReferencesAnyVar(AssignedRHS, LocalDecls))
           constrainLeafCondition(State, AssignedRHS, WantTrue, EscapedVars,
                                  Depth + 1);
         return;
       }
     }
 
-    if (!UsesAnyLocalDecl(UsesAnyLocalDecl, LastExpr))
+    if (!exprReferencesAnyVar(LastExpr, LocalDecls))
       constrainLeafCondition(State, LastExpr, WantTrue, EscapedVars, Depth + 1);
     return;
   }
@@ -5398,18 +5546,23 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
       return;
     }
     if (BO->isLogicalOp()) {
+      llvm::SmallPtrSet<const ValueDecl *, 4> RHSEsc, RHSMod;
+      scanTrylockVars(BO->getRHS(), RHSEsc, RHSMod);
+      bool CanConstrainLHS = !exprReferencesAnyVar(BO->getLHS(), RHSMod);
       // A true && or a false || constrains both operands. Otherwise, one of
       // the operands has the value WantTrue.
       if (WantTrue == (BO->getOpcode() == BO_LAnd)) {
-        constrainLeafCondition(State, BO->getLHS(), WantTrue, EscapedVars,
-                               Depth + 1);
+        if (CanConstrainLHS)
+          constrainLeafCondition(State, BO->getLHS(), WantTrue, EscapedVars,
+                                 Depth + 1);
         constrainLeafCondition(State, BO->getRHS(), WantTrue, EscapedVars,
                                Depth + 1);
       } else {
         TrylockValueState LState = State;
         TrylockValueState RState = State;
-        constrainLeafCondition(LState, BO->getLHS(), WantTrue, EscapedVars,
-                               Depth + 1);
+        if (CanConstrainLHS)
+          constrainLeafCondition(LState, BO->getLHS(), WantTrue, EscapedVars,
+                                 Depth + 1);
         constrainLeafCondition(RState, BO->getRHS(), WantTrue, EscapedVars,
                                Depth + 1);
         State.Infeasible = true;
@@ -5462,7 +5615,8 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
               (isa<UnaryOperator>(StrippedSub) &&
                cast<UnaryOperator>(StrippedSub)->getOpcode() == UO_LNot) ||
               (isa<BinaryOperator>(StrippedSub) &&
-               (cast<BinaryOperator>(StrippedSub)->isComparisonOp() ||
+               (cast<BinaryOperator>(StrippedSub)->isRelationalOp() ||
+                cast<BinaryOperator>(StrippedSub)->isEqualityOp() ||
                 cast<BinaryOperator>(StrippedSub)->isLogicalOp()));
           if (!IsZeroOrOne)
             return false;
@@ -5511,15 +5665,10 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
 
   if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
     const Expr *Cond = SS->getCond();
-    if (!Cond)
+    auto CondDom = Cond ? getScalarDomain(Cond->getType()) : std::nullopt;
+    if (!CondDom)
       return;
-    const ValueDecl *VD = extractTrackableVarExpr(Cond, EscapedVars);
-    auto DomOpt =
-        VD ? getScalarDomain(VD->getType()) : getScalarDomain(Cond->getType());
-    if (!DomOpt)
-      return;
-    const IntDomain &Dom = *DomOpt;
-    const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
+    const SwitchCaseTable &Table = getSwitchCaseTable(SS, *CondDom);
     if (!Table.Valid)
       return;
     auto SwitchEdgeSet = getSwitchEdgeSet(PredBlock, Table, CurrBlock);
@@ -5527,30 +5676,40 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
       State.Infeasible = true;
       return;
     }
-    const IntRangeSet &EdgeSet = *SwitchEdgeSet;
+    const IntRangeSet &CondEdgeSet = *SwitchEdgeSet;
 
+    SmallVector<const CastExpr *, 2> SwitchCasts;
+    const Expr *SubE = Cond;
+    const ValueDecl *VD = nullptr;
+    while (SubE) {
+      if ((VD = extractTrackableVarExpr(SubE, EscapedVars)))
+        break;
+      SubE = skipValuePreservingWrappers(SubE, /*C=*/nullptr,
+                                         /*IgnoreSideEffects=*/false);
+      const auto *CE = dyn_cast_or_null<CastExpr>(SubE);
+      if (!CE || !isBijectiveReinterpretCast(CE, *ASTCtx))
+        break;
+      SwitchCasts.push_back(CE);
+      SubE = CE->getSubExpr();
+    }
     if (VD) {
-      IntRangeSet Cur = IntRangeSet::full(Dom);
-      if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
-        Cur = It->second;
-      IntRangeSet Restricted = Cur.intersect(EdgeSet);
-      if (Restricted.empty()) {
-        State.Infeasible = true;
-        return;
+      if (auto VarDom = getScalarDomain(VD->getType())) {
+        IntRangeSet MappedEdge = mapRangeBackwardThroughBijectiveCasts(
+            CondEdgeSet, SwitchCasts, *VarDom, *ASTCtx);
+        restrictVarRange(State, VD, *VarDom, MappedEdge);
+        if (State.Infeasible)
+          return;
       }
-      State.VarRanges[VD] = std::move(Restricted);
     }
-    if (auto CondDom = getScalarDomain(Cond->getType())) {
-      const Expr *StrippedCond = stripNoOpExprWrappers(Cond);
-      IntRangeSet CondEdge = reprojectRangeSet(EdgeSet, *CondDom);
-      if (auto Cur = evaluatePureExprRange(StrippedCond, State))
-        CondEdge = CondEdge.intersect(*Cur);
-      if (CondEdge.empty()) {
-        State.Infeasible = true;
-        return;
-      }
-      State.ExprRanges[StrippedCond] = std::move(CondEdge);
+    const Expr *StrippedCond = stripNoOpExprWrappers(Cond);
+    IntRangeSet CondEdge = CondEdgeSet;
+    if (auto Cur = evaluatePureExprRange(StrippedCond, State))
+      CondEdge = CondEdge.intersect(*Cur);
+    if (CondEdge.empty()) {
+      State.Infeasible = true;
+      return;
     }
+    State.ExprRanges[StrippedCond] = std::move(CondEdge);
     return;
   }
 
@@ -5582,9 +5741,6 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
   }
 
   constrainLeafCondition(State, LeafCond, TakeTrue, EscapedVars);
-  // Also constrain the whole && / || chain.
-  if (StrippedRaw != LeafCond)
-    constrainLeafCondition(State, StrippedRaw, TakeTrue, EscapedVars);
 }
 
 void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
@@ -5594,7 +5750,7 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
 
   auto UnwrapDirectTrylockCall =
       [&](const Expr *E, LocalVarContext Ctx, QualType VarTy,
-          bool &PreservesExactInt) -> const CallExpr * {
+          IntRangeSet &CallRange, bool &PreservesExactInt) -> const CallExpr * {
     PreservesExactInt = true;
     while ((E = skipValuePreservingWrappers(E, &Ctx))) {
       if (const auto *CallExp = dyn_cast<CallExpr>(E))
@@ -5602,6 +5758,21 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
       const auto *CE = dyn_cast<CastExpr>(E);
       if (!CE)
         return nullptr;
+      if (isBijectiveReinterpretCast(CE, *ASTCtx)) {
+        if (PreservesExactInt) {
+          QualType DstScalarTy = CE->getType()->isAnyPointerType()
+                                     ? ASTCtx->getUIntPtrType()
+                                     : CE->getType();
+          QualType SrcScalarTy = CE->getSubExpr()->getType()->isAnyPointerType()
+                                     ? ASTCtx->getUIntPtrType()
+                                     : CE->getSubExpr()->getType();
+          IntDomain DstDom = IntDomain::forType(DstScalarTy, *ASTCtx);
+          CallRange = castIntegralRangeSet(reprojectRangeSet(CallRange, DstDom),
+                                           SrcScalarTy, *ASTCtx);
+        }
+        E = CE->getSubExpr();
+        continue;
+      }
       // Casts that preserve whether the value is zero, but not the value.
       switch (CE->getCastKind()) {
       case CK_DerivedToBase:
@@ -5632,9 +5803,11 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
     auto VarDom = getScalarDomain(VD->getType());
     if (!VarDom)
       continue;
+    IntRangeSet CallRange = VR->second;
     bool PreservesExactInt = false;
-    const CallExpr *CallExp = UnwrapDirectTrylockCall(
-        DefPair.first, DefPair.second, VD->getType(), PreservesExactInt);
+    const CallExpr *CallExp =
+        UnwrapDirectTrylockCall(DefPair.first, DefPair.second, VD->getType(),
+                                CallRange, PreservesExactInt);
     if (!CallExp)
       continue;
     const auto *Callee = dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl());
@@ -5651,13 +5824,19 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
     bool ExactInt = PreservesExactInt &&
                     isRangeTrylockReturnType(CallExp->getType()) &&
                     isRangeTrylockReturnType(VD->getType());
+    IntDomain EvalDom =
+        PreservesExactInt ? getTrylockCallDomain(CallExp) : *VarDom;
+    if (PreservesExactInt)
+      CallRange = reprojectRangeSet(CallRange, EvalDom);
     for (const Attr *A : trylockAttrs(Callee)) {
+      if (!trylockAttrAppliesTo(A, CallExp->getType()))
+        continue;
       if (isa<TryAcquireCapabilityRangeAttr>(A) && !ExactInt)
         continue;
       if (State.AcquiredTrylockAttrs.contains({CallExp, A}))
         continue;
-      auto SuccSet = getTrylockSuccessSet(A, *VarDom);
-      if (SuccSet && VR->second.subsetOfSet(*SuccSet) &&
+      auto SuccSet = getTrylockSuccessSet(A, EvalDom);
+      if (SuccSet && !CallRange.empty() && CallRange.subsetOfSet(*SuccSet) &&
           collectTrylockCaps(A, CallExp, Callee, ExclusiveLocksToAdd,
                              SharedLocksToAdd))
         State.AcquiredTrylockAttrs.insert({CallExp, A});
@@ -6474,7 +6653,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign)
       return EvalSub(BO->getRHS(), TargetDom, Out);
 
-    if (BO->isComparisonOp()) {
+    if (BO->isRelationalOp() || BO->isEqualityOp()) {
       auto LDom = getScalarDomain(BO->getLHS()->getType());
       auto RDom = getScalarDomain(BO->getRHS()->getType());
       if (!LDom || !RDom)
@@ -8004,6 +8183,10 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   const NamedDecl *D = walker.getDecl();
   ASTCtx = &AC.getASTContext();
   RangeCondCache.clear();
+  TerminatorCondCache.clear();
+  CurrentSortedGraph = nullptr;
+  BuiltLogicalOpTermBlock = false;
+  LogicalOpTermBlock.clear();
   SwitchTables.clear();
   InlineBodyCache.clear();
   InlineExpansionCount = 0;
@@ -8051,6 +8234,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       LocalVarMap.addEscapedVar(VD);
   }
   LocalVarMap.traverseCFG(CFGraph, SortedGraph, BlockInfo);
+  CurrentSortedGraph = SortedGraph;
 
   // Fill in source locations for all CFGBlocks.
   findBlockLocations(CFGraph, SortedGraph, BlockInfo);
