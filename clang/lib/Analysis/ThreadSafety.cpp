@@ -6131,9 +6131,31 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomes(
     const SmallVectorImpl<PendingTrylockAcquire> &InPending,
     const TrylockValueState &State, LocalVarContext Ctx, bool UseVarRanges,
     SmallVectorImpl<ReturnEvalOutcome> &Out, unsigned Depth) {
+  if (State.Infeasible)
+    return;
+  if (!E || Depth > 24 || E->isTypeDependent() || E->isValueDependent()) {
+    Out.push_back({IntRangeSet::full(TargetDom),
+                   InLockset,
+                   {InPending.begin(), InPending.end()}});
+    return;
+  }
+
+  E = stripNoOpExprWrappers(E);
   SmallVector<ReturnEvalOutcome, 4> Local;
   evaluateReturnOutcomesImpl(E, TargetDom, InLockset, InPending, State, Ctx,
                              UseVarRanges, Local, Depth);
+
+  // Drop the values that contradict the range recorded for E, e.g. by the
+  // condition of a branch that has been taken.
+  if (UseVarRanges || isa<CallExpr>(E)) {
+    if (auto It = State.ExprRanges.find(E); It != State.ExprRanges.end()) {
+      IntRangeSet Allowed = reprojectRangeSet(It->second, TargetDom);
+      for (ReturnEvalOutcome &O : Local)
+        O.Values = O.Values.intersect(Allowed);
+      llvm::erase_if(
+          Local, [](const ReturnEvalOutcome &O) { return O.Values.empty(); });
+    }
+  }
 
   // Merge outcomes that only differ in their values. This keeps the number
   // of outcomes linear instead of exponential in the number of trylock calls
@@ -6192,21 +6214,21 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomes(
     Out.push_back(std::move(O));
 }
 
+/// Helper of evaluateReturnOutcomes() that evaluates the non-null and
+/// non-dependent expression \p E, which has been stripped of no-op wrappers,
+/// without restricting the values to the range recorded for \p E.
 void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     const Expr *E, const IntDomain &TargetDom, const FactSet &InLockset,
     const SmallVectorImpl<PendingTrylockAcquire> &InPending,
     const TrylockValueState &State, LocalVarContext Ctx, bool UseVarRanges,
     SmallVectorImpl<ReturnEvalOutcome> &Out, unsigned Depth) {
-  if (State.Infeasible)
-    return;
-
-  auto EmitDefault = [&]() {
-    ReturnEvalOutcome O;
-    O.Values = IntRangeSet::full(TargetDom);
-    O.Lockset = InLockset;
-    O.PendingAcquires.assign(InPending.begin(), InPending.end());
-    Out.push_back(std::move(O));
+  // Add an outcome with the values Values and the lock state InLockset and
+  // InPending to Out.
+  auto Emit = [&](IntRangeSet Values) {
+    Out.push_back(
+        {std::move(Values), InLockset, {InPending.begin(), InPending.end()}});
   };
+  auto EmitDefault = [&]() { Emit(IntRangeSet::full(TargetDom)); };
   // Add a copy of O with the value V to Out.
   auto PushValue = [&](ReturnEvalOutcome O, int V) {
     O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(V));
@@ -6221,45 +6243,12 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       PushValue(std::move(O), 1);
   };
 
-  if (!E || Depth > 24 || E->isTypeDependent() || E->isValueDependent()) {
-    EmitDefault();
-    return;
-  }
-
-  E = stripNoOpExprWrappers(E);
-  size_t StartIdx = Out.size();
-  auto ApplyExprConstraint = [&]() {
-    if (!UseVarRanges && !isa<CallExpr>(E))
-      return;
-    auto It = State.ExprRanges.find(E);
-    if (It == State.ExprRanges.end())
-      return;
-    IntRangeSet Allowed = reprojectRangeSet(It->second, TargetDom);
-    size_t WriteIdx = StartIdx;
-    for (size_t I = StartIdx; I < Out.size(); ++I) {
-      Out[I].Values = Out[I].Values.intersect(Allowed);
-      if (!Out[I].Values.empty()) {
-        if (WriteIdx != I)
-          Out[WriteIdx] = std::move(Out[I]);
-        ++WriteIdx;
-      }
-    }
-    Out.truncate(WriteIdx);
-  };
-
   if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
     if (BO->isLogicalOp() && UseVarRanges) {
       if (auto It = State.ShortCircuitedOps.find(BO);
-          It != State.ShortCircuitedOps.end()) {
-        ReturnEvalOutcome O;
-        O.Values = IntRangeSet::single(TargetDom,
-                                       llvm::APSInt::get(It->second ? 1 : 0));
-        O.Lockset = InLockset;
-        O.PendingAcquires.assign(InPending.begin(), InPending.end());
-        Out.push_back(std::move(O));
-        ApplyExprConstraint();
-        return;
-      }
+          It != State.ShortCircuitedOps.end())
+        return Emit(IntRangeSet::single(TargetDom,
+                                        llvm::APSInt::get(It->second ? 1 : 0)));
     }
   }
 
@@ -6271,20 +6260,10 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       llvm::SaveAndRestore AssumeNonNull(AssumeDerefNonNull, true);
       R = evaluatePureExprRange(E, EvalState);
     }
-    if (R) {
-      IntRangeSet Mapped = reprojectRangeSet(*R, TargetDom);
-      if (!Mapped.empty()) {
-        ReturnEvalOutcome O;
-        O.Values = std::move(Mapped);
-        O.Lockset = InLockset;
-        O.PendingAcquires.assign(InPending.begin(), InPending.end());
-        Out.push_back(std::move(O));
-      }
-      ApplyExprConstraint();
-      return;
-    }
-    EmitDefault();
-    ApplyExprConstraint();
+    if (!R)
+      return EmitDefault();
+    if (IntRangeSet Mapped = reprojectRangeSet(*R, TargetDom); !Mapped.empty())
+      Emit(std::move(Mapped));
     return;
   }
 
@@ -6293,13 +6272,10 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       if (const auto *Last = dyn_cast<Expr>(CS->body_back())) {
         evaluateReturnOutcomes(Last, TargetDom, InLockset, InPending, State,
                                Ctx, UseVarRanges, Out, Depth + 1);
-        ApplyExprConstraint();
         return;
       }
     }
-    EmitDefault();
-    ApplyExprConstraint();
-    return;
+    return EmitDefault();
   }
 
   if (const auto *CE = dyn_cast<CastExpr>(E)) {
@@ -6308,7 +6284,6 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     case CK_NoOp:
       evaluateReturnOutcomes(CE->getSubExpr(), TargetDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Out, Depth + 1);
-      ApplyExprConstraint();
       return;
     case CK_BitCast:
       if (CE->getType()->isAnyPointerType() &&
@@ -6316,22 +6291,16 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         evaluateReturnOutcomes(CE->getSubExpr(), TargetDom, InLockset,
                                InPending, State, Ctx, UseVarRanges, Out,
                                Depth + 1);
-        ApplyExprConstraint();
         return;
       }
-      EmitDefault();
-      ApplyExprConstraint();
-      return;
+      return EmitDefault();
     case CK_DerivedToBase:
     case CK_UncheckedDerivedToBase:
       if (CE->getType()->isAnyPointerType() &&
           CE->getSubExpr()->getType()->isAnyPointerType()) {
         auto PtrDom = getScalarDomain(CE->getType());
-        if (!PtrDom) {
-          EmitDefault();
-          ApplyExprConstraint();
-          return;
-        }
+        if (!PtrDom)
+          return EmitDefault();
         SmallVector<ReturnEvalOutcome, 2> Sub;
         evaluateReturnOutcomes(CE->getSubExpr(), *PtrDom, InLockset, InPending,
                                State, Ctx, UseVarRanges, Sub, Depth + 1);
@@ -6341,25 +6310,16 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
           if (!SO.Values.empty())
             Out.push_back(std::move(SO));
         }
-        ApplyExprConstraint();
         return;
       }
-      EmitDefault();
-      ApplyExprConstraint();
-      return;
+      return EmitDefault();
     case CK_PointerToIntegral: {
       if (!CE->getSubExpr()->getType()->isAnyPointerType() ||
-          !CE->getType()->isIntegralOrEnumerationType()) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+          !CE->getType()->isIntegralOrEnumerationType())
+        return EmitDefault();
       auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
-      if (!SubDom) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+      if (!SubDom)
+        return EmitDefault();
       SmallVector<ReturnEvalOutcome, 2> Sub;
       evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Sub, Depth + 1);
@@ -6369,16 +6329,12 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         if (!SO.Values.empty())
           Out.push_back(std::move(SO));
       }
-      ApplyExprConstraint();
       return;
     }
     case CK_IntegralToPointer: {
       if (!CE->getType()->isAnyPointerType() ||
-          !CE->getSubExpr()->getType()->isIntegralOrEnumerationType()) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+          !CE->getSubExpr()->getType()->isIntegralOrEnumerationType())
+        return EmitDefault();
       IntDomain SubDom =
           IntDomain::forType(CE->getSubExpr()->getType(), *ASTCtx);
       SmallVector<ReturnEvalOutcome, 2> Sub;
@@ -6391,33 +6347,25 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         if (!SO.Values.empty())
           Out.push_back(std::move(SO));
       }
-      ApplyExprConstraint();
       return;
     }
     case CK_IntegralToBoolean:
     case CK_PointerToBoolean:
     case CK_MemberPointerToBoolean: {
       auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
-      if (!SubDom) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+      if (!SubDom)
+        return EmitDefault();
       SmallVector<ReturnEvalOutcome, 2> Sub;
       evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Sub, Depth + 1);
       for (auto &SO : Sub)
         PushTruthValues(std::move(SO));
-      ApplyExprConstraint();
       return;
     }
     case CK_BooleanToSignedIntegral: {
       auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
-      if (!SubDom) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+      if (!SubDom)
+        return EmitDefault();
       SmallVector<ReturnEvalOutcome, 2> Sub;
       evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Sub, Depth + 1);
@@ -6426,16 +6374,12 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         if (!SO.Values.empty())
           Out.push_back(std::move(SO));
       }
-      ApplyExprConstraint();
       return;
     }
     case CK_IntegralCast: {
       if (!CE->getSubExpr()->getType()->isIntegralOrEnumerationType() ||
-          !CE->getType()->isIntegralOrEnumerationType()) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+          !CE->getType()->isIntegralOrEnumerationType())
+        return EmitDefault();
       IntDomain SubDom =
           IntDomain::forType(CE->getSubExpr()->getType(), *ASTCtx);
       SmallVector<ReturnEvalOutcome, 2> Sub;
@@ -6447,13 +6391,10 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         if (!SO.Values.empty())
           Out.push_back(std::move(SO));
       }
-      ApplyExprConstraint();
       return;
     }
     default:
-      EmitDefault();
-      ApplyExprConstraint();
-      return;
+      return EmitDefault();
     }
   }
 
@@ -6489,13 +6430,10 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
           if (!SO.Values.empty())
             Out.push_back(std::move(SO));
         }
-        ApplyExprConstraint();
         return;
       }
     }
-    EmitDefault();
-    ApplyExprConstraint();
-    return;
+    return EmitDefault();
   }
 
   if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
@@ -6503,14 +6441,10 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     case UO_Plus:
       evaluateReturnOutcomes(UO->getSubExpr(), TargetDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Out, Depth + 1);
-      ApplyExprConstraint();
       return;
     case UO_Minus: {
-      if (!UO->getType()->isIntegralOrEnumerationType()) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+      if (!UO->getType()->isIntegralOrEnumerationType())
+        return EmitDefault();
       SmallVector<ReturnEvalOutcome, 2> Sub;
       evaluateReturnOutcomes(UO->getSubExpr(), TargetDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Sub, Depth + 1);
@@ -6520,16 +6454,12 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         if (!SO.Values.empty())
           Out.push_back(std::move(SO));
       }
-      ApplyExprConstraint();
       return;
     }
     case UO_LNot: {
       auto SubDom = getScalarDomain(UO->getSubExpr()->getType());
-      if (!SubDom) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+      if (!SubDom)
+        return EmitDefault();
       SmallVector<ReturnEvalOutcome, 2> Sub;
       evaluateReturnOutcomes(UO->getSubExpr(), *SubDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Sub, Depth + 1);
@@ -6539,13 +6469,10 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         if (SO.Values.mayBeNonZero())
           PushValue(std::move(SO), 0);
       }
-      ApplyExprConstraint();
       return;
     }
     default:
-      EmitDefault();
-      ApplyExprConstraint();
-      return;
+      return EmitDefault();
     }
   }
 
@@ -6553,18 +6480,14 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign) {
       evaluateReturnOutcomes(BO->getRHS(), TargetDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Out, Depth + 1);
-      ApplyExprConstraint();
       return;
     }
 
     if (BO->isComparisonOp()) {
       auto LDom = getScalarDomain(BO->getLHS()->getType());
       auto RDom = getScalarDomain(BO->getRHS()->getType());
-      if (!LDom || !RDom) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+      if (!LDom || !RDom)
+        return EmitDefault();
       bool IsMemberPtrCmp = BO->getLHS()->getType()->isMemberPointerType();
       SmallVector<ReturnEvalOutcome, 2> LHSOut;
       evaluateReturnOutcomes(BO->getLHS(), *LDom, InLockset, InPending, State,
@@ -6586,18 +6509,14 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
           PushTruthValues(std::move(RO));
         }
       }
-      ApplyExprConstraint();
       return;
     }
 
     if (BO->isLogicalOp()) {
       auto LDom = getScalarDomain(BO->getLHS()->getType());
       auto RDom = getScalarDomain(BO->getRHS()->getType());
-      if (!LDom || !RDom) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+      if (!LDom || !RDom)
+        return EmitDefault();
       SmallVector<ReturnEvalOutcome, 2> LHSOut;
       evaluateReturnOutcomes(BO->getLHS(), *LDom, InLockset, InPending, State,
                              Ctx, UseVarRanges, LHSOut, Depth + 1);
@@ -6616,22 +6535,16 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         for (auto &RO : RHSOut)
           PushTruthValues(std::move(RO));
       }
-      ApplyExprConstraint();
       return;
     }
 
-    EmitDefault();
-    ApplyExprConstraint();
-    return;
+    return EmitDefault();
   }
 
   if (const auto *COP = dyn_cast<AbstractConditionalOperator>(E)) {
     auto CondDom = getScalarDomain(COP->getCond()->getType());
-    if (!CondDom) {
-      EmitDefault();
-      ApplyExprConstraint();
-      return;
-    }
+    if (!CondDom)
+      return EmitDefault();
     SmallVector<ReturnEvalOutcome, 2> CondOut;
     evaluateReturnOutcomes(COP->getCond(), *CondDom, InLockset, InPending,
                            State, Ctx, UseVarRanges, CondOut, Depth + 1);
@@ -6645,18 +6558,14 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
                                CO.PendingAcquires, State, Ctx, UseVarRanges,
                                Out, Depth + 1);
     }
-    ApplyExprConstraint();
     return;
   }
 
   if (const auto *CallExp = dyn_cast<CallExpr>(E)) {
     if (isBuiltinExpectCall(CallExp)) {
       auto ArgDom = getScalarDomain(CallExp->getArg(0)->getType());
-      if (!ArgDom) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+      if (!ArgDom)
+        return EmitDefault();
       SmallVector<ReturnEvalOutcome, 2> Sub;
       evaluateReturnOutcomes(CallExp->getArg(0), *ArgDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Sub, Depth + 1);
@@ -6667,16 +6576,12 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         if (!SO.Values.empty())
           Out.push_back(std::move(SO));
       }
-      ApplyExprConstraint();
       return;
     }
 
     const auto *Callee = dyn_cast_or_null<NamedDecl>(CallExp->getCalleeDecl());
-    if (!Callee) {
-      EmitDefault();
-      ApplyExprConstraint();
-      return;
-    }
+    if (!Callee)
+      return EmitDefault();
 
     if (!hasTrylockAttr(Callee)) {
       if (auto InlineInfo = getCachedTrivialInlineBody(CallExp)) {
@@ -6763,7 +6668,6 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
             if (!FState.Infeasible)
               EmitCalleeRet(InlineInfo->ElseRet, FState, B.Lockset, B.Pending);
           }
-          ApplyExprConstraint();
           return;
         }
       }
@@ -6832,11 +6736,8 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       if (!trylockAttrAppliesTo(A, CallExp->getType()))
         continue;
       auto SuccSet = getTrylockSuccessSet(A, TargetDom);
-      if (!SuccSet) {
-        EmitDefault();
-        ApplyExprConstraint();
-        return;
-      }
+      if (!SuccSet)
+        return EmitDefault();
       CapExprSet Caps;
       getTrylockMutexIDs(Caps, A, CallExp, Callee);
       RecordCallSpec(A, *SuccSet, Caps,
@@ -6871,12 +6772,10 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     for (auto &CO : CallOutcomes)
       if (!CO.Values.empty())
         Out.push_back(std::move(CO));
-    ApplyExprConstraint();
     return;
   }
 
   EmitDefault();
-  ApplyExprConstraint();
 }
 
 void ThreadSafetyAnalyzer::applyScopeExitCleanups(FactSet &StateSet,
