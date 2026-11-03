@@ -1133,6 +1133,14 @@ struct UnderlyingCapability {
   UnderlyingCapabilityKind Kind;
 };
 
+/// The reentrancy depth of \p Fact, or zero if \p Fact is not a lockable
+/// fact.
+static unsigned getFactReentrancyDepth(const FactEntry &Fact) {
+  if (const auto *LFE = dyn_cast<LockableFactEntry>(&Fact))
+    return LFE->getReentrancyDepth();
+  return 0;
+}
+
 class ScopedLockableFactEntry final
     : public FactEntry,
       private llvm::TrailingObjects<ScopedLockableFactEntry,
@@ -3559,11 +3567,15 @@ scanBlockModifiedVars(const CFGBlock *B,
   }
 }
 
+static bool isScopedLockable(const TagDecl *TD) {
+  return TD->getMostRecentDecl()->hasAttr<ScopedLockableAttr>();
+}
+
 static bool hasThreadSafetyCallEffects(const NamedDecl *Callee,
                                        const Expr *CallOrCtor) {
   if (CallOrCtor) {
     if (const auto *TagT = CallOrCtor->getType()->getAs<TagType>())
-      if (TagT->getDecl()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>())
+      if (isScopedLockable(TagT->getDecl()))
         return true;
   }
   if (!Callee)
@@ -3785,10 +3797,10 @@ bool ThreadSafetyAnalyzer::isPureExitBlock(const CFGBlock *B,
       if (!Callee)
         return false;
       if (const auto *TagT = CE->getType()->getAs<TagType>())
-        if (TagT->getDecl()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>())
+        if (isScopedLockable(TagT->getDecl()))
           return false;
       if (const auto *MD = dyn_cast<CXXMethodDecl>(Callee))
-        if (MD->getParent()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>())
+        if (isScopedLockable(MD->getParent()))
           return false;
       if (const auto *FD = dyn_cast<FunctionDecl>(Callee))
         for (const ParmVarDecl *P : FD->parameters())
@@ -3808,6 +3820,13 @@ bool ThreadSafetyAnalyzer::isPureExitBlock(const CFGBlock *B,
           return TC.equals(Cp);
         });
       };
+      // Whether the capabilities that attribute A names are disjoint from
+      // TargetCaps.
+      auto CheckArgsDisjoint = [&](const auto *A) {
+        if (A->args_size() == 0)
+          return isa<CXXMethodDecl>(Callee) && CheckCapDisjoint(nullptr);
+        return llvm::all_of(A->args(), CheckCapDisjoint);
+      };
 
       for (const Attr *At : Callee->attrs()) {
         switch (At->getKind()) {
@@ -3817,30 +3836,14 @@ bool ThreadSafetyAnalyzer::isPureExitBlock(const CFGBlock *B,
         case attr::AssertCapability:
         case attr::LocksExcluded:
           return false;
-        case attr::ReleaseCapability: {
-          const auto *A = cast<ReleaseCapabilityAttr>(At);
-          if (A->args_size() == 0) {
-            if (!isa<CXXMethodDecl>(Callee) || !CheckCapDisjoint(nullptr))
-              return false;
-          } else {
-            for (Expr *Arg : A->args())
-              if (!CheckCapDisjoint(Arg))
-                return false;
-          }
+        case attr::ReleaseCapability:
+          if (!CheckArgsDisjoint(cast<ReleaseCapabilityAttr>(At)))
+            return false;
           break;
-        }
-        case attr::RequiresCapability: {
-          const auto *A = cast<RequiresCapabilityAttr>(At);
-          if (A->args_size() == 0) {
-            if (!isa<CXXMethodDecl>(Callee) || !CheckCapDisjoint(nullptr))
-              return false;
-          } else {
-            for (Expr *Arg : A->args())
-              if (!CheckCapDisjoint(Arg))
-                return false;
-          }
+        case attr::RequiresCapability:
+          if (!CheckArgsDisjoint(cast<RequiresCapabilityAttr>(At)))
+            return false;
           break;
-        }
         default:
           break;
         }
@@ -3855,8 +3858,7 @@ bool ThreadSafetyAnalyzer::isPureExitBlock(const CFGBlock *B,
       // destructor has thread safety attributes.
       const CXXDestructorDecl *DD =
           BI.castAs<CFGTemporaryDtor>().getDestructorDecl(*ASTCtx);
-      if (!DD ||
-          DD->getParent()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>() ||
+      if (!DD || isScopedLockable(DD->getParent()) ||
           hasThreadSafetyCallEffects(DD, /*CallOrCtor=*/nullptr))
         return false;
       break;
@@ -3972,12 +3974,7 @@ bool ThreadSafetyAnalyzer::factSetsEquivalent(const FactSet &A,
         FA.kind() != FB->kind() || FA.negative() != FB->negative() ||
         FA.asserted() != FB->asserted())
       return false;
-    if (const auto *LA = dyn_cast<LockableFactEntry>(&FA)) {
-      const auto *LB = cast<LockableFactEntry>(FB);
-      if (LA->getReentrancyDepth() != LB->getReentrancyDepth())
-        return false;
-    }
-    return true;
+    return getFactReentrancyDepth(FA) == getFactReentrancyDepth(*FB);
   };
   for (FactID ID : A)
     if (!FactMatchesIn(FactMan[ID], B))
@@ -4739,33 +4736,25 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
            llvm::APSInt::compareValues(R.intervals()[0].second, Dom->Hi) >= 0;
   };
 
-  SmallVector<const ValueDecl *, 4> VarsToErase;
-  for (auto &[VD, R] : Dst.VarRanges) {
-    if (auto It = Src.VarRanges.find(VD); It != Src.VarRanges.end()) {
-      R = R.unionWith(It->second);
-      R.widen(MaxStateRangeIntervals);
-      if (CoversDomain(R, VD->getType()))
-        VarsToErase.push_back(VD);
-    } else {
-      VarsToErase.push_back(VD);
+  // Join the ranges of the variables or expressions in DstMap and SrcMap.
+  auto JoinRanges = [&](auto &DstMap, const auto &SrcMap) {
+    using KeyT = typename std::remove_reference_t<decltype(DstMap)>::key_type;
+    SmallVector<KeyT, 4> ToErase;
+    for (auto &[Key, R] : DstMap) {
+      if (auto It = SrcMap.find(Key); It != SrcMap.end()) {
+        R = R.unionWith(It->second);
+        R.widen(MaxStateRangeIntervals);
+        if (CoversDomain(R, Key->getType()))
+          ToErase.push_back(Key);
+      } else {
+        ToErase.push_back(Key);
+      }
     }
-  }
-  for (const ValueDecl *VD : VarsToErase)
-    Dst.VarRanges.erase(VD);
-
-  SmallVector<const Expr *, 4> ExprsToErase;
-  for (auto &[E, R] : Dst.ExprRanges) {
-    if (auto It = Src.ExprRanges.find(E); It != Src.ExprRanges.end()) {
-      R = R.unionWith(It->second);
-      R.widen(MaxStateRangeIntervals);
-      if (CoversDomain(R, E->getType()))
-        ExprsToErase.push_back(E);
-    } else {
-      ExprsToErase.push_back(E);
-    }
-  }
-  for (const Expr *E : ExprsToErase)
-    Dst.ExprRanges.erase(E);
+    for (auto Key : ToErase)
+      DstMap.erase(Key);
+  };
+  JoinRanges(Dst.VarRanges, Src.VarRanges);
+  JoinRanges(Dst.ExprRanges, Src.ExprRanges);
 
   SmallVector<const BinaryOperator *, 2> OpsToErase;
   for (const auto &[BO, Val] : Dst.ShortCircuitedOps) {
@@ -4776,12 +4765,10 @@ unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
   for (const BinaryOperator *BO : OpsToErase)
     Dst.ShortCircuitedOps.erase(BO);
 
-  for (const auto &Key : Src.AcquiredTrylockAttrs)
-    Dst.AcquiredTrylockAttrs.insert(Key);
-  for (const auto &Key : Src.ConsumedTrylockAttrs)
-    Dst.ConsumedTrylockAttrs.insert(Key);
-  for (const CallExpr *CE : Src.DiscardedTrylockCalls)
-    Dst.DiscardedTrylockCalls.insert(CE);
+  llvm::set_union(Dst.AcquiredTrylockAttrs, Src.AcquiredTrylockAttrs);
+  llvm::set_union(Dst.ConsumedTrylockAttrs, Src.ConsumedTrylockAttrs);
+  Dst.DiscardedTrylockCalls.insert(Src.DiscardedTrylockCalls.begin(),
+                                   Src.DiscardedTrylockCalls.end());
   llvm::set_intersect(Dst.DerefNonNullVars, Src.DerefNonNullVars);
 }
 
@@ -5879,23 +5866,13 @@ void ThreadSafetyAnalyzer::updateValueStateForStmtImpl(
     return;
 
   if (const auto *E = dyn_cast<Expr>(S)) {
+    // Keep ShortCircuitedOps such that the enclosing statement can read the
+    // short-circuited value of a logical operator.
     State.ExprRanges.erase(stripNoOpExprWrappers(E));
-    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
-      if (BO->isLogicalOp()) {
-        if (auto It = State.ShortCircuitedOps.find(BO);
-            It != State.ShortCircuitedOps.end()) {
-          // Preserve ShortCircuitedOps[BO] so the enclosing statement can read
-          // the short-circuited value.
-        }
-      }
-    }
-    if (const auto *CE = dyn_cast<CallExpr>(E);
-        CE && DiscardedCalls.contains(CE)) {
-      if (const auto *Callee = dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl());
-          Callee && hasTrylockAttr(Callee))
-        State.DiscardedTrylockCalls.insert(CE);
-    }
     if (const auto *CE = dyn_cast<CallExpr>(E)) {
+      if (const auto *Callee = dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl());
+          Callee && DiscardedCalls.contains(CE) && hasTrylockAttr(Callee))
+        State.DiscardedTrylockCalls.insert(CE);
       SmallVector<AcquiredTrylockKey, 2> ToErase;
       for (const auto &Key : State.AcquiredTrylockAttrs)
         if (Key.first == CE)
@@ -5949,29 +5926,19 @@ void ThreadSafetyAnalyzer::updateValueStateForStmtImpl(
     VD = cast<ValueDecl>(VD->getCanonicalDecl());
     RetireDef(VD, RHS);
     State.DerefNonNullVars.erase(VD);
-    if (!isTrackableLocalVar(VD, EscapedVars)) {
+    if (!isTrackableLocalVar(VD, EscapedVars) || !RHS) {
       State.VarRanges.erase(VD);
       State.UnmaterializedVarDefs.erase(VD);
       return;
     }
-    if (!RHS) {
-      State.VarRanges.erase(VD);
-      State.UnmaterializedVarDefs.erase(VD);
-      return;
-    }
-    if (const ValueDecl *SrcVD = extractTrackableVarExpr(RHS, EscapedVars)) {
-      if (auto DefIt = State.UnmaterializedVarDefs.find(SrcVD);
-          DefIt != State.UnmaterializedVarDefs.end()) {
-        // Copy the definition first: inserting VD may grow the map and
-        // invalidate DefIt.
-        auto Def = DefIt->second;
-        State.UnmaterializedVarDefs.insert_or_assign(VD, Def);
-      } else if (exprHasUnmaterializedTrylock(RHS, StmtCtx, State,
-                                              /*UseStateDefs=*/true))
-        State.UnmaterializedVarDefs.insert_or_assign(
-            VD, std::make_pair(RHS, StmtCtx));
-      else
-        State.UnmaterializedVarDefs.erase(VD);
+    const ValueDecl *SrcVD = extractTrackableVarExpr(RHS, EscapedVars);
+    auto DefIt = SrcVD ? State.UnmaterializedVarDefs.find(SrcVD)
+                       : State.UnmaterializedVarDefs.end();
+    if (DefIt != State.UnmaterializedVarDefs.end()) {
+      // Copy the definition first: inserting VD may grow the map and
+      // invalidate DefIt.
+      auto Def = DefIt->second;
+      State.UnmaterializedVarDefs.insert_or_assign(VD, Def);
     } else if (exprHasUnmaterializedTrylock(RHS, StmtCtx, State,
                                             /*UseStateDefs=*/true)) {
       State.UnmaterializedVarDefs.insert_or_assign(
@@ -7229,11 +7196,8 @@ void ThreadSafetyAnalyzer::checkTrylockExitOutcome(
         continue;
       if (const FactEntry *EntryFact =
               P.ExpectedSet.findLock(FactMan, ExitFact)) {
-        unsigned ReentrancyA = 0, ReentrancyB = 0;
-        if (const auto *LFE = dyn_cast<LockableFactEntry>(EntryFact))
-          ReentrancyA = LFE->getReentrancyDepth();
-        if (const auto *LFE = dyn_cast<LockableFactEntry>(&ExitFact))
-          ReentrancyB = LFE->getReentrancyDepth();
+        unsigned ReentrancyA = getFactReentrancyDepth(*EntryFact);
+        unsigned ReentrancyB = getFactReentrancyDepth(ExitFact);
 
         if (ReentrancyA != ReentrancyB) {
           bool MissingAcquire = ReentrancyB < ReentrancyA;
@@ -7739,7 +7703,7 @@ void BuildLockset::handleCall(const Expr *Exp, const NamedDecl *D,
       assert(inserted.second && "Are we visiting the same expression again?");
       if (isa<CXXConstructExpr>(Exp))
         Self = Placeholder;
-      if (TagT->getDecl()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>())
+      if (isScopedLockable(TagT->getDecl()))
         Scp = CapabilityExpr(Placeholder, Exp->getType(), /*Neg=*/false);
     }
 
@@ -8209,13 +8173,8 @@ bool ThreadSafetyAnalyzer::join(const FactEntry &A, const FactEntry &B,
                                 LockErrorKind EntryLEK) {
   // Whether we can replace \p A by \p B.
   const bool CanModify = EntryLEK != LEK_LockedSomeLoopIterations;
-  unsigned int ReentrancyDepthA = 0;
-  unsigned int ReentrancyDepthB = 0;
-
-  if (const auto *LFE = dyn_cast<LockableFactEntry>(&A))
-    ReentrancyDepthA = LFE->getReentrancyDepth();
-  if (const auto *LFE = dyn_cast<LockableFactEntry>(&B))
-    ReentrancyDepthB = LFE->getReentrancyDepth();
+  unsigned int ReentrancyDepthA = getFactReentrancyDepth(A);
+  unsigned int ReentrancyDepthB = getFactReentrancyDepth(B);
 
   if (ReentrancyDepthA != ReentrancyDepthB) {
     Handler.handleMutexHeldEndOfScope(B.getKind(), B.toString(), B.loc(),
@@ -8272,12 +8231,6 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
     const CapExprSet *TrylockRebranchCaps, bool RebranchIgnoresDepth) {
   FactSet EntrySetOrig = EntrySet;
 
-  auto GetFactReentrancyDepth = [](const FactEntry &FE) -> unsigned {
-    if (const auto *LFE = dyn_cast<LockableFactEntry>(&FE))
-      return LFE->getReentrancyDepth();
-    return 0;
-  };
-
   auto IsTrylockRebranched = [TrylockRebranchCaps](const FactEntry &FE) {
     return TrylockRebranchCaps &&
            llvm::any_of(*TrylockRebranchCaps, [&FE](const CapabilityExpr &CE) {
@@ -8296,8 +8249,8 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
           EntryLEK == LEK_LockedSomePredecessors &&
           EntryFact.loc() == ExitFact.loc() && !EntryFact.managed() &&
           !ExitFact.managed() &&
-          (RebranchIgnoresDepth || GetFactReentrancyDepth(EntryFact) ==
-                                       GetFactReentrancyDepth(ExitFact))) {
+          (RebranchIgnoresDepth || getFactReentrancyDepth(EntryFact) ==
+                                       getFactReentrancyDepth(ExitFact))) {
         // Both facts have been created by the same trylock call, whose result
         // is checked again by the terminator of this block. The lock kind may
         // differ if the trylock function has range attributes for different
@@ -8832,11 +8785,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       FactSet::iterator It = Acc.findLockIter(FactMan, AFact);
       if (It == Acc.end())
         continue;
-      unsigned DepthA = 0, DepthB = 0;
-      if (const auto *LFE = dyn_cast<LockableFactEntry>(&AFact))
-        DepthA = LFE->getReentrancyDepth();
-      if (const auto *LFE = dyn_cast<LockableFactEntry>(BFact))
-        DepthB = LFE->getReentrancyDepth();
+      unsigned DepthA = getFactReentrancyDepth(AFact);
+      unsigned DepthB = getFactReentrancyDepth(*BFact);
       if (DepthA != DepthB) {
         if (DepthB < DepthA)
           Acc.replaceLock(FactMan, It, BFact);
