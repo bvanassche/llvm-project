@@ -2243,13 +2243,9 @@ static bool hasTrylockAttr(const Decl *D) {
          D->hasAttr<TryAcquireCapabilityRangeAttr>();
 }
 
-/// The trylock attributes of \p D: try_acquire_capability attributes first,
-/// followed by try_acquire_capability_range attributes.
-static SmallVector<const Attr *, 4> trylockAttrs(const Decl *D) {
-  SmallVector<const Attr *, 4> Attrs;
-  llvm::append_range(Attrs, D->specific_attrs<TryAcquireCapabilityAttr>());
-  llvm::append_range(Attrs, D->specific_attrs<TryAcquireCapabilityRangeAttr>());
-  return Attrs;
+/// The trylock attributes of \p D in declaration order.
+static auto trylockAttrs(const Decl *D) {
+  return llvm::make_filter_range(D->attrs(), isTrylockAttr);
 }
 
 /// Call \p F with trylock attribute \p A cast to its attribute class.
