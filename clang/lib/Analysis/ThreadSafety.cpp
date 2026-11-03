@@ -1545,6 +1545,9 @@ public:
       RangeCondCache;
   TrylockRangeCondResult evaluateTerminatorTrylockCond(const Stmt *Cond,
                                                        LocalVarContext C);
+  bool getTerminatorTrylockCond(const CFGBlock *Block,
+                                TrylockRangeCondResult &Res,
+                                const SwitchCaseTable *&Table);
 
   void getEdgeLockset(
       FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
@@ -1694,6 +1697,42 @@ public:
     }
     InlineExpansionScope(const InlineExpansionScope &) = delete;
     InlineExpansionScope &operator=(const InlineExpansionScope &) = delete;
+  };
+
+  /// If beta warnings are enabled, makes the SExpr builder look up local
+  /// variables in a local variable context for the lifetime of this object.
+  class LocalVarLookupScope {
+    ThreadSafetyAnalyzer &Analyzer;
+    bool Active;
+
+  public:
+    /// Look up local variables in a copy of \p Ctx.
+    LocalVarLookupScope(ThreadSafetyAnalyzer &Analyzer, LocalVarContext Ctx)
+        : Analyzer(Analyzer), Active(Analyzer.Handler.issueBetaWarnings()) {
+      if (Active)
+        Analyzer.SxBuilder.setLookupLocalVarExpr(
+            [&Analyzer, Ctx](const NamedDecl *D) mutable -> const Expr * {
+              return Analyzer.LocalVarMap.lookupExpr(D, Ctx);
+            });
+    }
+    /// Look up local variables in the context that \p Ctx points to at the
+    /// time of each lookup.
+    LocalVarLookupScope(ThreadSafetyAnalyzer &Analyzer,
+                        const LocalVarContext *Ctx)
+        : Analyzer(Analyzer), Active(Analyzer.Handler.issueBetaWarnings()) {
+      if (Active)
+        Analyzer.SxBuilder.setLookupLocalVarExpr(
+            [&Analyzer, Ctx](const NamedDecl *D) -> const Expr * {
+              LocalVarContext LookupCtx = *Ctx;
+              return Analyzer.LocalVarMap.lookupExpr(D, LookupCtx);
+            });
+    }
+    ~LocalVarLookupScope() {
+      if (Active)
+        Analyzer.SxBuilder.setLookupLocalVarExpr(nullptr);
+    }
+    LocalVarLookupScope(const LocalVarLookupScope &) = delete;
+    LocalVarLookupScope &operator=(const LocalVarLookupScope &) = delete;
   };
 
   std::optional<TrivialInlineBody>
@@ -2962,6 +3001,67 @@ ThreadSafetyAnalyzer::evaluateTerminatorTrylockCond(const Stmt *Cond,
   return Res;
 }
 
+/// Whether \p Succ is the first (true) and whether it is the second (false)
+/// successor of \p Pred.
+static std::pair<bool, bool> getBranchEdgeKinds(const CFGBlock *Pred,
+                                                const CFGBlock *Succ) {
+  unsigned N = Pred->succ_size();
+  return {N > 0 && *Pred->succ_begin() == Succ,
+          N > 1 && *(Pred->succ_begin() + 1) == Succ};
+}
+
+/// The values of the condition of the switch statement that terminates
+/// \p Pred for which the edge to \p Succ is taken according to \p Table, or
+/// std::nullopt if that edge cannot be taken.
+static std::optional<ThreadSafetyAnalyzer::IntRangeSet>
+getSwitchEdgeSet(const CFGBlock *Pred,
+                 const ThreadSafetyAnalyzer::SwitchCaseTable &Table,
+                 const CFGBlock *Succ) {
+  const auto *TargetCS = dyn_cast_if_present<CaseStmt>(Succ->getLabel());
+  if (auto It = Table.CaseSets.find(TargetCS); It != Table.CaseSets.end())
+    return It->second;
+  if (!isa_and_nonnull<DefaultStmt>(Succ->getLabel()) &&
+      cast<SwitchStmt>(Pred->getTerminatorStmt())->isAllEnumCasesCovered())
+    return std::nullopt;
+  return Table.DefaultSet;
+}
+
+/// If the terminator of \p Block branches on the result of a trylock call,
+/// store the call, its callee and the domain of its result in \p Res and
+/// return true. For a switch statement, \p Table is set to the case table of
+/// the switch statement. Otherwise \p Table is set to null and Res.TrueSet and
+/// Res.FalseSet hold the results for which the first and the second successor
+/// are taken.
+bool ThreadSafetyAnalyzer::getTerminatorTrylockCond(
+    const CFGBlock *Block, TrylockRangeCondResult &Res,
+    const SwitchCaseTable *&Table) {
+  Table = nullptr;
+  const Stmt *Term = Block->getTerminatorStmt();
+  if (!Term || isa<IndirectGotoStmt>(Term))
+    return false;
+
+  // We don't acquire try-locks on ?: branches, except when its result is used.
+  if (const auto *ACO = dyn_cast<AbstractConditionalOperator>(Term);
+      ACO && !ACO->getType()->isVoidType())
+    return false;
+
+  const LocalVarContext &LVarCtx = BlockInfo[Block->getBlockID()].ExitContext;
+  if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
+    Res.Call = unwrapTrylockValueExpr(SS->getCond(), LVarCtx);
+    Res.Callee = getTrylockCallee(Res.Call);
+    if (!Res.Callee)
+      return false;
+    Res.Dom = getTrylockCallDomain(Res.Call);
+    Table = &getSwitchCaseTable(SS, Res.Dom);
+    return Table->Valid;
+  }
+  const Stmt *Cond = Block->getTerminatorCondition();
+  if (!Cond)
+    return false;
+  Res = evaluateTerminatorTrylockCond(Cond, LVarCtx);
+  return Res.Call;
+}
+
 /// Find the lockset that holds on the edge between PredBlock
 /// and CurrBlock.  The edge set is the exit set of PredBlock (passed
 /// as the ExitSet parameter) plus any trylocks, which are conditionally held.
@@ -2972,95 +3072,47 @@ void ThreadSafetyAnalyzer::getEdgeLockset(
     const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs) {
   Result = ExitSet;
 
-  const Stmt *Term = PredBlock->getTerminatorStmt();
-  if (!Term || isa<IndirectGotoStmt>(Term))
+  TrylockRangeCondResult Cond;
+  const SwitchCaseTable *Table;
+  if (!getTerminatorTrylockCond(PredBlock, Cond, Table))
     return;
-
-  // We don't acquire try-locks on ?: branches, except when its result is used.
-  if (const auto *COp = dyn_cast<ConditionalOperator>(Term))
-    if (!COp->getType()->isVoidType())
-      return;
-  if (const auto *BCO = dyn_cast<BinaryConditionalOperator>(Term))
-    if (!BCO->getType()->isVoidType())
-      return;
-
-  const LocalVarContext &LVarCtx =
-      BlockInfo[PredBlock->getBlockID()].ExitContext;
-  const CallExpr *CallExp = nullptr;
-  const NamedDecl *Callee = nullptr;
-  IntDomain Dom;
   IntRangeSet EdgeSet;
-
-  if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
-    CallExp = unwrapTrylockValueExpr(SS->getCond(), LVarCtx);
-    if (!CallExp)
+  if (Table) {
+    auto SwitchEdgeSet = getSwitchEdgeSet(PredBlock, *Table, CurrBlock);
+    if (!SwitchEdgeSet)
       return;
-    Callee = getTrylockCallee(CallExp);
-    if (!Callee)
-      return;
-    Dom = getTrylockCallDomain(CallExp);
-    const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
-    if (!Table.Valid)
-      return;
-    const auto *TargetCS = dyn_cast_if_present<CaseStmt>(CurrBlock->getLabel());
-    if (auto It = Table.CaseSets.find(TargetCS); It != Table.CaseSets.end()) {
-      EdgeSet = It->second;
-    } else {
-      if (!isa_and_nonnull<DefaultStmt>(CurrBlock->getLabel()) &&
-          SS->isAllEnumCasesCovered())
-        return;
-      EdgeSet = Table.DefaultSet;
-    }
+    EdgeSet = std::move(*SwitchEdgeSet);
   } else {
-    const Stmt *Cond = PredBlock->getTerminatorCondition();
-    if (!Cond)
-      return;
-    auto CondRes = evaluateTerminatorTrylockCond(Cond, LVarCtx);
-    if (!CondRes.Call)
-      return;
-    CallExp = CondRes.Call;
-    Callee = CondRes.Callee;
-    Dom = CondRes.Dom;
-    int BranchIdx = 0;
-    for (auto SI = PredBlock->succ_begin(), SE = PredBlock->succ_end();
-         SI != SE && BranchIdx < 2; ++SI, ++BranchIdx) {
-      if (*SI == CurrBlock) {
-        EdgeSet = EdgeSet.unionWith(BranchIdx == 0 ? CondRes.TrueSet
-                                                   : CondRes.FalseSet);
-      }
-    }
+    auto [IsTrue, IsFalse] = getBranchEdgeKinds(PredBlock, CurrBlock);
+    if (IsTrue)
+      EdgeSet = EdgeSet.unionWith(Cond.TrueSet);
+    if (IsFalse)
+      EdgeSet = EdgeSet.unionWith(Cond.FalseSet);
   }
 
   if (EdgeSet.empty())
     return;
 
-  std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
-  if (Handler.issueBetaWarnings()) {
-    SxBuilder.setLookupLocalVarExpr(
-        [this, Ctx = LVarCtx](const NamedDecl *D) mutable -> const Expr * {
-          return LocalVarMap.lookupExpr(D, Ctx);
-        });
-    Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
-  }
-
+  LocalVarLookupScope Lookup(*this,
+                             BlockInfo[PredBlock->getBlockID()].ExitContext);
   CapExprSet ExclusiveLocksToAdd;
   CapExprSet SharedLocksToAdd;
-  for (const Attr *A : trylockAttrs(Callee)) {
-    if (!trylockAttrAppliesTo(A, CallExp->getType()))
+  for (const Attr *A : trylockAttrs(Cond.Callee)) {
+    if (!trylockAttrAppliesTo(A, Cond.Call->getType()))
       continue;
-    auto SuccSet = getTrylockSuccessSet(A, Dom);
+    auto SuccSet = getTrylockSuccessSet(A, Cond.Dom);
     if (!SuccSet || !EdgeSet.subsetOfSet(*SuccSet))
       continue;
-    if (ConsumedAttrs && ConsumedAttrs->contains({CallExp, A}))
+    if (ConsumedAttrs && ConsumedAttrs->contains({Cond.Call, A}))
       continue;
-    if (collectTrylockCaps(A, CallExp, Callee, ExclusiveLocksToAdd,
+    if (collectTrylockCaps(A, Cond.Call, Cond.Callee, ExclusiveLocksToAdd,
                            SharedLocksToAdd) &&
         AcquiredAttrs)
-      AcquiredAttrs->insert({CallExp, A});
+      AcquiredAttrs->insert({Cond.Call, A});
   }
 
   addTrylockFacts(Result, ExclusiveLocksToAdd, SharedLocksToAdd,
-                  CallExp->getExprLoc());
+                  Cond.Call->getExprLoc());
 }
 
 /// If the terminator of \p Block branches on the result of a try-lock call
@@ -3068,70 +3120,32 @@ void ThreadSafetyAnalyzer::getEdgeLockset(
 /// that call to \p Caps.
 void ThreadSafetyAnalyzer::getTerminatorTrylockCaps(const CFGBlock *Block,
                                                     CapExprSet &Caps) {
-  const Stmt *Term = Block->getTerminatorStmt();
-  if (!Term || isa<IndirectGotoStmt>(Term))
+  TrylockRangeCondResult Cond;
+  const SwitchCaseTable *Table;
+  if (!getTerminatorTrylockCond(Block, Cond, Table))
     return;
-  if (const auto *COp = dyn_cast<ConditionalOperator>(Term))
-    if (!COp->getType()->isVoidType())
-      return;
-  if (const auto *BCO = dyn_cast<BinaryConditionalOperator>(Term))
-    if (!BCO->getType()->isVoidType())
-      return;
-
-  const LocalVarContext &LVarCtx = BlockInfo[Block->getBlockID()].ExitContext;
-  const CallExpr *CallExp = nullptr;
-  const NamedDecl *Callee = nullptr;
-  IntDomain Dom;
   SmallVector<IntRangeSet, 4> BranchSets;
-
-  if (const auto *SS = dyn_cast<SwitchStmt>(Term)) {
-    CallExp = unwrapTrylockValueExpr(SS->getCond(), LVarCtx);
-    if (!CallExp)
-      return;
-    Callee = getTrylockCallee(CallExp);
-    if (!Callee)
-      return;
-    Dom = getTrylockCallDomain(CallExp);
-    const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
-    if (!Table.Valid)
-      return;
-    for (const auto &[CS, CaseSet] : Table.CaseSets)
+  if (Table) {
+    for (const auto &[CS, CaseSet] : Table->CaseSets)
       BranchSets.push_back(CaseSet);
-    BranchSets.push_back(Table.DefaultSet);
+    BranchSets.push_back(Table->DefaultSet);
   } else {
-    const Stmt *Cond = Block->getTerminatorCondition();
-    if (!Cond)
-      return;
-    auto CondRes = evaluateTerminatorTrylockCond(Cond, LVarCtx);
-    if (!CondRes.Call)
-      return;
-    CallExp = CondRes.Call;
-    Callee = CondRes.Callee;
-    Dom = CondRes.Dom;
-    BranchSets.push_back(std::move(CondRes.TrueSet));
-    BranchSets.push_back(std::move(CondRes.FalseSet));
+    BranchSets.push_back(std::move(Cond.TrueSet));
+    BranchSets.push_back(std::move(Cond.FalseSet));
   }
 
-  std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
-  if (Handler.issueBetaWarnings()) {
-    SxBuilder.setLookupLocalVarExpr(
-        [this, Ctx = LVarCtx](const NamedDecl *D) mutable -> const Expr * {
-          return LocalVarMap.lookupExpr(D, Ctx);
-        });
-    Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
-  }
-
-  for (const Attr *A : trylockAttrs(Callee)) {
-    if (!trylockAttrAppliesTo(A, CallExp->getType()))
+  LocalVarLookupScope Lookup(*this, BlockInfo[Block->getBlockID()].ExitContext);
+  for (const Attr *A : trylockAttrs(Cond.Callee)) {
+    if (!trylockAttrAppliesTo(A, Cond.Call->getType()))
       continue;
-    auto SuccSet = getTrylockSuccessSet(A, Dom);
+    auto SuccSet = getTrylockSuccessSet(A, Cond.Dom);
     if (!SuccSet)
       continue;
     bool CleanPartition = llvm::all_of(BranchSets, [&](const IntRangeSet &S) {
       return S.empty() || S.subsetOfSet(*SuccSet) || !S.intersectsSet(*SuccSet);
     });
     if (CleanPartition)
-      getTrylockMutexIDs(Caps, A, CallExp, Callee);
+      getTrylockMutexIDs(Caps, A, Cond.Call, Cond.Callee);
   }
 }
 
@@ -3781,16 +3795,7 @@ bool ThreadSafetyAnalyzer::isPureExitBlock(const CFGBlock *B,
           if (P->hasAttrs())
             return false;
 
-      std::optional<llvm::scope_exit<std::function<void()>>> LookupCleanup;
-      if (Handler.issueBetaWarnings()) {
-        LocalVarContext LookupCtx = StmtCtx;
-        SxBuilder.setLookupLocalVarExpr(
-            [this, LookupCtx](const NamedDecl *D) mutable -> const Expr * {
-              return LocalVarMap.lookupExpr(D, LookupCtx);
-            });
-        LookupCleanup.emplace(
-            [this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
-      }
+      LocalVarLookupScope Lookup(*this, StmtCtx);
 
       auto CheckCapDisjoint = [&](Expr *Arg) -> bool {
         CapabilityExpr Cp =
@@ -5404,37 +5409,20 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
                              Depth + 1);
       return;
     }
-    if (BO->getOpcode() == BO_LAnd) {
-      if (WantTrue) {
-        constrainLeafCondition(State, BO->getLHS(), true, EscapedVars,
+    if (BO->isLogicalOp()) {
+      // A true && or a false || constrains both operands. Otherwise, one of
+      // the operands has the value WantTrue.
+      if (WantTrue == (BO->getOpcode() == BO_LAnd)) {
+        constrainLeafCondition(State, BO->getLHS(), WantTrue, EscapedVars,
                                Depth + 1);
-        constrainLeafCondition(State, BO->getRHS(), true, EscapedVars,
-                               Depth + 1);
-      } else {
-        TrylockValueState LState = State;
-        TrylockValueState RState = State;
-        constrainLeafCondition(LState, BO->getLHS(), false, EscapedVars,
-                               Depth + 1);
-        constrainLeafCondition(RState, BO->getRHS(), false, EscapedVars,
-                               Depth + 1);
-        State.Infeasible = true;
-        unionIntoValueState(State, LState, *ASTCtx);
-        unionIntoValueState(State, RState, *ASTCtx);
-      }
-      return;
-    }
-    if (BO->getOpcode() == BO_LOr) {
-      if (!WantTrue) {
-        constrainLeafCondition(State, BO->getLHS(), false, EscapedVars,
-                               Depth + 1);
-        constrainLeafCondition(State, BO->getRHS(), false, EscapedVars,
+        constrainLeafCondition(State, BO->getRHS(), WantTrue, EscapedVars,
                                Depth + 1);
       } else {
         TrylockValueState LState = State;
         TrylockValueState RState = State;
-        constrainLeafCondition(LState, BO->getLHS(), true, EscapedVars,
+        constrainLeafCondition(LState, BO->getLHS(), WantTrue, EscapedVars,
                                Depth + 1);
-        constrainLeafCondition(RState, BO->getRHS(), true, EscapedVars,
+        constrainLeafCondition(RState, BO->getRHS(), WantTrue, EscapedVars,
                                Depth + 1);
         State.Infeasible = true;
         unionIntoValueState(State, LState, *ASTCtx);
@@ -5546,18 +5534,12 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
     const SwitchCaseTable &Table = getSwitchCaseTable(SS, Dom);
     if (!Table.Valid)
       return;
-    const auto *TargetCS = dyn_cast_if_present<CaseStmt>(CurrBlock->getLabel());
-    IntRangeSet EdgeSet;
-    if (auto It = Table.CaseSets.find(TargetCS); It != Table.CaseSets.end()) {
-      EdgeSet = It->second;
-    } else {
-      if (!isa_and_nonnull<DefaultStmt>(CurrBlock->getLabel()) &&
-          SS->isAllEnumCasesCovered()) {
-        State.Infeasible = true;
-        return;
-      }
-      EdgeSet = Table.DefaultSet;
+    auto SwitchEdgeSet = getSwitchEdgeSet(PredBlock, Table, CurrBlock);
+    if (!SwitchEdgeSet) {
+      State.Infeasible = true;
+      return;
     }
+    const IntRangeSet &EdgeSet = *SwitchEdgeSet;
 
     if (VD) {
       IntRangeSet Cur = IntRangeSet::full(Dom);
@@ -5589,18 +5571,7 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
   if (!RawCond)
     return;
 
-  bool MatchesTrue = false;
-  bool MatchesFalse = false;
-  int BranchIdx = 0;
-  for (auto SI = PredBlock->succ_begin(), SE = PredBlock->succ_end();
-       SI != SE && BranchIdx < 2; ++SI, ++BranchIdx) {
-    if (*SI == CurrBlock) {
-      if (BranchIdx == 0)
-        MatchesTrue = true;
-      else
-        MatchesFalse = true;
-    }
-  }
+  auto [MatchesTrue, MatchesFalse] = getBranchEdgeKinds(PredBlock, CurrBlock);
   if (MatchesTrue == MatchesFalse)
     return;
 
@@ -5614,7 +5585,8 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
 
   // In Clang's linearized CFG, PredBlock evaluated the rightmost leaf of any
   // top-level && / || chain in RawCond.
-  const Expr *LeafCond = stripNoOpExprWrappers(RawCond);
+  const Expr *StrippedRaw = stripNoOpExprWrappers(RawCond);
+  const Expr *LeafCond = StrippedRaw;
   while (const auto *BO = dyn_cast<BinaryOperator>(LeafCond)) {
     if (!BO->isLogicalOp())
       break;
@@ -5625,7 +5597,6 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
   if (State.Infeasible)
     return;
 
-  const Expr *StrippedRaw = stripNoOpExprWrappers(RawCond);
   if (StrippedRaw != LeafCond) {
     if (auto RawDom = getScalarDomain(StrippedRaw->getType())) {
       IntRangeSet Allowed = IntRangeSet::truthSet(*RawDom, TakeTrue);
@@ -5698,13 +5669,7 @@ void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
     if (!Callee)
       continue;
 
-    std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
-    if (Handler.issueBetaWarnings()) {
-      SxBuilder.setLookupLocalVarExpr(
-          [this, LookupCtx = DefPair.second](const NamedDecl *D) mutable
-              -> const Expr * { return LocalVarMap.lookupExpr(D, LookupCtx); });
-      Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
-    }
+    LocalVarLookupScope Lookup(*this, DefPair.second);
 
     CapExprSet ExclusiveLocksToAdd;
     CapExprSet SharedLocksToAdd;
@@ -6978,14 +6943,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
         CallOutcomes = std::move(Next);
     }
 
-    std::optional<llvm::scope_exit<std::function<void()>>> Cleanup;
-    if (Handler.issueBetaWarnings()) {
-      SxBuilder.setLookupLocalVarExpr(
-          [this, LookupCtx = Ctx](const NamedDecl *D) mutable -> const Expr * {
-            return LocalVarMap.lookupExpr(D, LookupCtx);
-          });
-      Cleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
-    }
+    LocalVarLookupScope Lookup(*this, Ctx);
 
     SmallVector<TrylockExitSpec, 2> CallSpecs;
     SmallVector<std::pair<CapabilityExpr, LockKind>, 2> AlreadyAcquiredCaps;
@@ -7072,15 +7030,8 @@ void ThreadSafetyAnalyzer::applyScopeExitCleanups(FactSet &StateSet,
   unsigned CtxIdx = BlockInfo[B->getBlockID()].EntryIndex;
   LocalVarContext StmtCtx = BlockInfo[B->getBlockID()].EntryContext;
 
-  std::optional<llvm::scope_exit<std::function<void()>>> LookupCleanup;
-  if (Handler.issueBetaWarnings()) {
-    SxBuilder.setLookupLocalVarExpr(
-        [this, &StmtCtx](const NamedDecl *D) -> const Expr * {
-          LocalVarContext LookupCtx = StmtCtx;
-          return LocalVarMap.lookupExpr(D, LookupCtx);
-        });
-    LookupCleanup.emplace([this] { SxBuilder.setLookupLocalVarExpr(nullptr); });
-  }
+  // StmtCtx advances while the statements of B are visited.
+  LocalVarLookupScope Lookup(*this, &StmtCtx);
 
   auto ApplyCallee = [&](const NamedDecl *Callee, const Expr *Exp,
                          til::SExpr *Self, SourceLocation Loc,
