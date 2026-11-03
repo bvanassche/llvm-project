@@ -1360,7 +1360,8 @@ public:
 
   bool inCurrentScope(const CapabilityExpr &CapE);
 
-  void addLock(FactSet &FSet, const FactEntry *Entry, bool ReqAttr = false);
+  void addLock(FactSet &FSet, const FactEntry *Entry, bool ReqAttr = false,
+               ThreadSafetyHandler *DiagHandler = nullptr);
   void removeLock(FactSet &FSet, const CapabilityExpr &CapE,
                   SourceLocation UnlockLoc, bool FullyRemove, LockKind Kind);
 
@@ -1985,10 +1986,15 @@ bool ThreadSafetyAnalyzer::inCurrentScope(const CapabilityExpr &CapE) {
 
 /// Add a new lock to the lockset, warning if the lock is already there.
 /// \param ReqAttr -- true if this is part of an initial Requires attribute.
+/// \param DiagHandler -- the handler that reports diagnostics, or nullptr to
+/// use \c Handler.
 void ThreadSafetyAnalyzer::addLock(FactSet &FSet, const FactEntry *Entry,
-                                   bool ReqAttr) {
+                                   bool ReqAttr,
+                                   ThreadSafetyHandler *DiagHandler) {
   if (Entry->shouldIgnore())
     return;
+
+  ThreadSafetyHandler &H = DiagHandler ? *DiagHandler : Handler;
 
   if (!ReqAttr && !Entry->negative()) {
     // look for the negative capability, and remove it from the fact set.
@@ -1999,20 +2005,21 @@ void ThreadSafetyAnalyzer::addLock(FactSet &FSet, const FactEntry *Entry,
     }
     else {
       if (inCurrentScope(*Entry) && !Entry->asserted() && !Entry->reentrant())
-        Handler.handleNegativeNotHeld(Entry->getKind(), Entry->toString(),
-                                      NegC.toString(), Entry->loc());
+        H.handleNegativeNotHeld(Entry->getKind(), Entry->toString(),
+                                NegC.toString(), Entry->loc());
     }
   }
 
   // Check before/after constraints
   if (!Entry->asserted() && !Entry->declared()) {
     GlobalBeforeSet->checkBeforeAfter(Entry->valueDecl(), FSet, *this,
-                                      Entry->loc(), Entry->getKind());
+                                      Entry->loc(), Entry->getKind(),
+                                      DiagHandler);
   }
 
   if (const FactEntry *Cp = FSet.findLock(FactMan, *Entry)) {
     if (!Entry->asserted())
-      Cp->handleLock(FSet, FactMan, *Entry, Handler);
+      Cp->handleLock(FSet, FactMan, *Entry, H);
   } else {
     FSet.addLock(FactMan, Entry);
   }
@@ -8934,34 +8941,11 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       const Expr *RetVal = RS ? RS->getRetValue() : nullptr;
 
       auto VerifyExitOutcome = [&](ReturnEvalOutcome &Outcome) {
-        for (const PendingTrylockAcquire &PA : Outcome.PendingAcquires) {
-          const auto *Entry = FactMan.createFact<LockableFactEntry>(
-              PA.Cap, PA.LK, PA.Loc, FactEntry::Acquired);
-          if (Entry->shouldIgnore())
-            continue;
-          if (!Entry->negative()) {
-            CapabilityExpr NegC = !*Entry;
-            if (Outcome.Lockset.findLock(FactMan, NegC)) {
-              Outcome.Lockset.removeLock(FactMan, NegC);
-            } else if (inCurrentScope(*Entry) && !Entry->asserted() &&
-                       !Entry->reentrant()) {
-              DedupHandler.handleNegativeNotHeld(Entry->getKind(),
-                                                 Entry->toString(),
-                                                 NegC.toString(), Entry->loc());
-            }
-          }
-          if (!Entry->asserted() && !Entry->declared()) {
-            GlobalBeforeSet->checkBeforeAfter(
-                Entry->valueDecl(), Outcome.Lockset, *this, Entry->loc(),
-                Entry->getKind(), &DedupHandler);
-          }
-          if (const FactEntry *Cp = Outcome.Lockset.findLock(FactMan, *Entry)) {
-            if (!Entry->asserted())
-              Cp->handleLock(Outcome.Lockset, FactMan, *Entry, DedupHandler);
-          } else {
-            Outcome.Lockset.addLock(FactMan, Entry);
-          }
-        }
+        for (const PendingTrylockAcquire &PA : Outcome.PendingAcquires)
+          addLock(Outcome.Lockset,
+                  FactMan.createFact<LockableFactEntry>(PA.Cap, PA.LK, PA.Loc,
+                                                        FactEntry::Acquired),
+                  /*ReqAttr=*/false, &DedupHandler);
         applyScopeExitCleanups(Outcome.Lockset, PredBlock,
                                /*OnlyAfterReturn=*/true);
         checkTrylockExitOutcome(ExpectedFunctionExitSet, Outcome, DiagLoc,
