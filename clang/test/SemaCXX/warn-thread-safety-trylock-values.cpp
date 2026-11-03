@@ -458,4 +458,105 @@ int test_spaceship_in_trylock(int a, int b) TRY1 {
   }
   return 0;
 }
+
+int test_requires_unevaluated() TRY1 { // expected-note{{mutex acquired here}}
+  int ok = 1;
+  bool b = requires {
+    { ok = 0 };
+  };
+  (void)b;
+  return ok; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
 #endif
+
+//===----------------------------------------------------------------------===//
+// Lvalue assignments, call-argument escapes, unevaluated builtins, and StmtExpr.
+//===----------------------------------------------------------------------===//
+
+int *id_ptr_alias(int *p) { return p; }
+void take_uintptr(__UINTPTR_TYPE__);
+void take_const_ptr_ref(int *const &);
+void bind(int *);
+
+void test_lvalue_and_call_escapes() {
+  int r0;
+  int *p0 = &(r0 = trylock_zero());
+  *p0 = 0;
+  if (r0 == 0) {
+    data = 1; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+  }
+
+  auto set = [](int &x, int val) { x = val; };
+  int r1 = trylock_zero();
+  set(r1, 0);
+  if (r1 == 0) {
+    data = 2; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+  }
+
+  int r2 = 1;
+  int *p2 = id_ptr_alias(&r2);
+  r2 = trylock_zero();
+  *p2 = 0;
+  if (!r2) {
+    data = 3; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+  }
+
+  int r3 = trylock_zero();
+  take_uintptr((__UINTPTR_TYPE__)&r3);
+  if (!r3) {
+    data = 4; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+  }
+
+  int r4 = trylock_zero();
+  take_const_ptr_ref(&r4);
+  if (!r4) {
+    data = 5; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+  }
+
+  int r5 = trylock_zero();
+  bind(&r5);
+  if (!r5) {
+    data = 6; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+  }
+}
+
+int test_prefix_inc_on_assignment() TRY1 { // expected-note{{mutex acquired here}}
+  int ok = 0;
+  ++(ok = 0);
+  return ok; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+void test_builtin_constant_p_caller() {
+  int r = cond();
+  (void)__builtin_constant_p(r = trylock_zero());
+  if (r == 0) {
+    data = 1; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+    unlock(&mu); // expected-warning{{releasing mutex 'mu' that was not held}}
+  }
+}
+
+int test_builtin_constant_p_callee(bool unk)
+    __attribute__((try_acquire_capability_range(0, 0, mu))) { // expected-note@-1{{mutex acquired here}}
+  int r = cond();
+  (void)__builtin_constant_p(r = trylock_zero());
+  if (unk)
+    (void)__builtin_constant_p((__builtin_unreachable(), r = 0));
+  return r; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+int test_stmtexpr_last_expr_mutation() TRY1 { // expected-note{{mutex acquired here}}
+  return ({ // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+    int d = 0;
+    (d = 1, d + 0);
+  });
+}
+
+int test_stmtexpr_pre_rhs_snapshot() TRY1 { // expected-note{{mutex acquired here}}
+  int ok = 0;
+  int y = (({
+             int s = (ok == 0);
+             s;
+           }) +
+           ((ok = 1), 0));
+  return y; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+}

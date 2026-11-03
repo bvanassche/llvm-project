@@ -1704,6 +1704,50 @@ void test_recursive_identity_helper_c(int ok) {
   }
 }
 
+// Address-of on dereferenced, subscripted, member, or weak lvalues may be null.
+extern int c_weak_obj __attribute__((weak));
+int c_nonweak_obj;
+
+int *c_addrof_deref_null(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *p = 0;
+  return &*p;
+}
+
+int c_addrof_deref_branch(void) // expected-note{{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *p = 0;
+  if (&*p == 0)
+    return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+  return 0;
+}
+
+int *c_addrof_weak(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return &c_weak_obj; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_addrof_nonweak(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &c_nonweak_obj;
+}
+
+// _Generic controlling and unselected expressions are unevaluated.
+void test_generic_unevaluated_c(int unk) {
+  int r = unk;
+  (void)_Generic((r = c_llong_range_lock()), long long: 0, default: 1); // expected-warning{{expression with side effects has no effect in an unevaluated context}}
+  if (r == 0) {
+    work_data = 41; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+  int r2 = unk;
+  (void)_Generic(0, double: (r2 = (int)c_llong_range_lock()), default: 0);
+  if (r2 == 0) {
+    work_data = 42; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+}
+
 // We had a problem where we'd skip all attributes that follow a late-parsed
 // attribute in a single __attribute__.
 void run(void) __attribute__((guarded_by(mu1), guarded_by(mu1))); // expected-warning 2{{only applies to non-static data members and global variables}}

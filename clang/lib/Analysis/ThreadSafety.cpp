@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/Analysis/Analyses/ThreadSafety.h"
+#include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -39,31 +40,29 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/Specifiers.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/ImmutableMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SetOperations.h"
 #include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/TrailingObjects.h"
 #include "llvm/Support/SaveAndRestore.h"
+#include "llvm/Support/TrailingObjects.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <functional>
 #include <iterator>
 #include <memory>
 #include <optional>
-#include <set>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -322,6 +321,22 @@ class ThreadSafetyAnalyzer;
 namespace clang {
 namespace threadSafety {
 
+/// The body of a trivial inline or constexpr function whose return value can
+/// be evaluated in terms of its parameters.
+struct TrivialInlineBody {
+  const FunctionDecl *DefFD = nullptr;
+  const Expr *SingleRet = nullptr;
+  const Expr *CondExpr = nullptr;
+  const Expr *ThenRet = nullptr;
+  const Expr *ElseRet = nullptr;
+  llvm::SmallPtrSet<const ValueDecl *, 8> CalleeEscaped;
+
+  /// The canonical declaration of parameter \p I.
+  const ValueDecl *param(unsigned I) const {
+    return cast<ValueDecl>(DefFD->getParamDecl(I)->getCanonicalDecl());
+  }
+};
+
 class BeforeSet {
 private:
   using BeforeVect = SmallVector<const ValueDecl *, 4>;
@@ -351,6 +366,14 @@ public:
                         ThreadSafetyAnalyzer &Analyzer, SourceLocation Loc,
                         StringRef CapKind,
                         ThreadSafetyHandler *DiagHandler = nullptr);
+
+  // Translation-unit-wide caches of trivial inline helper bodies and
+  // single-argument identity parameter indices, keyed by the defining
+  // FunctionDecl.
+  llvm::DenseMap<const FunctionDecl *, std::optional<TrivialInlineBody>>
+      InlineBodyCache;
+  llvm::DenseMap<const FunctionDecl *, std::optional<unsigned>>
+      IdentityParamCache;
 
 private:
   BeforeMap BMap;
@@ -475,11 +498,20 @@ private:
   // Local variables that may be modified other than by a direct assignment,
   // e.g. because their address is taken.
   llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
+#ifndef NDEBUG
+  bool EscapedVarsComputed = false;
+#endif
 
 public:
   LocalVariableMap() {
     // index 0 is a placeholder for undefined variables (aka phi-nodes).
     VarDefinitions.push_back(VarDefinition(nullptr, 0, 0, getEmptyContext()));
+  }
+
+  void markEscapedVarsComputed() {
+#ifndef NDEBUG
+    EscapedVarsComputed = true;
+#endif
   }
 
   /// Record that \p VD may be modified other than by a direct assignment.
@@ -494,6 +526,8 @@ public:
   /// analysis' back. Capability expressions deliberately look through such
   /// variables anyway; see testReassignmentPointerToAlias().
   bool hasTrackableValue(const NamedDecl *D) const {
+    assert(EscapedVarsComputed &&
+           "EscapedVars must be computed before querying hasTrackableValue");
     const auto *VD = dyn_cast<VarDecl>(D);
     return VD && VD->hasLocalStorage() &&
            !VD->getType().isVolatileQualified() && !VD->hasAttr<BlocksAttr>() &&
@@ -532,6 +566,8 @@ public:
   /// its last definition. Use this when evaluating the value of a variable,
   /// e.g. a trylock result.
   const Expr *lookupValueExpr(const NamedDecl *D, Context &Ctx) const {
+    if (Ctx.isEmpty())
+      return nullptr;
     return hasTrackableValue(D) ? lookupExpr(D, Ctx) : nullptr;
   }
 
@@ -600,7 +636,8 @@ public:
 
   /// Builds the variable map.
   void traverseCFG(CFG *CFGraph, const PostOrderCFGView *SortedGraph,
-                   std::vector<CFGBlockInfo> &BlockInfo);
+                   std::vector<CFGBlockInfo> &BlockInfo,
+                   const llvm::SmallPtrSetImpl<const Stmt *> &UnevaluatedStmts);
 
 protected:
   friend class VarMapBuilder;
@@ -759,6 +796,93 @@ void VarMapBuilder::VisitUnaryOperator(const UnaryOperator *UO) {
   }
 }
 
+static Expr *ignoreNoOpCastSingleStep(Expr *E) {
+  if (auto *CE = dyn_cast<CastExpr>(E); CE && CE->getCastKind() == CK_NoOp)
+    return CE->getSubExpr();
+  return E;
+}
+
+static const DeclRefExpr *unwrapDirectLValueDRE(const Expr *E) {
+  if (!E)
+    return nullptr;
+  return dyn_cast<DeclRefExpr>(
+      IgnoreExprNodes(E, IgnoreParensOnlySingleStep, ignoreNoOpCastSingleStep));
+}
+
+/// If argument \p Idx of \p CE passes the address of or a mutable reference to
+/// a local variable in a form that the callee may use to modify the variable,
+/// return that variable's DeclRefExpr.
+static const DeclRefExpr *getInvalidatedCallArgDRE(const CallExpr *CE,
+                                                   unsigned Idx) {
+  auto UnwrapAddrOfDRE = [](const Expr *E) -> const DeclRefExpr * {
+    while (E) {
+      E = E->IgnoreParens();
+      if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(E)) {
+        E = MTE->getSubExpr();
+        continue;
+      }
+      if (const auto *FE = dyn_cast<FullExpr>(E)) {
+        E = FE->getSubExpr();
+        continue;
+      }
+      if (const auto *Cast = dyn_cast<CastExpr>(E)) {
+        if (Cast->getCastKind() == CK_NoOp ||
+            ((Cast->getCastKind() == CK_BitCast ||
+              Cast->getCastKind() == CK_DerivedToBase ||
+              Cast->getCastKind() == CK_UncheckedDerivedToBase) &&
+             Cast->getType()->isPointerType() &&
+             Cast->getSubExpr()->getType()->isPointerType())) {
+          E = Cast->getSubExpr();
+          continue;
+        }
+      }
+      break;
+    }
+    if (const auto *UO = dyn_cast_or_null<UnaryOperator>(E);
+        UO && UO->getOpcode() == UO_AddrOf)
+      return unwrapDirectLValueDRE(UO->getSubExpr());
+    return nullptr;
+  };
+
+  const FunctionDecl *FD = CE->getDirectCallee();
+  bool HasImplicitObjArg = false;
+  if (isa<CXXOperatorCallExpr>(CE))
+    if (const auto *MD = dyn_cast_or_null<CXXMethodDecl>(FD);
+        MD && MD->isImplicitObjectMemberFunction())
+      HasImplicitObjArg = true;
+
+  const Expr *RawArg = CE->getArg(Idx);
+  if (HasImplicitObjArg && Idx == 0) {
+    if (!cast<CXXMethodDecl>(FD)->isConst() && RawArg->isGLValue())
+      return unwrapDirectLValueDRE(RawArg);
+    return nullptr;
+  }
+
+  unsigned ParamIdx = HasImplicitObjArg ? Idx - 1 : Idx;
+  if (!FD || ParamIdx >= FD->getNumParams()) {
+    // The parameter type is not known, e.g. for a variadic argument or an
+    // indirect call. Assume that the callee may modify the variable.
+    if (const DeclRefExpr *AddrDRE = UnwrapAddrOfDRE(RawArg))
+      return AddrDRE;
+    if (RawArg->isGLValue())
+      return unwrapDirectLValueDRE(RawArg);
+    return nullptr;
+  }
+
+  QualType ParamType = FD->getParamDecl(ParamIdx)->getType();
+  if (const DeclRefExpr *AddrDRE = UnwrapAddrOfDRE(RawArg)) {
+    QualType NonRefTy = ParamType.getNonReferenceType();
+    if (NonRefTy->isPointerType() &&
+        !NonRefTy->getPointeeType().isConstQualified())
+      return AddrDRE;
+    return nullptr;
+  }
+  if (ParamType->isReferenceType() &&
+      !ParamType->getPointeeType().isConstQualified() && RawArg->isGLValue())
+    return unwrapDirectLValueDRE(RawArg);
+  return nullptr;
+}
+
 // Invalidates local variable definitions if variable escaped.
 void VarMapBuilder::VisitCallExpr(const CallExpr *CE) {
   const FunctionDecl *FD = CE->getDirectCallee();
@@ -772,45 +896,11 @@ void VarMapBuilder::VisitCallExpr(const CallExpr *CE) {
       return;
   }
 
-  // Returns the variable whose address is \p Arg, if any.
-  auto GetAddressOfVar = [](const Expr *Arg) -> const ValueDecl * {
-    if (const auto *UO = dyn_cast<UnaryOperator>(Arg->IgnoreParenCasts()))
-      if (UO->getOpcode() == UO_AddrOf)
-        if (const auto *DRE =
-                dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParenCasts()))
-          return DRE->getDecl();
-    return nullptr;
-  };
-
   // Invalidate local variable definitions that are passed by non-const
   // reference or non-const pointer.
   for (unsigned Idx = 0; Idx < CE->getNumArgs(); ++Idx) {
-    const Expr *Arg = CE->getArg(Idx)->IgnoreParenImpCasts();
-    const ValueDecl *VDec = nullptr;
-
-    if (!FD || Idx >= FD->getNumParams()) {
-      // The parameter type is not known, e.g. for a variadic argument or an
-      // indirect call. Assume that the callee may modify the variable.
-      VDec = GetAddressOfVar(Arg);
-      if (!VDec && CE->getArg(Idx)->isGLValue())
-        if (const auto *DRE = dyn_cast<DeclRefExpr>(Arg))
-          VDec = DRE->getDecl();
-    } else {
-      QualType ParamType = FD->getParamDecl(Idx)->getType();
-
-      // Potential reassignment if passed by non-const reference / pointer.
-      if (ParamType->isReferenceType() &&
-          !ParamType->getPointeeType().isConstQualified()) {
-        if (const auto *DRE = dyn_cast<DeclRefExpr>(Arg))
-          VDec = DRE->getDecl();
-      } else if (ParamType->isPointerType() &&
-                 !ParamType->getPointeeType().isConstQualified()) {
-        VDec = GetAddressOfVar(Arg);
-      }
-    }
-
-    if (VDec)
-      Ctx = VMap->clearDefinition(VDec, Ctx);
+    if (const DeclRefExpr *DRE = getInvalidatedCallArgDRE(CE, Idx))
+      Ctx = VMap->clearDefinition(DRE->getDecl(), Ctx);
   }
   // Save the context after the call where escaped variables' definitions (if
   // they exist) are cleared.
@@ -909,9 +999,10 @@ void LocalVariableMap::intersectBackEdge(Context C1, Context C2) {
 //   while (b)           { x -> x2, y -> y1  | [1st:] x2=x1; [2nd:] x2=NULL; }
 //     x = x+1;          { x -> x3, y -> y1  | x3 = x2 + 1, ... }
 //   ...                 { y -> y1           | x3 = 2, x2 = 1, ... }
-void LocalVariableMap::traverseCFG(CFG *CFGraph,
-                                   const PostOrderCFGView *SortedGraph,
-                                   std::vector<CFGBlockInfo> &BlockInfo) {
+void LocalVariableMap::traverseCFG(
+    CFG *CFGraph, const PostOrderCFGView *SortedGraph,
+    std::vector<CFGBlockInfo> &BlockInfo,
+    const llvm::SmallPtrSetImpl<const Stmt *> &UnevaluatedStmts) {
   PostOrderCFGView::CFGBlockSet VisitedBlocks(CFGraph);
 
   for (const auto *CurrBlock : *SortedGraph) {
@@ -960,8 +1051,9 @@ void LocalVariableMap::traverseCFG(CFG *CFGraph,
     for (const auto &BI : *CurrBlock) {
       switch (BI.getKind()) {
         case CFGElement::Statement: {
-          CFGStmt CS = BI.castAs<CFGStmt>();
-          VMapBuilder.Visit(CS.getStmt());
+          const Stmt *S = BI.castAs<CFGStmt>().getStmt();
+          if (!UnevaluatedStmts.contains(S))
+            VMapBuilder.Visit(S);
           break;
         }
         default:
@@ -1333,27 +1425,11 @@ static constexpr unsigned MaxZeroOrOneDepth = 8;
 static constexpr unsigned MaxConstrainExprDepth = 24;
 
 /// Class which implements the core thread safety analysis routines.
-/// The body of a trivial inline or constexpr function whose return value can
-/// be evaluated in terms of its parameters.
-struct TrivialInlineBody {
-  const FunctionDecl *DefFD = nullptr;
-  const Expr *SingleRet = nullptr;
-  const Expr *CondExpr = nullptr;
-  const Expr *ThenRet = nullptr;
-  const Expr *ElseRet = nullptr;
-  llvm::SmallPtrSet<const ValueDecl *, 8> CalleeEscaped;
-
-  /// The canonical declaration of parameter \p I.
-  const ValueDecl *param(unsigned I) const {
-    return cast<ValueDecl>(DefFD->getParamDecl(I)->getCanonicalDecl());
-  }
-};
-
 class ThreadSafetyAnalyzer {
   friend class BuildLockset;
   friend class threadSafety::BeforeSet;
 
-  llvm::BumpPtrAllocator Bpa;
+  mutable llvm::BumpPtrAllocator Bpa;
   threadSafety::til::MemRegionRef Arena;
   threadSafety::SExprBuilder SxBuilder;
 
@@ -1595,6 +1671,7 @@ public:
                  TrylockRangeCondResult>
       TerminatorCondCache;
   const PostOrderCFGView *CurrentSortedGraph = nullptr;
+  bool HasTrylockCall = false;
   bool BuiltLogicalOpTermBlock = false;
   llvm::DenseMap<const BinaryOperator *, unsigned> LogicalOpTermBlock;
   LocalVarContext getLogicalOpLHSContext(const BinaryOperator *BOP,
@@ -1704,32 +1781,21 @@ public:
   void applyScopeExitCleanups(FactSet &StateSet, const CFGBlock *B,
                               bool OnlyAfterReturn = false);
 
-  // Cache of getTrivialInlineBody() results, keyed by the callee and the
-  // number of call arguments.
-  mutable llvm::DenseMap<std::pair<const FunctionDecl *, unsigned>,
-                         std::optional<TrivialInlineBody>>
-      InlineBodyCache;
   // Functions that are being expanded inline and the expansion depth. Used to
   // prevent recursive and deeply nested inline expansion.
   mutable llvm::SmallPtrSet<const FunctionDecl *, 4> ActiveInlineCallees;
   mutable unsigned InlineDepth = 0;
   // The number of inline expansions performed for the current function.
   mutable unsigned InlineExpansionCount = 0;
-  // Cache of getIdentityInlineParamIndex() results, keyed by the canonical
-  // declaration of the callee. While a result is being computed, its entry is
-  // std::nullopt such that recursive helpers are not treated as identities.
-  // Unlike inline expansions, these lookups do not count against
-  // MaxInlineExpansions because they happen for unrelated calls too.
-  mutable llvm::DenseMap<const FunctionDecl *, std::optional<unsigned>>
-      IdentityParamCache;
   // Nesting depth of getIdentityInlineParamIndex() computations.
   mutable unsigned IdentityProbeDepth = 0;
   // Results of evaluatePureExprRange() for calls of inline helpers, keyed by
-  // getInlineCallCacheKey(). The result of expanding a helper only depends
+  // profileInlineCallCacheKey(). The result of expanding a helper only depends
   // on the callee and on the ranges of its arguments. Caching it keeps calls
   // that are repeated many times, e.g. in conditions unrelated to the tracked
   // values, from exhausting MaxInlineExpansions.
-  mutable llvm::StringMap<std::optional<IntRangeSet>> InlineCallRangeCache;
+  mutable llvm::DenseMap<llvm::FoldingSetNodeIDRef, std::optional<IntRangeSet>>
+      InlineCallRangeCache;
   // The effect of constrainLeafCondition() on the parameters of an inline
   // helper whose call is used as a condition.
   struct InlineCondResult {
@@ -1737,8 +1803,9 @@ public:
     SmallVector<std::optional<IntRangeSet>, 4> ParamRanges;
   };
   // Results of constrainLeafCondition() for calls of inline helpers, keyed by
-  // getInlineCallCacheKey().
-  mutable llvm::StringMap<InlineCondResult> InlineCondCache;
+  // profileInlineCallCacheKey().
+  mutable llvm::DenseMap<llvm::FoldingSetNodeIDRef, InlineCondResult>
+      InlineCondCache;
 
   /// Marks a function as being expanded inline for the lifetime of this
   /// object, preventing recursive expansion and bounding the nesting depth.
@@ -1802,9 +1869,9 @@ public:
   SmallVector<std::optional<IntRangeSet>, 4>
   evaluateInlineArgRanges(const CallExpr *CallExp,
                           const TrylockValueState &State, unsigned Depth) const;
-  std::string
-  getInlineCallCacheKey(const CallExpr *CallExp, unsigned Kind,
-                        ArrayRef<std::optional<IntRangeSet>> ArgRanges) const;
+  bool profileInlineCallCacheKey(
+      llvm::FoldingSetNodeID &ID, const FunctionDecl *DefFD, unsigned Kind,
+      ArrayRef<std::optional<IntRangeSet>> ArgRanges) const;
   TrylockValueState
   makeCalleeState(const TrivialInlineBody &Info,
                   ArrayRef<std::optional<IntRangeSet>> ArgRanges) const;
@@ -2734,11 +2801,13 @@ castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
                      QualType DstTy, const ASTContext &Ctx);
 
 static const Expr *stripNoOpExprWrappers(const Expr *E);
-static void
-scanTrylockVars(const Stmt *Root,
-                llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
-                llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars,
-                bool CallArgsAreTransient = false);
+static void scanTrylockVars(
+    const Stmt *Root, const ASTContext &Ctx,
+    llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
+    llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars,
+    bool CallArgsAreTransient = false,
+    llvm::SmallPtrSetImpl<const ValueDecl *> *NonTransientCallEscaped =
+        nullptr);
 
 static bool isBuiltinExpectCall(const CallExpr *CallExp) {
   unsigned BuiltinID = CallExp->getBuiltinCallee();
@@ -2946,7 +3015,7 @@ ThreadSafetyAnalyzer::getLogicalOpLHSContext(const BinaryOperator *BOP,
       return BlockInfo[It->second].ExitContext;
   }
   llvm::SmallPtrSet<const ValueDecl *, 4> Esc, Mod;
-  scanTrylockVars(BOP->getRHS(), Esc, Mod);
+  scanTrylockVars(BOP->getRHS(), *ASTCtx, Esc, Mod);
   for (const ValueDecl *VD : Mod)
     if (const auto *ND = dyn_cast<NamedDecl>(VD))
       C = LocalVarMap.clearDefinitionIfSet(ND, C);
@@ -3293,6 +3362,8 @@ bool ThreadSafetyAnalyzer::getTerminatorTrylockCond(
     SmallVectorImpl<const CastExpr *> &SwitchCasts) {
   Table = nullptr;
   SwitchCasts.clear();
+  if (!HasTrylockCall)
+    return false;
   const Stmt *Term = Block->getTerminatorStmt();
   if (!Term || isa<IndirectGotoStmt>(Term))
     return false;
@@ -3451,7 +3522,8 @@ namespace {
 /// other code.
 class DedupThreadSafetyHandler final : public ThreadSafetyHandler {
   ThreadSafetyHandler &Inner;
-  std::set<llvm::FoldingSetNodeID> Emitted;
+  llvm::BumpPtrAllocator Alloc;
+  llvm::DenseSet<llvm::FoldingSetNodeIDRef> Emitted;
 
   static void add(llvm::FoldingSetNodeID &ID, StringRef Str) {
     ID.AddString(Str);
@@ -3468,7 +3540,10 @@ class DedupThreadSafetyHandler final : public ThreadSafetyHandler {
     llvm::FoldingSetNodeID ID;
     add(ID, Callback);
     (add(ID, Args), ...);
-    return Emitted.insert(ID).second;
+    if (Emitted.find_as(ID) != Emitted.end())
+      return false;
+    Emitted.insert(ID.Intern(Alloc));
+    return true;
   }
 
   template <typename E> static unsigned long long val(E V) {
@@ -3534,12 +3609,6 @@ public:
 
 } // namespace
 
-static Expr *ignoreNoOpCastSingleStep(Expr *E) {
-  if (auto *CE = dyn_cast<CastExpr>(E); CE && CE->getCastKind() == CK_NoOp)
-    return CE->getSubExpr();
-  return E;
-}
-
 static Expr *ignoreFullExprOrOpaqueValueSingleStep(Expr *E) {
   if (auto *FE = dyn_cast<FullExpr>(E))
     return FE->getSubExpr();
@@ -3557,33 +3626,77 @@ static const Expr *stripNoOpExprWrappers(const Expr *E) {
                          ignoreNoOpCastSingleStep);
 }
 
-static const DeclRefExpr *unwrapDirectLValueDRE(const Expr *E) {
-  if (!E)
-    return nullptr;
-  return dyn_cast<DeclRefExpr>(
-      IgnoreExprNodes(E, IgnoreParensOnlySingleStep, ignoreNoOpCastSingleStep));
+/// Return whether \p Call cannot return an alias to any scalar argument or
+/// store an alias through another argument, and is not exempted from invalidat-
+/// ing its arguments in VarMapBuilder::VisitCallExpr().
+static bool isTransientSafeCall(const CallExpr *Call) {
+  if (Call->isGLValue())
+    return false;
+  QualType RetTy = Call->getType();
+  if (!RetTy->isVoidType() && !RetTy->isArithmeticType() &&
+      !RetTy->isEnumeralType())
+    return false;
+  const FunctionDecl *FD = Call->getDirectCallee();
+  if (const IdentifierInfo *II = FD ? FD->getIdentifier() : nullptr)
+    if (II->isStr("bind") || II->isStr("bind_front"))
+      return false;
+  for (const Expr *Arg : Call->arguments()) {
+    QualType NonRefTy = Arg->getType().getNonReferenceType();
+    if (NonRefTy->isPointerType() &&
+        NonRefTy->getPointeeType()->isAnyPointerType())
+      return false;
+  }
+  return true;
 }
 
 /// Collect the local variables that are referenced in \p Root other than by
 /// reading or assigning their value (EscapedVars) and the variables that may
 /// be modified (ModifiedVars). If \p CallArgsAreTransient is true, passing
-/// the address of a variable or a reference to a variable as a function
-/// argument does not count as an escape: the callee can only modify the
-/// variable during the call, and the LocalVariableMap invalidates the
-/// definition of the variable at the call.
-static void
-scanTrylockVars(const Stmt *Root,
-                llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
-                llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars,
-                bool CallArgsAreTransient) {
+/// the address of a variable or a reference to a variable as an argument of a
+/// call that VarMapBuilder::VisitCallExpr() invalidates and that cannot retain
+/// an alias does not count as an escape in \p EscapedVars (though if
+/// \p NonTransientCallEscaped is non-null, it records the escaped set as if
+/// \p CallArgsAreTransient were false).
+static void scanTrylockVars(
+    const Stmt *Root, const ASTContext &Ctx,
+    llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
+    llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars,
+    bool CallArgsAreTransient,
+    llvm::SmallPtrSetImpl<const ValueDecl *> *NonTransientCallEscaped) {
   if (!Root)
     return;
 
   llvm::SmallPtrSet<const DeclRefExpr *, 16> SafeDREs;
-  auto VisitNode = [&](auto &Self, const Stmt *S,
-                       bool InNestedClosure) -> void {
+  llvm::SmallPtrSet<const DeclRefExpr *, 8> TransientCallDREs;
+  auto VisitNode = [&](auto &Self, const Stmt *S, bool InNestedClosure,
+                       bool LValueIsSafe) -> void {
     if (!S)
       return;
+
+    // Skip unevaluated operands completely.
+    if (const auto *CE = dyn_cast<CallExpr>(S);
+        CE && CE->isUnevaluatedBuiltinCall(Ctx))
+      return;
+    if (isa<CXXNoexceptExpr>(S))
+      return;
+    if (const auto *TE = dyn_cast<UnaryExprOrTypeTraitExpr>(S)) {
+      if (!TE->isArgumentType() &&
+          TE->getArgumentExpr()->getType()->isVariablyModifiedType())
+        Self(Self, TE->getArgumentExpr(), InNestedClosure,
+             /*LValueIsSafe=*/false);
+      return;
+    }
+    if (const auto *TE = dyn_cast<CXXTypeidExpr>(S)) {
+      if (!TE->isTypeOperand() && TE->isPotentiallyEvaluated())
+        Self(Self, TE->getExprOperand(), InNestedClosure,
+             /*LValueIsSafe=*/false);
+      return;
+    }
+    if (const auto *GSE = dyn_cast<GenericSelectionExpr>(S)) {
+      if (!GSE->isResultDependent())
+        Self(Self, GSE->getResultExpr(), InNestedClosure, LValueIsSafe);
+      return;
+    }
 
     if (const auto *LE = dyn_cast<LambdaExpr>(S)) {
       for (const LambdaCapture &Cap : LE->captures()) {
@@ -3591,6 +3704,8 @@ scanTrylockVars(const Stmt *Root,
           const ValueDecl *VD =
               cast<ValueDecl>(Cap.getCapturedVar()->getCanonicalDecl());
           EscapedVars.insert(VD);
+          if (NonTransientCallEscaped)
+            NonTransientCallEscaped->insert(VD);
           ModifiedVars.insert(VD);
         }
       }
@@ -3604,6 +3719,8 @@ scanTrylockVars(const Stmt *Root,
           const ValueDecl *VD =
               cast<ValueDecl>(Cap.getVariable()->getCanonicalDecl());
           EscapedVars.insert(VD);
+          if (NonTransientCallEscaped)
+            NonTransientCallEscaped->insert(VD);
           ModifiedVars.insert(VD);
         }
       }
@@ -3620,33 +3737,31 @@ scanTrylockVars(const Stmt *Root,
       } else if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
         if (BO->isAssignmentOp()) {
           if (const auto *DRE = unwrapDirectLValueDRE(BO->getLHS())) {
-            SafeDREs.insert(DRE);
-            ModifiedVars.insert(
-                cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+            if (!BO->isGLValue() || LValueIsSafe)
+              SafeDREs.insert(DRE);
+            if (isa<VarDecl>(DRE->getDecl()))
+              ModifiedVars.insert(
+                  cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
           }
         }
       } else if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
         if (UO->isIncrementDecrementOp()) {
           if (const auto *DRE = unwrapDirectLValueDRE(UO->getSubExpr())) {
-            SafeDREs.insert(DRE);
-            ModifiedVars.insert(
-                cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+            if (!UO->isGLValue() || LValueIsSafe)
+              SafeDREs.insert(DRE);
+            if (isa<VarDecl>(DRE->getDecl()))
+              ModifiedVars.insert(
+                  cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
           }
         }
       } else if (const auto *Call = dyn_cast<CallExpr>(S);
-                 Call && CallArgsAreTransient) {
-        for (const Expr *Arg : Call->arguments()) {
-          const DeclRefExpr *DRE = nullptr;
-          if (const auto *AddrOf =
-                  dyn_cast<UnaryOperator>(Arg->IgnoreParenCasts());
-              AddrOf && AddrOf->getOpcode() == UO_AddrOf)
-            DRE = unwrapDirectLValueDRE(AddrOf->getSubExpr());
-          else if (Arg->isGLValue())
-            DRE = unwrapDirectLValueDRE(Arg);
-          if (DRE) {
-            SafeDREs.insert(DRE);
-            ModifiedVars.insert(
-                cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+                 Call && CallArgsAreTransient && isTransientSafeCall(Call)) {
+        for (unsigned Idx = 0, N = Call->getNumArgs(); Idx < N; ++Idx) {
+          if (const DeclRefExpr *DRE = getInvalidatedCallArgDRE(Call, Idx)) {
+            TransientCallDREs.insert(DRE);
+            if (isa<VarDecl>(DRE->getDecl()))
+              ModifiedVars.insert(
+                  cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
           }
         }
       }
@@ -3654,21 +3769,127 @@ scanTrylockVars(const Stmt *Root,
 
     if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {
       if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+        const ValueDecl *CanonVD = cast<ValueDecl>(VD->getCanonicalDecl());
         if (InNestedClosure || !SafeDREs.contains(DRE)) {
-          const ValueDecl *CanonVD = cast<ValueDecl>(VD->getCanonicalDecl());
-          EscapedVars.insert(CanonVD);
-          ModifiedVars.insert(CanonVD);
+          if (NonTransientCallEscaped)
+            NonTransientCallEscaped->insert(CanonVD);
+          if (InNestedClosure || !TransientCallDREs.contains(DRE)) {
+            EscapedVars.insert(CanonVD);
+            ModifiedVars.insert(CanonVD);
+          }
         }
       }
+    }
+
+    if (const auto *PE = dyn_cast<ParenExpr>(S)) {
+      Self(Self, PE->getSubExpr(), InNestedClosure, LValueIsSafe);
+      return;
+    }
+    if (const auto *FE = dyn_cast<FullExpr>(S)) {
+      Self(Self, FE->getSubExpr(), InNestedClosure, LValueIsSafe);
+      return;
+    }
+    if (const auto *CE = dyn_cast<CastExpr>(S)) {
+      bool ChildSafe = false;
+      if (CE->getCastKind() == CK_LValueToRValue ||
+          CE->getCastKind() == CK_ToVoid)
+        ChildSafe = true;
+      else if (CE->getCastKind() == CK_NoOp && CE->isGLValue())
+        ChildSafe = LValueIsSafe;
+      Self(Self, CE->getSubExpr(), InNestedClosure, ChildSafe);
+      return;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(S);
+        BO && BO->getOpcode() == BO_Comma) {
+      Self(Self, BO->getLHS(), InNestedClosure, /*LValueIsSafe=*/true);
+      Self(Self, BO->getRHS(), InNestedClosure, LValueIsSafe);
+      return;
+    }
+    if (const auto *CO = dyn_cast<ConditionalOperator>(S)) {
+      Self(Self, CO->getCond(), InNestedClosure, /*LValueIsSafe=*/false);
+      Self(Self, CO->getTrueExpr(), InNestedClosure, LValueIsSafe);
+      Self(Self, CO->getFalseExpr(), InNestedClosure, LValueIsSafe);
+      return;
+    }
+    if (const auto *SE = dyn_cast<StmtExpr>(S)) {
+      if (const CompoundStmt *CS = SE->getSubStmt()) {
+        for (const Stmt *Sub : llvm::drop_end(CS->body()))
+          Self(Self, Sub, InNestedClosure, /*LValueIsSafe=*/true);
+        if (!CS->body_empty())
+          Self(Self, CS->body_back(), InNestedClosure, /*LValueIsSafe=*/false);
+      }
+      return;
+    }
+    if (const auto *CS = dyn_cast<CompoundStmt>(S)) {
+      for (const Stmt *Sub : CS->body())
+        Self(Self, Sub, InNestedClosure, /*LValueIsSafe=*/true);
+      return;
+    }
+    if (const auto *LS = dyn_cast<LabelStmt>(S)) {
+      Self(Self, LS->getSubStmt(), InNestedClosure, LValueIsSafe);
+      return;
+    }
+    if (const auto *AS = dyn_cast<AttributedStmt>(S)) {
+      Self(Self, AS->getSubStmt(), InNestedClosure, LValueIsSafe);
+      return;
+    }
+    if (const auto *DS = dyn_cast<DefaultStmt>(S)) {
+      Self(Self, DS->getSubStmt(), InNestedClosure, LValueIsSafe);
+      return;
+    }
+    if (const auto *CS = dyn_cast<CaseStmt>(S)) {
+      Self(Self, CS->getLHS(), InNestedClosure, /*LValueIsSafe=*/false);
+      Self(Self, CS->getRHS(), InNestedClosure, /*LValueIsSafe=*/false);
+      Self(Self, CS->getSubStmt(), InNestedClosure, LValueIsSafe);
+      return;
+    }
+    if (const auto *IS = dyn_cast<IfStmt>(S)) {
+      Self(Self, IS->getInit(), InNestedClosure, /*LValueIsSafe=*/true);
+      Self(Self, IS->getConditionVariableDeclStmt(), InNestedClosure,
+           /*LValueIsSafe=*/false);
+      Self(Self, IS->getCond(), InNestedClosure, /*LValueIsSafe=*/false);
+      Self(Self, IS->getThen(), InNestedClosure, /*LValueIsSafe=*/true);
+      Self(Self, IS->getElse(), InNestedClosure, /*LValueIsSafe=*/true);
+      return;
+    }
+    if (const auto *WS = dyn_cast<WhileStmt>(S)) {
+      Self(Self, WS->getConditionVariableDeclStmt(), InNestedClosure,
+           /*LValueIsSafe=*/false);
+      Self(Self, WS->getCond(), InNestedClosure, /*LValueIsSafe=*/false);
+      Self(Self, WS->getBody(), InNestedClosure, /*LValueIsSafe=*/true);
+      return;
+    }
+    if (const auto *DS = dyn_cast<DoStmt>(S)) {
+      Self(Self, DS->getBody(), InNestedClosure, /*LValueIsSafe=*/true);
+      Self(Self, DS->getCond(), InNestedClosure, /*LValueIsSafe=*/false);
+      return;
+    }
+    if (const auto *FS = dyn_cast<ForStmt>(S)) {
+      Self(Self, FS->getInit(), InNestedClosure, /*LValueIsSafe=*/true);
+      Self(Self, FS->getConditionVariableDeclStmt(), InNestedClosure,
+           /*LValueIsSafe=*/false);
+      Self(Self, FS->getCond(), InNestedClosure, /*LValueIsSafe=*/false);
+      Self(Self, FS->getInc(), InNestedClosure, /*LValueIsSafe=*/true);
+      Self(Self, FS->getBody(), InNestedClosure, /*LValueIsSafe=*/true);
+      return;
+    }
+    if (const auto *SS = dyn_cast<SwitchStmt>(S)) {
+      Self(Self, SS->getInit(), InNestedClosure, /*LValueIsSafe=*/true);
+      Self(Self, SS->getConditionVariableDeclStmt(), InNestedClosure,
+           /*LValueIsSafe=*/false);
+      Self(Self, SS->getCond(), InNestedClosure, /*LValueIsSafe=*/false);
+      Self(Self, SS->getBody(), InNestedClosure, /*LValueIsSafe=*/true);
+      return;
     }
 
     // Note: DeclStmt::children() includes the variable initializers.
     for (const Stmt *Child : S->children())
       if (Child)
-        Self(Self, Child, InNestedClosure);
+        Self(Self, Child, InNestedClosure, /*LValueIsSafe=*/false);
   };
 
-  VisitNode(VisitNode, Root, /*InNestedClosure=*/false);
+  VisitNode(VisitNode, Root, /*InNestedClosure=*/false,
+            /*LValueIsSafe=*/isa<CompoundStmt>(Root));
 }
 
 /// Return whether the value of \p E is discarded, e.g. because \p E is an
@@ -3717,9 +3938,10 @@ static bool isDiscardedValue(const Expr *E, const ParentMap &PM) {
   return true;
 }
 
-static void
-scanBlockModifiedVars(const CFGBlock *B,
-                      llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars) {
+static void scanBlockModifiedVars(
+    const CFGBlock *B,
+    const llvm::SmallPtrSetImpl<const Stmt *> &UnevaluatedStmts,
+    llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars) {
   if (!B)
     return;
 
@@ -3732,6 +3954,8 @@ scanBlockModifiedVars(const CFGBlock *B,
     if (!CS)
       continue;
     const Stmt *S = CS->getStmt();
+    if (UnevaluatedStmts.contains(S))
+      continue;
     if (const auto *DS = dyn_cast<DeclStmt>(S)) {
       for (const Decl *D : DS->decls())
         if (const auto *VD = dyn_cast<VarDecl>(D); VD && VD->hasLocalStorage())
@@ -3799,26 +4023,19 @@ static unsigned countReturnStmts(const Stmt *S) {
 }
 
 static std::optional<TrivialInlineBody>
-getTrivialInlineBody(const CallExpr *CallExp) {
-  if (!CallExp || CallExp->isTypeDependent() || CallExp->isValueDependent())
-    return std::nullopt;
-  const FunctionDecl *FD = CallExp->getDirectCallee();
-  if (!FD)
-    return std::nullopt;
-  if (const auto *MD = dyn_cast<CXXMethodDecl>(FD))
+getTrivialInlineBody(const FunctionDecl *DefFD, const Stmt *Body) {
+  if (const auto *MD = dyn_cast<CXXMethodDecl>(DefFD))
     if (!MD->isStatic())
       return std::nullopt;
-
-  const FunctionDecl *DefFD = nullptr;
-  const Stmt *Body = FD->getBody(DefFD);
-  if (!Body || !DefFD)
+  if ((!DefFD->isInlined() && !DefFD->isConstexpr()) || DefFD->isWeak() ||
+      DefFD->isVariadic())
     return std::nullopt;
-  if ((!DefFD->isInlined() && !DefFD->isConstexpr()) || DefFD->isWeak())
-    return std::nullopt;
-  if (DefFD->isVariadic() || CallExp->getNumArgs() != DefFD->getNumParams())
-    return std::nullopt;
-  if (hasThreadSafetyCallEffects(FD, CallExp) ||
-      hasThreadSafetyCallEffects(DefFD, CallExp))
+  if (const auto *TagT = DefFD->getReturnType()->getAs<TagType>())
+    if (isScopedLockable(TagT->getDecl()))
+      return std::nullopt;
+  if (hasThreadSafetyCallEffects(DefFD, /*CallOrCtor=*/nullptr) ||
+      hasThreadSafetyCallEffects(DefFD->getMostRecentDecl(),
+                                 /*CallOrCtor=*/nullptr))
     return std::nullopt;
 
   for (const ParmVarDecl *P : DefFD->parameters()) {
@@ -3827,14 +4044,16 @@ getTrivialInlineBody(const CallExpr *CallExp) {
       return std::nullopt;
   }
 
+  // Reject large inline functions before walking their AST.
   const auto *CS = dyn_cast<CompoundStmt>(Body);
-  if (!CS || CS->body_empty())
+  if (!CS || CS->body_empty() || CS->size() > 2)
     return std::nullopt;
 
   TrivialInlineBody Info;
   Info.DefFD = DefFD;
   llvm::SmallPtrSet<const ValueDecl *, 8> CalleeModified;
-  scanTrylockVars(CS, Info.CalleeEscaped, CalleeModified);
+  scanTrylockVars(CS, DefFD->getASTContext(), Info.CalleeEscaped,
+                  CalleeModified);
   for (const ParmVarDecl *P : DefFD->parameters()) {
     const auto *PVD = cast<ValueDecl>(P->getCanonicalDecl());
     if (Info.CalleeEscaped.contains(PVD) || CalleeModified.contains(PVD))
@@ -3902,31 +4121,32 @@ ThreadSafetyAnalyzer::evaluateInlineArgRanges(const CallExpr *CallExp,
   return ArgRanges;
 }
 
-/// Returns a key that identifies an inline expansion of the callee of
-/// \p CallExp for arguments with the ranges \p ArgRanges. \p Kind
-/// distinguishes the kinds of results that are cached. Returns an empty
-/// string if the result must not be cached: only results computed outside
-/// other expansions, which are not limited by MaxInlineDepth, are cached.
-std::string ThreadSafetyAnalyzer::getInlineCallCacheKey(
-    const CallExpr *CallExp, unsigned Kind,
+/// Profiles a key that identifies an inline expansion of \p DefFD for
+/// arguments with the ranges \p ArgRanges into \p ID. \p Kind distinguishes
+/// the kinds of results that are cached. Returns false if the result must not
+/// be cached: only results computed outside other expansions, which are not
+/// limited by MaxInlineDepth, are cached.
+bool ThreadSafetyAnalyzer::profileInlineCallCacheKey(
+    llvm::FoldingSetNodeID &ID, const FunctionDecl *DefFD, unsigned Kind,
     ArrayRef<std::optional<IntRangeSet>> ArgRanges) const {
-  const FunctionDecl *FD = CallExp->getDirectCallee();
-  if (!FD || InlineDepth != 0)
-    return {};
-  std::string Key;
-  llvm::raw_string_ostream OS(Key);
-  OS << static_cast<const void *>(FD->getCanonicalDecl()) << ':' << Kind;
+  if (!DefFD || InlineDepth != 0)
+    return false;
+  ID.AddPointer(DefFD);
+  ID.AddInteger(Kind);
+  ID.AddInteger(ArgRanges.size());
   for (const auto &R : ArgRanges) {
-    OS << '|';
     if (!R) {
-      OS << '?';
+      ID.AddBoolean(false);
       continue;
     }
-    for (const auto &[Lo, Hi] : R->intervals())
-      OS << Lo.getBitWidth() << (Lo.isUnsigned() ? 'u' : 's') << Lo << ',' << Hi
-         << ';';
+    ID.AddBoolean(true);
+    ID.AddInteger(R->intervals().size());
+    for (const auto &[Lo, Hi] : R->intervals()) {
+      Lo.Profile(ID);
+      Hi.Profile(ID);
+    }
   }
-  return Key;
+  return true;
 }
 
 /// The value state in which the parameters of \p Info have the ranges
@@ -3946,11 +4166,15 @@ ThreadSafetyAnalyzer::lookupTrivialInlineBody(const CallExpr *CallExp) const {
   const FunctionDecl *FD = CallExp ? CallExp->getDirectCallee() : nullptr;
   if (!FD || CallExp->isTypeDependent() || CallExp->isValueDependent())
     return std::nullopt;
-  std::pair<const FunctionDecl *, unsigned> Key(FD->getCanonicalDecl(),
-                                                CallExp->getNumArgs());
-  auto [It, Inserted] = InlineBodyCache.try_emplace(Key);
+  const FunctionDecl *DefFD = nullptr;
+  const Stmt *Body = FD->getBody(DefFD);
+  if (!Body || !DefFD || DefFD->isVariadic() ||
+      CallExp->getNumArgs() != DefFD->getNumParams() ||
+      hasThreadSafetyCallEffects(FD, CallExp))
+    return std::nullopt;
+  auto [It, Inserted] = GlobalBeforeSet->InlineBodyCache.try_emplace(DefFD);
   if (Inserted)
-    It->second = getTrivialInlineBody(CallExp);
+    It->second = getTrivialInlineBody(DefFD, Body);
   return It->second;
 }
 
@@ -3989,7 +4213,7 @@ static bool isStraightLineStmtExprSubStmt(const Stmt *S, bool IsRoot = false) {
 /// (\p LocalDecls) and variables that escape (\p Escaped), returns that
 /// expression. Otherwise returns nullptr.
 static const Expr *
-analyzeStmtExpr(const StmtExpr *SE,
+analyzeStmtExpr(const StmtExpr *SE, const ASTContext &Ctx,
                 llvm::SmallPtrSetImpl<const ValueDecl *> &LocalDecls,
                 llvm::SmallPtrSetImpl<const ValueDecl *> &Escaped) {
   const CompoundStmt *CS = SE->getSubStmt();
@@ -4006,7 +4230,7 @@ analyzeStmtExpr(const StmtExpr *SE,
           LocalDecls.insert(cast<ValueDecl>(VD->getCanonicalDecl()));
 
   llvm::SmallPtrSet<const ValueDecl *, 4> Modified;
-  scanTrylockVars(CS, Escaped, Modified);
+  scanTrylockVars(CS, Ctx, Escaped, Modified);
   for (const ValueDecl *MVD : Modified)
     if (!Escaped.contains(MVD) && !LocalDecls.contains(MVD))
       return nullptr;
@@ -4022,6 +4246,8 @@ bool ThreadSafetyAnalyzer::isPureExitBlock(const CFGBlock *B,
     switch (BI.getKind()) {
     case CFGElement::Statement: {
       const Stmt *S = BI.castAs<CFGStmt>().getStmt();
+      if (UnevaluatedStmts.contains(S))
+        break;
       llvm::scope_exit AdvanceCtx(
           [&] { StmtCtx = LocalVarMap.getNextContext(CtxIdx, S, StmtCtx); });
 
@@ -4536,6 +4762,42 @@ static std::optional<ThreadSafetyAnalyzer::IntRangeSet> compareRangeSets(
       mayHold(Opc, L, R));
 }
 
+/// Whether the address of lvalue \p E is guaranteed to be a valid non-null
+/// object or function address (excluding weak symbols and arbitrary pointer
+/// dereferences).
+static bool isKnownValidObjectOrFunctionLValue(const Expr *E) {
+  while (E) {
+    E = stripNoOpExprWrappers(E);
+    if (isa<StringLiteral, CompoundLiteralExpr, PredefinedExpr, ObjCEncodeExpr>(
+            E))
+      return true;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const ValueDecl *D = DRE->getDecl();
+      if (D->isWeak())
+        return false;
+      if (const auto *VD = dyn_cast<VarDecl>(D))
+        return !VD->getType()->isReferenceType();
+      return isa<FunctionDecl>(D);
+    }
+    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+      const ValueDecl *MD = ME->getMemberDecl();
+      if (const auto *VD = dyn_cast<VarDecl>(MD))
+        return !VD->isWeak() && !VD->getType()->isReferenceType();
+      if (const auto *FD = dyn_cast<FunctionDecl>(MD))
+        return !FD->isWeak();
+      if (!isa<FieldDecl, IndirectFieldDecl>(MD))
+        return false;
+      if (ME->isArrow())
+        return isa_and_nonnull<CXXThisExpr>(
+            stripNoOpExprWrappers(ME->getBase()));
+      E = ME->getBase();
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
 std::optional<ThreadSafetyAnalyzer::IntRangeSet>
 ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
                                             const TrylockValueState &State,
@@ -4598,7 +4860,9 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
       return IntRangeSet::single(Dom, llvm::APSInt::get(0));
     case CK_ArrayToPointerDecay:
     case CK_FunctionToPointerDecay:
-      return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
+      if (isKnownValidObjectOrFunctionLValue(CE->getSubExpr()))
+        return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
+      return std::nullopt;
     default:
       break;
     }
@@ -4616,23 +4880,29 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
         return std::nullopt;
       return castIntegralRangeSet(*Sub, CallExp->getType(), *ASTCtx);
     }
-    // Evaluate the arguments first. The result of the expansion only depends
-    // on the callee and on the argument ranges. Look it up in the cache
-    // before getCachedTrivialInlineBody() counts the expansion against the
-    // budget.
+    if (InlineDepth >= MaxInlineDepth)
+      return std::nullopt;
+    // Check whether the callee is a trivial inline helper before evaluating
+    // arguments or profiling cache keys, so unrelated calls cost O(1).
+    auto InlineInfo = lookupTrivialInlineBody(CallExp);
+    if (!InlineInfo || ActiveInlineCallees.contains(InlineInfo->DefFD))
+      return std::nullopt;
+
     SmallVector<std::optional<IntRangeSet>, 4> ArgRanges =
         evaluateInlineArgRanges(CallExp, State, Depth + 1);
-    std::string CacheKey =
-        getInlineCallCacheKey(CallExp, AssumeDerefNonNull ? 1 : 0, ArgRanges);
-    if (!CacheKey.empty())
-      if (auto It = InlineCallRangeCache.find(CacheKey);
+    llvm::FoldingSetNodeID CacheID;
+    bool CanCache = profileInlineCallCacheKey(
+        CacheID, InlineInfo->DefFD, AssumeDerefNonNull ? 1 : 0, ArgRanges);
+    if (CanCache)
+      if (auto It = InlineCallRangeCache.find_as(CacheID);
           It != InlineCallRangeCache.end())
         return It->second ? std::optional(reprojectRangeSet(*It->second, Dom))
                           : std::nullopt;
 
-    auto InlineInfo = getCachedTrivialInlineBody(CallExp);
-    if (!InlineInfo)
+    if (InlineExpansionCount >= MaxInlineExpansions)
       return std::nullopt;
+    ++InlineExpansionCount;
+
     // The union of the values of the return values, or std::nullopt if the
     // value of one of them is unknown.
     std::optional<IntRangeSet> Res = IntRangeSet();
@@ -4649,15 +4919,26 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
               Res.reset();
           });
     }
-    if (!CacheKey.empty())
-      InlineCallRangeCache.try_emplace(CacheKey, Res);
+    if (CanCache)
+      InlineCallRangeCache.try_emplace(CacheID.Intern(Bpa), Res);
     return Res;
   }
 
   if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
     switch (UO->getOpcode()) {
-    case UO_AddrOf:
-      return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
+    case UO_AddrOf: {
+      const Expr *Sub = stripNoOpExprWrappers(UO->getSubExpr());
+      if (const auto *Deref = dyn_cast_or_null<UnaryOperator>(Sub);
+          Deref && Deref->getOpcode() == UO_Deref) {
+        auto SubR =
+            evaluatePureExprRange(Deref->getSubExpr(), State, Depth + 1);
+        return SubR ? std::optional(reprojectRangeSet(*SubR, Dom))
+                    : std::nullopt;
+      }
+      if (isKnownValidObjectOrFunctionLValue(Sub))
+        return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
+      return std::nullopt;
+    }
     case UO_Plus:
       return evaluatePureExprRange(UO->getSubExpr(), State, Depth + 1);
     case UO_Minus: {
@@ -4757,7 +5038,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
 
   if (const auto *SE = dyn_cast<StmtExpr>(E)) {
     llvm::SmallPtrSet<const ValueDecl *, 4> LocalDecls, SEEscaped;
-    const Expr *LastExpr = analyzeStmtExpr(SE, LocalDecls, SEEscaped);
+    const Expr *LastExpr = analyzeStmtExpr(SE, *ASTCtx, LocalDecls, SEEscaped);
     if (!LastExpr)
       return std::nullopt;
 
@@ -4767,7 +5048,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
     // would use stale values, so forget the modified variables and VD instead.
     auto AssignLocal = [&](const ValueDecl *VD, const Expr *RHS) {
       llvm::SmallPtrSet<const ValueDecl *, 4> RHSEsc, RHSMod;
-      scanTrylockVars(RHS, RHSEsc, RHSMod);
+      scanTrylockVars(RHS, *ASTCtx, RHSEsc, RHSMod);
       for (const ValueDecl *MVD : RHSMod)
         SubState.VarRanges.erase(MVD);
       auto VDom = getScalarDomain(VD->getType());
@@ -4802,11 +5083,31 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
         }
       }
       llvm::SmallPtrSet<const ValueDecl *, 4> SubEsc, SubMod;
-      scanTrylockVars(S, SubEsc, SubMod);
+      scanTrylockVars(S, *ASTCtx, SubEsc, SubMod);
       for (const ValueDecl *MVD : SubMod)
         if (LocalDecls.contains(MVD))
           SubState.VarRanges.erase(MVD);
     }
+
+    if (const auto *BO =
+            dyn_cast_or_null<BinaryOperator>(stripNoOpExprWrappers(LastExpr));
+        BO && BO->getOpcode() == BO_Assign &&
+        unwrapDirectLValueDRE(BO->getLHS())) {
+      llvm::SmallPtrSet<const ValueDecl *, 4> RHSEsc, RHSMod;
+      scanTrylockVars(BO->getRHS(), *ASTCtx, RHSEsc, RHSMod);
+      if (!RHSMod.empty())
+        return std::nullopt;
+      auto Sub = evaluatePureExprRange(BO->getRHS(), SubState, Depth + 1);
+      auto BODom = getScalarDomain(BO->getType());
+      if (!Sub || !BODom)
+        return std::nullopt;
+      return reprojectRangeSet(reprojectRangeSet(*Sub, *BODom), Dom);
+    }
+
+    llvm::SmallPtrSet<const ValueDecl *, 4> LastEsc, LastMod;
+    scanTrylockVars(LastExpr, *ASTCtx, LastEsc, LastMod);
+    for (const ValueDecl *MVD : LastMod)
+      SubState.VarRanges.erase(MVD);
     auto Sub = evaluatePureExprRange(LastExpr, SubState, Depth + 1);
     return Sub ? std::optional<IntRangeSet>(reprojectRangeSet(*Sub, Dom))
                : std::nullopt;
@@ -4952,12 +5253,15 @@ std::optional<unsigned> ThreadSafetyAnalyzer::getIdentityInlineParamIndex(
   const FunctionDecl *FD = CallExp->getDirectCallee();
   if (!FD || IdentityProbeDepth >= MaxIdentityProbeDepth)
     return std::nullopt;
-  FD = FD->getCanonicalDecl();
-  if (auto It = IdentityParamCache.find(FD); It != IdentityParamCache.end())
+  const FunctionDecl *DefFD = nullptr;
+  if (!FD->getBody(DefFD) || !DefFD || hasThreadSafetyCallEffects(FD, CallExp))
+    return std::nullopt;
+  if (auto It = GlobalBeforeSet->IdentityParamCache.find(DefFD);
+      It != GlobalBeforeSet->IdentityParamCache.end())
     return It->second;
   // Mark the computation as in progress such that recursive helpers are not
   // treated as identities.
-  IdentityParamCache[FD] = std::nullopt;
+  GlobalBeforeSet->IdentityParamCache[DefFD] = std::nullopt;
   ++IdentityProbeDepth;
   llvm::scope_exit PopProbe([&] { --IdentityProbeDepth; });
 
@@ -4975,7 +5279,7 @@ std::optional<unsigned> ThreadSafetyAnalyzer::getIdentityInlineParamIndex(
         DRE->getDecl()->getCanonicalDecl() == Param->getCanonicalDecl())
       Res = 0;
   }
-  IdentityParamCache[FD] = Res;
+  GlobalBeforeSet->IdentityParamCache[DefFD] = Res;
   return Res;
 }
 
@@ -5383,6 +5687,11 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
                              Depth + 1);
       return;
     }
+    if (InlineDepth >= MaxInlineDepth)
+      return;
+    auto InlineInfo = lookupTrivialInlineBody(CallExp);
+    if (!InlineInfo || ActiveInlineCallees.contains(InlineInfo->DefFD))
+      return;
     // Expanding the helper only yields information if an argument is a
     // tracked variable or has a known range. Check this first such that
     // conditions that are unrelated to the tracked values do not use up the
@@ -5418,41 +5727,45 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
           return;
       }
     };
-    std::string CacheKey =
-        getInlineCallCacheKey(CallExp, WantTrue ? 3 : 2, ArgRanges);
-    if (!CacheKey.empty())
-      if (auto It = InlineCondCache.find(CacheKey); It != InlineCondCache.end())
+    llvm::FoldingSetNodeID CacheID;
+    bool CanCache = profileInlineCallCacheKey(CacheID, InlineInfo->DefFD,
+                                              WantTrue ? 3 : 2, ArgRanges);
+    if (CanCache)
+      if (auto It = InlineCondCache.find_as(CacheID);
+          It != InlineCondCache.end())
         return ApplyToCaller(It->second);
-    if (auto InlineInfo = getCachedTrivialInlineBody(CallExp)) {
-      TrylockValueState CalleeState = makeCalleeState(*InlineInfo, ArgRanges);
-      InlineExpansionScope Scope(*this, InlineInfo->DefFD);
-      constrainInlineReturns(CalleeState, *InlineInfo, Depth + 1,
-                             [&](TrylockValueState &S, const Expr *RetE) {
-                               constrainLeafCondition(S, RetE, WantTrue,
-                                                      InlineInfo->CalleeEscaped,
-                                                      Depth + 1);
-                             });
-      InlineCondResult R;
-      R.Infeasible = CalleeState.Infeasible;
-      if (!R.Infeasible) {
-        for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
-          const auto *PVD = InlineInfo->param(I);
-          auto PIt = CalleeState.VarRanges.find(PVD);
-          R.ParamRanges.push_back(PIt != CalleeState.VarRanges.end()
-                                      ? std::optional(PIt->second)
-                                      : std::nullopt);
-        }
+    if (InlineExpansionCount >= MaxInlineExpansions)
+      return;
+    ++InlineExpansionCount;
+
+    TrylockValueState CalleeState = makeCalleeState(*InlineInfo, ArgRanges);
+    InlineExpansionScope Scope(*this, InlineInfo->DefFD);
+    constrainInlineReturns(CalleeState, *InlineInfo, Depth + 1,
+                           [&](TrylockValueState &S, const Expr *RetE) {
+                             constrainLeafCondition(S, RetE, WantTrue,
+                                                    InlineInfo->CalleeEscaped,
+                                                    Depth + 1);
+                           });
+    InlineCondResult R;
+    R.Infeasible = CalleeState.Infeasible;
+    if (!R.Infeasible) {
+      for (unsigned I = 0, N = CallExp->getNumArgs(); I < N; ++I) {
+        const auto *PVD = InlineInfo->param(I);
+        auto PIt = CalleeState.VarRanges.find(PVD);
+        R.ParamRanges.push_back(PIt != CalleeState.VarRanges.end()
+                                    ? std::optional(PIt->second)
+                                    : std::nullopt);
       }
-      ApplyToCaller(R);
-      if (!CacheKey.empty())
-        InlineCondCache.try_emplace(CacheKey, std::move(R));
     }
+    ApplyToCaller(R);
+    if (CanCache)
+      InlineCondCache.try_emplace(CacheID.Intern(Bpa), std::move(R));
     return;
   }
 
   if (const auto *SE = dyn_cast<StmtExpr>(Cond)) {
     llvm::SmallPtrSet<const ValueDecl *, 4> LocalDecls, SEEscaped;
-    const Expr *LastExpr = analyzeStmtExpr(SE, LocalDecls, SEEscaped);
+    const Expr *LastExpr = analyzeStmtExpr(SE, *ASTCtx, LocalDecls, SEEscaped);
     if (!LastExpr)
       return;
 
@@ -5461,12 +5774,16 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
         L2R && L2R->getCastKind() == CK_LValueToRValue)
       UnwrappedLast = stripNoOpExprWrappers(L2R->getSubExpr());
 
+    llvm::SmallPtrSet<const ValueDecl *, 4> LastEsc, LastMod;
+    scanTrylockVars(LastExpr, *ASTCtx, LastEsc, LastMod);
+
     if (const auto *DRE = dyn_cast<DeclRefExpr>(UnwrappedLast)) {
       const auto *TargetVD =
           cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
       if (LocalDecls.contains(TargetVD) && !SEEscaped.contains(TargetVD)) {
         const Expr *AssignedRHS = nullptr;
         unsigned AssignCount = 0;
+        llvm::SmallPtrSet<const ValueDecl *, 4> ModifiedAfterAssign = LastMod;
         for (const Stmt *S : llvm::drop_end(SE->getSubStmt()->body())) {
           if (const auto *DS = dyn_cast<DeclStmt>(S)) {
             for (const Decl *D : DS->decls()) {
@@ -5476,9 +5793,11 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
               // An initializer may assign to the target variable, e.g.
               // 'int d = (r = 0);'.
               llvm::SmallPtrSet<const ValueDecl *, 4> InitEsc, InitMod;
-              scanTrylockVars(VD->getInit(), InitEsc, InitMod);
+              scanTrylockVars(VD->getInit(), *ASTCtx, InitEsc, InitMod);
               if (InitMod.contains(TargetVD))
                 return;
+              if (AssignCount > 0)
+                ModifiedAfterAssign.insert_range(InitMod);
               if (VD->getCanonicalDecl() == TargetVD) {
                 AssignedRHS = VD->getInit();
                 ++AssignCount;
@@ -5492,25 +5811,33 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
               BO && BO->getOpcode() == BO_Assign) {
             if (const auto *LHSDRE = unwrapDirectLValueDRE(BO->getLHS());
                 LHSDRE && LHSDRE->getDecl()->getCanonicalDecl() == TargetVD) {
+              llvm::SmallPtrSet<const ValueDecl *, 4> RHSEsc, RHSMod;
+              scanTrylockVars(BO->getRHS(), *ASTCtx, RHSEsc, RHSMod);
+              if (RHSMod.contains(TargetVD))
+                return;
               AssignedRHS = BO->getRHS();
               ++AssignCount;
               continue;
             }
           }
           llvm::SmallPtrSet<const ValueDecl *, 4> SubEsc, SubMod;
-          scanTrylockVars(S, SubEsc, SubMod);
+          scanTrylockVars(S, *ASTCtx, SubEsc, SubMod);
           if (SubMod.contains(TargetVD))
             return;
+          if (AssignCount > 0)
+            ModifiedAfterAssign.insert_range(SubMod);
         }
         if (AssignCount == 1 && AssignedRHS &&
-            !exprReferencesAnyVar(AssignedRHS, LocalDecls))
+            !exprReferencesAnyVar(AssignedRHS, LocalDecls) &&
+            !exprReferencesAnyVar(AssignedRHS, ModifiedAfterAssign))
           constrainLeafCondition(State, AssignedRHS, WantTrue, EscapedVars,
                                  Depth + 1);
         return;
       }
     }
 
-    if (!exprReferencesAnyVar(LastExpr, LocalDecls))
+    if (!exprReferencesAnyVar(LastExpr, LocalDecls) &&
+        !exprReferencesAnyVar(LastExpr, LastMod))
       constrainLeafCondition(State, LastExpr, WantTrue, EscapedVars, Depth + 1);
     return;
   }
@@ -5547,7 +5874,7 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
     }
     if (BO->isLogicalOp()) {
       llvm::SmallPtrSet<const ValueDecl *, 4> RHSEsc, RHSMod;
-      scanTrylockVars(BO->getRHS(), RHSEsc, RHSMod);
+      scanTrylockVars(BO->getRHS(), *ASTCtx, RHSEsc, RHSMod);
       bool CanConstrainLHS = !exprReferencesAnyVar(BO->getLHS(), RHSMod);
       // A true && or a false || constrains both operands. Otherwise, one of
       // the operands has the value WantTrue.
@@ -6033,10 +6360,22 @@ void ThreadSafetyAnalyzer::updateValueStateForStmt(
         State.ExprRanges.erase(stripNoOpExprWrappers(VD->getInit()));
     return;
   }
-  if (const auto *E = dyn_cast<Expr>(S))
-    if (isa_and_nonnull<CompoundStmt, LabelStmt, CaseStmt, DefaultStmt,
-                        AttributedStmt>(CurrentParentMap->getParent(S)))
+  if (const auto *E = dyn_cast<Expr>(S)) {
+    if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+      if (const CompoundStmt *CS = SE->getSubStmt(); CS && !CS->body_empty())
+        if (const auto *LastExpr = dyn_cast<Expr>(CS->body_back()))
+          State.ExprRanges.erase(stripNoOpExprWrappers(LastExpr));
+    }
+    const Stmt *Parent = CurrentParentMap->getParent(S);
+    if (const auto *CS = dyn_cast_if_present<CompoundStmt>(Parent)) {
+      if (CS->body_back() != S ||
+          !isa_and_nonnull<StmtExpr>(CurrentParentMap->getParent(CS)))
+        State.ExprRanges.erase(stripNoOpExprWrappers(E));
+    } else if (isa_and_nonnull<LabelStmt, CaseStmt, DefaultStmt,
+                               AttributedStmt>(Parent)) {
       State.ExprRanges.erase(stripNoOpExprWrappers(E));
+    }
+  }
 }
 
 void ThreadSafetyAnalyzer::updateValueStateForStmtImpl(
@@ -6214,6 +6553,23 @@ void ThreadSafetyAnalyzer::updateValueStateForStmtImpl(
       }
     }
     State.VarRanges.erase(VD);
+    return;
+  }
+
+  if (const auto *SE = dyn_cast<StmtExpr>(S)) {
+    if (const CompoundStmt *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
+      if (const auto *LastExpr = dyn_cast<Expr>(CS->body_back())) {
+        if (auto Dom = getScalarDomain(SE->getType())) {
+          if (auto R = evaluatePureExprRange(LastExpr, State))
+            State.ExprRanges[stripNoOpExprWrappers(SE)] =
+                reprojectRangeSet(*R, *Dom);
+          else if (!SE->getType()->isAnyPointerType() ||
+                   State.DerefNonNullVars.empty())
+            State.ExprRanges[stripNoOpExprWrappers(SE)] =
+                IntRangeSet::full(*Dom);
+        }
+      }
+    }
   }
 }
 
@@ -6440,8 +6796,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomes(
                         const SmallVectorImpl<PendingTrylockAcquire> &B) {
     return A.size() == B.size() &&
            llvm::all_of(llvm::zip_equal(A, B), [](const auto &P) {
-             const PendingTrylockAcquire &PA = std::get<0>(P);
-             const PendingTrylockAcquire &PB = std::get<1>(P);
+             const auto &[PA, PB] = P;
              return PA.LK == PB.LK && PA.Loc == PB.Loc &&
                     PA.Cap.equals(PB.Cap);
            });
@@ -6629,6 +6984,13 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
 
   if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
     switch (UO->getOpcode()) {
+    case UO_AddrOf: {
+      const Expr *Sub = stripNoOpExprWrappers(UO->getSubExpr());
+      if (const auto *Deref = dyn_cast_or_null<UnaryOperator>(Sub);
+          Deref && Deref->getOpcode() == UO_Deref)
+        return EvalSub(Deref->getSubExpr(), TargetDom, Out);
+      return EmitDefault();
+    }
     case UO_Plus:
       return EvalSub(UO->getSubExpr(), TargetDom, Out);
     case UO_Minus:
@@ -6963,6 +7325,8 @@ void ThreadSafetyAnalyzer::applyScopeExitCleanups(FactSet &StateSet,
   for (const auto &BI : *B) {
     if (std::optional<CFGStmt> CS = BI.getAs<CFGStmt>()) {
       const Stmt *S = CS->getStmt();
+      if (UnevaluatedStmts.contains(S))
+        continue;
       llvm::scope_exit AdvanceCtx(
           [&] { StmtCtx = LocalVarMap.getNextContext(CtxIdx, S, StmtCtx); });
       if (isa<ReturnStmt>(S)) {
@@ -8188,9 +8552,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   BuiltLogicalOpTermBlock = false;
   LogicalOpTermBlock.clear();
   SwitchTables.clear();
-  InlineBodyCache.clear();
+  HasTrylockCall = false;
   InlineExpansionCount = 0;
-  IdentityParamCache.clear();
   InlineCallRangeCache.clear();
   InlineCondCache.clear();
   CurrentFunction = dyn_cast<FunctionDecl>(D);
@@ -8224,16 +8587,75 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   // Mark entry block as reachable
   Initial.Reachable = true;
 
-  // Compute SSA names for local variables. Record which variables may be
-  // modified through an alias, since the analysis would not see the update.
+  // Identify subtrees of unevaluated expressions (which CFGBuilder may still
+  // emit as CFG elements when AlwaysAdd is set) and check whether any
+  // evaluated call targets a trylock function.
+  UnevaluatedStmts.clear();
   {
-    llvm::SmallPtrSet<const ValueDecl *, 16> Escaped, Modified;
-    scanTrylockVars(AC.getBody(), Escaped, Modified,
-                    /*CallArgsAreTransient=*/true);
-    for (const ValueDecl *VD : Escaped)
-      LocalVarMap.addEscapedVar(VD);
+    auto AddUnevaluatedSubtree = [&](auto &Self, const Stmt *S) -> void {
+      if (!S || !UnevaluatedStmts.insert(S).second)
+        return;
+      for (const Stmt *Child : S->children())
+        Self(Self, Child);
+    };
+    SmallVector<const CallExpr *, 4> TrylockCalls;
+    for (const CFGBlock *B : *CFGraph) {
+      for (const CFGElement &BI : *B) {
+        std::optional<CFGStmt> CS = BI.getAs<CFGStmt>();
+        if (!CS)
+          continue;
+        const Stmt *S = CS->getStmt();
+        if (UnevaluatedStmts.contains(S))
+          continue;
+        if (const auto *CE = dyn_cast<CallExpr>(S)) {
+          if (CE->isUnevaluatedBuiltinCall(*ASTCtx)) {
+            for (const Expr *Arg : CE->arguments())
+              AddUnevaluatedSubtree(AddUnevaluatedSubtree, Arg);
+          } else if (getTrylockCallee(CE)) {
+            TrylockCalls.push_back(CE);
+          }
+          continue;
+        }
+        // Neither assignments nor dereferences in unevaluated operands have
+        // any effect at runtime.
+        if (const auto *NE = dyn_cast<CXXNoexceptExpr>(S)) {
+          AddUnevaluatedSubtree(AddUnevaluatedSubtree, NE->getOperand());
+        } else if (const auto *TE = dyn_cast<UnaryExprOrTypeTraitExpr>(S)) {
+          if (!TE->isArgumentType() &&
+              !TE->getArgumentExpr()->getType()->isVariablyModifiedType())
+            AddUnevaluatedSubtree(AddUnevaluatedSubtree, TE->getArgumentExpr());
+        } else if (const auto *TE = dyn_cast<CXXTypeidExpr>(S)) {
+          if (!TE->isTypeOperand() && !TE->isPotentiallyEvaluated())
+            AddUnevaluatedSubtree(AddUnevaluatedSubtree, TE->getExprOperand());
+        } else if (const auto *GSE = dyn_cast<GenericSelectionExpr>(S)) {
+          const Expr *Res =
+              GSE->isResultDependent() ? nullptr : GSE->getResultExpr();
+          for (const Stmt *Child : GSE->children())
+            if (Child != Res)
+              AddUnevaluatedSubtree(AddUnevaluatedSubtree, Child);
+        }
+      }
+    }
+    HasTrylockCall = llvm::any_of(TrylockCalls, [&](const CallExpr *CE) {
+      return !UnevaluatedStmts.contains(CE);
+    });
   }
-  LocalVarMap.traverseCFG(CFGraph, SortedGraph, BlockInfo);
+
+  // Compute SSA names for local variables. When trylocks are involved, record
+  // which variables may be modified through an alias, since the analysis would
+  // not see the update.
+  llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
+  llvm::SmallPtrSet<const ValueDecl *, 8> LoopModifiedVars;
+  if (HasTrylockCall || hasTrylockAttr(D)) {
+    llvm::SmallPtrSet<const ValueDecl *, 16> CallerEscaped;
+    scanTrylockVars(AC.getBody(), *ASTCtx, CallerEscaped, LoopModifiedVars,
+                    /*CallArgsAreTransient=*/true,
+                    hasTrylockAttr(D) ? &EscapedVars : nullptr);
+    for (const ValueDecl *VD : CallerEscaped)
+      LocalVarMap.addEscapedVar(VD);
+    LocalVarMap.markEscapedVarsComputed();
+  }
+  LocalVarMap.traverseCFG(CFGraph, SortedGraph, BlockInfo, UnevaluatedStmts);
   CurrentSortedGraph = SortedGraph;
 
   // Fill in source locations for all CFGBlocks.
@@ -8403,8 +8825,6 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   const unsigned NumBlocks = CFGraph->getNumBlockIDs();
 
   CapExprSet CurrentTrylockExitCaps;
-  llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
-  llvm::SmallPtrSet<const ValueDecl *, 8> LoopModifiedVars;
   std::vector<unsigned> RPOIdx;
   std::vector<llvm::SmallPtrSet<const ValueDecl *, 4>> BlockModifiedVars;
   std::vector<bool> PureExitPathBlocks;
@@ -8420,70 +8840,30 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     for (const auto &Spec : CurrentTrylockExitSpecs)
       CurrentTrylockExitCaps.push_back_nodup(Spec.Cap);
 
-    scanTrylockVars(AC.getBody(), EscapedVars, LoopModifiedVars);
-
     // Collect the trylock calls whose result is discarded.
     DiscardedCalls.clear();
     const ParentMap &PM = AC.getParentMap();
     CurrentParentMap = &PM;
     VarScopes.clear();
-    auto CollectDiscarded = [&](auto &Self, const Stmt *S) -> void {
-      if (!S || isa<LambdaExpr, BlockExpr, CapturedStmt>(S))
-        return;
-      if (const auto *Call = dyn_cast<CallExpr>(S)) {
-        const auto *Callee = dyn_cast_or_null<NamedDecl>(Call->getCalleeDecl());
-        if (Callee && hasTrylockAttr(Callee) && isDiscardedValue(Call, PM))
-          DiscardedCalls.insert(Call);
-      }
-      for (const Stmt *Child : S->children())
-        Self(Self, Child);
-    };
-    CollectDiscarded(CollectDiscarded, AC.getBody());
-
-    UnevaluatedStmts.clear();
-    auto AddSubtree = [&](auto &Self, const Stmt *S) -> void {
-      if (!S || !UnevaluatedStmts.insert(S).second)
-        return;
-      for (const Stmt *Child : S->children())
-        Self(Self, Child);
-    };
-    auto CollectUnevaluated = [&](auto &Self, const Stmt *S) -> void {
-      if (!S)
-        return;
-      if (const auto *CE = dyn_cast<CallExpr>(S);
-          CE && CE->isUnevaluatedBuiltinCall(*ASTCtx)) {
-        for (const Expr *Arg : CE->arguments())
-          AddSubtree(AddSubtree, Arg);
-        return;
-      }
-      // The operands of these expressions are not evaluated either. Neither
-      // assignments nor dereferences in these operands have any effect.
-      if (const auto *NE = dyn_cast<CXXNoexceptExpr>(S)) {
-        AddSubtree(AddSubtree, NE->getOperand());
-        return;
-      }
-      if (const auto *TE = dyn_cast<UnaryExprOrTypeTraitExpr>(S);
-          TE && !TE->isArgumentType() &&
-          !TE->getArgumentExpr()->getType()->isVariablyModifiedType()) {
-        AddSubtree(AddSubtree, TE->getArgumentExpr());
-        return;
-      }
-      if (const auto *TE = dyn_cast<CXXTypeidExpr>(S);
-          TE && !TE->isTypeOperand() && !TE->isPotentiallyEvaluated()) {
-        AddSubtree(AddSubtree, TE->getExprOperand());
-        return;
-      }
-      for (const Stmt *Child : S->children())
-        Self(Self, Child);
-    };
-    CollectUnevaluated(CollectUnevaluated, AC.getBody());
 
     RPOIdx.assign(NumBlocks, UINT_MAX);
     BlockModifiedVars.resize(NumBlocks);
     unsigned CurRPO = 0;
     for (const CFGBlock *B : *SortedGraph) {
       RPOIdx[B->getBlockID()] = CurRPO++;
-      scanBlockModifiedVars(B, BlockModifiedVars[B->getBlockID()]);
+      scanBlockModifiedVars(B, UnevaluatedStmts,
+                            BlockModifiedVars[B->getBlockID()]);
+      for (const CFGElement &BI : *B) {
+        std::optional<CFGStmt> CS = BI.getAs<CFGStmt>();
+        if (!CS || UnevaluatedStmts.contains(CS->getStmt()))
+          continue;
+        if (const auto *Call = dyn_cast<CallExpr>(CS->getStmt())) {
+          const auto *Callee =
+              dyn_cast_or_null<NamedDecl>(Call->getCalleeDecl());
+          if (Callee && hasTrylockAttr(Callee) && isDiscardedValue(Call, PM))
+            DiscardedCalls.insert(Call);
+        }
+      }
     }
 
     PureExitPathBlocks.assign(NumBlocks, false);
@@ -8916,6 +9296,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
                   for (const CFGElement &BI : *LB) {
                     if (std::optional<CFGStmt> CS = BI.getAs<CFGStmt>()) {
                       const Stmt *S = CS->getStmt();
+                      if (UnevaluatedStmts.contains(S))
+                        continue;
                       updateValueStateForStmt(LBS, S, SimStmtCtx, EscapedVars);
                       SimStmtCtx =
                           LocalVarMap.getNextContext(SimCtxIdx, S, SimStmtCtx);
@@ -8987,6 +9369,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         case CFGElement::Statement: {
           CFGStmt CS = BI.castAs<CFGStmt>();
           const Stmt *S = CS.getStmt();
+          if (UnevaluatedStmts.contains(S))
+            break;
           if (CheckingTrylockBody) {
             if (isa<ReturnStmt>(S)) {
               PreReturnLocksets[CurrBlockID] = LocksetBuilder.FSet;
@@ -9160,6 +9544,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
             if (!CS)
               continue;
             const Stmt *S = CS->getStmt();
+            if (UnevaluatedStmts.contains(S))
+              continue;
             if (S == RS)
               break;
             updateValueStateForStmt(State, S, Ctx, EscapedVars);
