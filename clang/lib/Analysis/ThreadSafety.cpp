@@ -8340,18 +8340,6 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     PreReturnVarCtx.resize(NumBlocks, LocalVarMap.getEmptyContext());
   }
 
-  auto SameShortCircuits = [](const TrylockValueState &A,
-                              const TrylockValueState &B) {
-    if (A.ShortCircuitedOps.size() != B.ShortCircuitedOps.size())
-      return false;
-    for (const auto &[BO, Val] : A.ShortCircuitedOps) {
-      auto It = B.ShortCircuitedOps.find(BO);
-      if (It == B.ShortCircuitedOps.end() || It->second != Val)
-        return false;
-    }
-    return true;
-  };
-
   auto SameUnmaterializedDefs = [](const TrylockValueState &A,
                                    const TrylockValueState &B) {
     if (A.UnmaterializedVarDefs.size() != B.UnmaterializedVarDefs.size())
@@ -8381,7 +8369,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     auto &Bundles = PureBlockBundles[BlockID];
     for (TrylockEdgeBundle &Existing : Bundles) {
       if (factSetsEquivalent(Existing.Lockset, Candidate.Lockset) &&
-          SameShortCircuits(Existing.ValState, Candidate.ValState) &&
+          Existing.ValState.ShortCircuitedOps ==
+              Candidate.ValState.ShortCircuitedOps &&
           Existing.ValState.AcquiredTrylockAttrs ==
               Candidate.ValState.AcquiredTrylockAttrs &&
           Existing.ValState.ConsumedTrylockAttrs ==
@@ -8420,6 +8409,31 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       unsigned DepthB = getFactReentrancyDepth(*BFact);
       if (DepthA != DepthB ? DepthB < DepthA : preferJoinedFact(AFact, *BFact))
         Acc.replaceLock(FactMan, It, BFact);
+    }
+  };
+
+  // Compute the lockset and the value state on the edge Pred -> Succ.
+  auto GetEdgeState = [&](const CFGBlock *Pred, const CFGBlock *Succ,
+                          FactSet &Lockset) {
+    TrylockValueState State = BlockExitValState[Pred->getBlockID()];
+    getEdgeLockset(Lockset, BlockInfo[Pred->getBlockID()].ExitSet, Pred, Succ,
+                   &State.AcquiredTrylockAttrs, &State.ConsumedTrylockAttrs);
+    constrainValueStateOnEdge(State, Pred, Succ, EscapedVars);
+    materializeNarrowedTrylocks(Lockset, State);
+    return State;
+  };
+
+  // Propagate the per-path states of the pure block Pred over the edge
+  // Pred -> Succ and pass the feasible ones to F.
+  auto ForEachEdgeBundle = [&](const CFGBlock *Pred, const CFGBlock *Succ,
+                               llvm::function_ref<void(TrylockEdgeBundle)> F) {
+    for (const TrylockEdgeBundle &Bnd : PureBlockBundles[Pred->getBlockID()]) {
+      TrylockEdgeBundle Next = Bnd;
+      constrainValueStateOnEdge(Next.ValState, Pred, Succ, EscapedVars);
+      if (Next.ValState.Infeasible)
+        continue;
+      materializeNarrowedTrylocks(Next.Lockset, Next.ValState);
+      F(std::move(Next));
     }
   };
 
@@ -8500,12 +8514,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 
       FactSet PrevLockset;
       if (CheckingTrylockBody) {
-        TrylockValueState EdgeValState = BlockExitValState[PrevBlockID];
-        getEdgeLockset(PrevLockset, PrevBlockInfo->ExitSet, *PI, CurrBlock,
-                       &EdgeValState.AcquiredTrylockAttrs,
-                       &EdgeValState.ConsumedTrylockAttrs);
-        constrainValueStateOnEdge(EdgeValState, *PI, CurrBlock, EscapedVars);
-        materializeNarrowedTrylocks(PrevLockset, EdgeValState);
+        TrylockValueState EdgeValState =
+            GetEdgeState(*PI, CurrBlock, PrevLockset);
         unionIntoValueState(CurrValState, EdgeValState, *ASTCtx);
 
         if (IsPureBlock) {
@@ -8513,16 +8523,9 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
             BundleOverflow[CurrBlockID] = true;
             PureBlockBundles[CurrBlockID].clear();
           } else if (PureExitPathBlocks[PrevBlockID]) {
-            for (const TrylockEdgeBundle &SrcBnd :
-                 PureBlockBundles[PrevBlockID]) {
-              TrylockEdgeBundle NextBnd = SrcBnd;
-              constrainValueStateOnEdge(NextBnd.ValState, *PI, CurrBlock,
-                                        EscapedVars);
-              if (!NextBnd.ValState.Infeasible) {
-                materializeNarrowedTrylocks(NextBnd.Lockset, NextBnd.ValState);
-                AddOrMergeBundle(CurrBlockID, std::move(NextBnd));
-              }
-            }
+            ForEachEdgeBundle(*PI, CurrBlock, [&](TrylockEdgeBundle Bnd) {
+              AddOrMergeBundle(CurrBlockID, std::move(Bnd));
+            });
           } else if (!EdgeValState.Infeasible) {
             AddOrMergeBundle(CurrBlockID,
                              {PrevLockset, std::move(EdgeValState)});
@@ -8908,25 +8911,38 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
       SourceLocation DiagLoc = RS ? RS->getBeginLoc() : Final.ExitLoc;
       const Expr *RetVal = RS ? RS->getRetValue() : nullptr;
 
-      auto VerifyExitOutcome = [&](ReturnEvalOutcome &Outcome) {
-        for (const PendingTrylockAcquire &PA : Outcome.PendingAcquires)
-          addLock(Outcome.Lockset,
-                  FactMan.createFact<LockableFactEntry>(PA.Cap, PA.LK, PA.Loc,
-                                                        FactEntry::Acquired),
-                  /*ReqAttr=*/false, &DedupHandler);
-        applyScopeExitCleanups(Outcome.Lockset, PredBlock,
-                               /*OnlyAfterReturn=*/true);
-        checkTrylockExitOutcome(ExpectedFunctionExitSet, Outcome, DiagLoc,
-                                DedupHandler);
+      LocalVarContext EvalCtx =
+          RS ? PreReturnVarCtx[PredID] : PredInfo.ExitContext;
+      // Verify the lock state at the exit for each value that the function
+      // may return if it leaves PredBlock with Lockset and State.
+      auto VerifyReturn = [&](const FactSet &Lockset, TrylockValueState State) {
+        if (!RS) {
+          constrainValueStateOnEdge(State, PredBlock, ExitBlock, EscapedVars);
+          if (State.Infeasible)
+            return;
+        }
+        SmallVector<ReturnEvalOutcome, 2> Outcomes;
+        evaluateReturnWithPendingTrylocks(RetVal, Lockset, State, EvalCtx,
+                                          Outcomes);
+        for (ReturnEvalOutcome &Outcome : Outcomes) {
+          for (const PendingTrylockAcquire &PA : Outcome.PendingAcquires)
+            addLock(Outcome.Lockset,
+                    FactMan.createFact<LockableFactEntry>(PA.Cap, PA.LK, PA.Loc,
+                                                          FactEntry::Acquired),
+                    /*ReqAttr=*/false, &DedupHandler);
+          applyScopeExitCleanups(Outcome.Lockset, PredBlock,
+                                 /*OnlyAfterReturn=*/true);
+          checkTrylockExitOutcome(ExpectedFunctionExitSet, Outcome, DiagLoc,
+                                  DedupHandler);
+        }
       };
 
       // If there are too many distinct lock and value states to track them
       // per path, verify the states per predecessor edge instead. Their
       // number is bounded by the number of CFG edges.
       if (PureExitPathBlocks[PredID] && BundleOverflow[PredID]) {
-        LocalVarContext EvalCtx =
-            RS ? PreReturnVarCtx[PredID] : PredInfo.ExitContext;
-        auto VerifyEdgeState = [&](FactSet Lockset, TrylockValueState State) {
+        auto VerifyEdgeState = [&](const FactSet &Lockset,
+                                   TrylockValueState State) {
           unsigned Idx = PredInfo.EntryIndex;
           LocalVarContext Ctx = PredInfo.EntryContext;
           for (const CFGElement &BI : *PredBlock) {
@@ -8939,15 +8955,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
             updateValueStateForStmt(State, S, Ctx, EscapedVars);
             Ctx = LocalVarMap.getNextContext(Idx, S, Ctx);
           }
-          if (!RS)
-            constrainValueStateOnEdge(State, PredBlock, ExitBlock, EscapedVars);
-          if (State.Infeasible)
-            return;
-          SmallVector<ReturnEvalOutcome, 2> Outcomes;
-          evaluateReturnWithPendingTrylocks(RetVal, Lockset, State, EvalCtx,
-                                            Outcomes);
-          for (ReturnEvalOutcome &Outcome : Outcomes)
-            VerifyExitOutcome(Outcome);
+          if (!State.Infeasible)
+            VerifyReturn(Lockset, std::move(State));
         };
         for (const CFGBlock *Q : PredBlock->preds()) {
           if (!Q || !VisitedBlocks.alreadySet(Q) || neverReturns(Q) ||
@@ -8955,53 +8964,21 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
             continue;
           unsigned QID = Q->getBlockID();
           if (PureExitPathBlocks[QID] && !BundleOverflow[QID]) {
-            for (const TrylockEdgeBundle &Bnd : PureBlockBundles[QID]) {
-              TrylockEdgeBundle Next = Bnd;
-              constrainValueStateOnEdge(Next.ValState, Q, PredBlock,
-                                        EscapedVars);
-              if (Next.ValState.Infeasible)
-                continue;
-              materializeNarrowedTrylocks(Next.Lockset, Next.ValState);
-              VerifyEdgeState(std::move(Next.Lockset),
-                              std::move(Next.ValState));
-            }
+            ForEachEdgeBundle(Q, PredBlock, [&](TrylockEdgeBundle Bnd) {
+              VerifyEdgeState(Bnd.Lockset, std::move(Bnd.ValState));
+            });
             continue;
           }
           FactSet EdgeLockset;
-          TrylockValueState EdgeState = BlockExitValState[QID];
-          getEdgeLockset(EdgeLockset, BlockInfo[QID].ExitSet, Q, PredBlock,
-                         &EdgeState.AcquiredTrylockAttrs,
-                         &EdgeState.ConsumedTrylockAttrs);
-          constrainValueStateOnEdge(EdgeState, Q, PredBlock, EscapedVars);
-          if (EdgeState.Infeasible)
-            continue;
-          materializeNarrowedTrylocks(EdgeLockset, EdgeState);
-          VerifyEdgeState(std::move(EdgeLockset), std::move(EdgeState));
+          TrylockValueState EdgeState = GetEdgeState(Q, PredBlock, EdgeLockset);
+          if (!EdgeState.Infeasible)
+            VerifyEdgeState(EdgeLockset, std::move(EdgeState));
         }
       } else if (PureExitPathBlocks[PredID]) {
-        LocalVarContext EvalCtx =
-            RS ? PreReturnVarCtx[PredID] : PredInfo.ExitContext;
-        for (const TrylockEdgeBundle &Bnd : PureBlockBundles[PredID]) {
-          TrylockValueState EvalState = Bnd.ValState;
-          if (!RS) {
-            constrainValueStateOnEdge(EvalState, PredBlock, ExitBlock,
-                                      EscapedVars);
-            if (EvalState.Infeasible)
-              continue;
-          }
-          SmallVector<ReturnEvalOutcome, 2> Outcomes;
-          evaluateReturnWithPendingTrylocks(RetVal, Bnd.Lockset, EvalState,
-                                            EvalCtx, Outcomes);
-          for (ReturnEvalOutcome &Outcome : Outcomes)
-            VerifyExitOutcome(Outcome);
-        }
+        for (const TrylockEdgeBundle &Bnd : PureBlockBundles[PredID])
+          VerifyReturn(Bnd.Lockset, Bnd.ValState);
       } else if (RS) {
-        SmallVector<ReturnEvalOutcome, 2> Outcomes;
-        evaluateReturnWithPendingTrylocks(
-            RetVal, PreReturnLocksets[PredID], PreReturnValStates[PredID],
-            PreReturnVarCtx[PredID], Outcomes);
-        for (ReturnEvalOutcome &Outcome : Outcomes)
-          VerifyExitOutcome(Outcome);
+        VerifyReturn(PreReturnLocksets[PredID], PreReturnValStates[PredID]);
       } else {
         TrylockValueState FallthroughState = BlockExitValState[PredID];
         constrainValueStateOnEdge(FallthroughState, PredBlock, ExitBlock,
