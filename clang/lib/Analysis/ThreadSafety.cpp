@@ -1363,10 +1363,20 @@ public:
 
     static IntDomain forType(QualType Ty, const ASTContext &Ctx);
     llvm::APSInt toDomainInt(const llvm::APSInt &V) const;
+
+    bool operator==(const IntDomain &Other) const {
+      return BitWidth == Other.BitWidth &&
+             llvm::APSInt::compareValues(Lo, Other.Lo) == 0 &&
+             llvm::APSInt::compareValues(Hi, Other.Hi) == 0;
+    }
   };
 
   class IntRangeSet {
     SmallVector<std::pair<llvm::APSInt, llvm::APSInt>, 2> Intervals;
+
+    /// Append \p Iv, which must not start before the last interval, and merge
+    /// it with the last interval if these overlap or are adjacent.
+    void appendCoalesced(const std::pair<llvm::APSInt, llvm::APSInt> &Iv);
 
   public:
     IntRangeSet() = default;
@@ -1381,6 +1391,15 @@ public:
     static IntRangeSet forComparison(const IntDomain &Dom,
                                      BinaryOperator::Opcode Opc,
                                      const llvm::APSInt &K);
+    /// The values in \p Dom that are true (non-zero) if \p Truth is set or
+    /// false (zero) otherwise.
+    static IntRangeSet truthSet(const IntDomain &Dom, bool Truth) {
+      return forComparison(Dom, Truth ? BO_NE : BO_EQ, llvm::APSInt::get(0));
+    }
+    /// The subset of {0, 1} in \p Dom with 0 if \p CanBeFalse and 1 if
+    /// \p CanBeTrue.
+    static IntRangeSet boolSet(const IntDomain &Dom, bool CanBeFalse,
+                               bool CanBeTrue);
 
     /// Union of all \p Sets in O(N log N) time, where N is the total number
     /// of intervals. All sets must belong to the same domain.
@@ -1395,6 +1414,14 @@ public:
     bool subsetOfSet(const IntRangeSet &Other) const;
     bool intersectsSet(const IntRangeSet &Other) const;
     bool isSingleValue(llvm::APSInt &Val) const;
+    bool mayBeZero() const {
+      llvm::APSInt Zero = llvm::APSInt::get(0);
+      return intersects(Zero, Zero);
+    }
+    bool mayBeNonZero() const {
+      llvm::APSInt Zero = llvm::APSInt::get(0);
+      return !empty() && !subsetOf(Zero, Zero);
+    }
     /// Over-approximate this set by at most \p MaxIntervals intervals by
     /// filling the smallest gaps between intervals.
     void widen(unsigned MaxIntervals);
@@ -1491,13 +1518,6 @@ public:
     IntDomain Dom;
     IntRangeSet TrueSet;
     IntRangeSet FalseSet;
-
-    TrylockRangeCondResult() = default;
-    TrylockRangeCondResult(const CallExpr *Call, const NamedDecl *Callee,
-                           IntDomain Dom, IntRangeSet TrueSet,
-                           IntRangeSet FalseSet)
-        : Call(Call), Callee(Callee), Dom(std::move(Dom)),
-          TrueSet(std::move(TrueSet)), FalseSet(std::move(FalseSet)) {}
   };
 
   std::optional<unsigned>
@@ -2106,8 +2126,7 @@ ThreadSafetyAnalyzer::getTrylockSuccessSet(const Attr *A,
     bool SuccBool = false;
     if (!evalTrylockSuccessBool(TA->getSuccessValue(), *ASTCtx, SuccBool))
       return std::nullopt;
-    IntRangeSet Zero = IntRangeSet::single(Dom, llvm::APSInt::get(0));
-    return SuccBool ? Zero.complement(Dom) : Zero;
+    return IntRangeSet::truthSet(Dom, SuccBool);
   }
   const auto *RA = cast<TryAcquireCapabilityRangeAttr>(A);
   if (!RA->getFirstSuccessValue() || !RA->getLastSuccessValue())
@@ -2279,6 +2298,13 @@ static llvm::APSInt decAPSInt(llvm::APSInt V) {
   return V;
 }
 
+/// \p V as a signed integer that is wide enough to add or subtract one.
+static llvm::APSInt widenAPSInt(const llvm::APSInt &V) {
+  llvm::APSInt Res = V.extend(V.getBitWidth() + 2);
+  Res.setIsSigned(true);
+  return Res;
+}
+
 ThreadSafetyAnalyzer::IntRangeSet
 ThreadSafetyAnalyzer::IntRangeSet::forComparison(const IntDomain &Dom,
                                                  BinaryOperator::Opcode Opc,
@@ -2289,32 +2315,27 @@ ThreadSafetyAnalyzer::IntRangeSet::forComparison(const IntDomain &Dom,
   case BO_NE:
     return single(Dom, K).complement(Dom);
   case BO_LT:
-    if (llvm::APSInt::compareValues(K, Dom.Lo) <= 0)
-      return {};
-    if (llvm::APSInt::compareValues(K, Dom.Hi) > 0)
-      return full(Dom);
-    {
-      IntRangeSet S;
-      S.Intervals.emplace_back(Dom.Lo, decAPSInt(Dom.toDomainInt(K)));
-      return S;
-    }
+    return closedRange(Dom, Dom.Lo, decAPSInt(widenAPSInt(K)));
   case BO_LE:
     return closedRange(Dom, Dom.Lo, K);
   case BO_GT:
-    if (llvm::APSInt::compareValues(K, Dom.Hi) >= 0)
-      return {};
-    if (llvm::APSInt::compareValues(K, Dom.Lo) < 0)
-      return full(Dom);
-    {
-      IntRangeSet S;
-      S.Intervals.emplace_back(incAPSInt(Dom.toDomainInt(K)), Dom.Hi);
-      return S;
-    }
+    return closedRange(Dom, incAPSInt(widenAPSInt(K)), Dom.Hi);
   case BO_GE:
     return closedRange(Dom, K, Dom.Hi);
   default:
     llvm_unreachable("Unexpected comparison opcode");
   }
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+ThreadSafetyAnalyzer::IntRangeSet::boolSet(const IntDomain &Dom,
+                                           bool CanBeFalse, bool CanBeTrue) {
+  IntRangeSet Res;
+  if (CanBeFalse)
+    Res = single(Dom, llvm::APSInt::get(0));
+  if (CanBeTrue)
+    Res = Res.unionWith(single(Dom, llvm::APSInt::get(1)));
+  return Res;
 }
 
 ThreadSafetyAnalyzer::IntRangeSet
@@ -2352,27 +2373,28 @@ ThreadSafetyAnalyzer::IntRangeSet::intersect(const IntRangeSet &Other) const {
   return Res;
 }
 
+void ThreadSafetyAnalyzer::IntRangeSet::appendCoalesced(
+    const std::pair<llvm::APSInt, llvm::APSInt> &Iv) {
+  if (Intervals.empty() || incAPSInt(Intervals.back().second) < Iv.first)
+    Intervals.push_back(Iv);
+  else if (Intervals.back().second < Iv.second)
+    Intervals.back().second = Iv.second;
+}
+
 ThreadSafetyAnalyzer::IntRangeSet
 ThreadSafetyAnalyzer::IntRangeSet::unionWith(const IntRangeSet &Other) const {
   IntRangeSet Res;
-  auto Append = [&Res](const std::pair<llvm::APSInt, llvm::APSInt> &Iv) {
-    if (Res.Intervals.empty() ||
-        incAPSInt(Res.Intervals.back().second) < Iv.first)
-      Res.Intervals.push_back(Iv);
-    else if (Res.Intervals.back().second < Iv.second)
-      Res.Intervals.back().second = Iv.second;
-  };
   size_t I = 0, J = 0;
   while (I < Intervals.size() && J < Other.Intervals.size()) {
     if (Intervals[I].first <= Other.Intervals[J].first)
-      Append(Intervals[I++]);
+      Res.appendCoalesced(Intervals[I++]);
     else
-      Append(Other.Intervals[J++]);
+      Res.appendCoalesced(Other.Intervals[J++]);
   }
   while (I < Intervals.size())
-    Append(Intervals[I++]);
+    Res.appendCoalesced(Intervals[I++]);
   while (J < Other.Intervals.size())
-    Append(Other.Intervals[J++]);
+    Res.appendCoalesced(Other.Intervals[J++]);
   return Res;
 }
 
@@ -2419,13 +2441,8 @@ ThreadSafetyAnalyzer::IntRangeSet::unionAll(ArrayRef<IntRangeSet> Sets) {
     return llvm::APSInt::compareValues(A.first, B.first) < 0;
   });
   IntRangeSet Res;
-  for (const auto &Iv : All) {
-    if (Res.Intervals.empty() ||
-        incAPSInt(Res.Intervals.back().second) < Iv.first)
-      Res.Intervals.push_back(Iv);
-    else if (Res.Intervals.back().second < Iv.second)
-      Res.Intervals.back().second = Iv.second;
-  }
+  for (const auto &Iv : All)
+    Res.appendCoalesced(Iv);
   return Res;
 }
 
@@ -2434,9 +2451,7 @@ ThreadSafetyAnalyzer::getSwitchCaseTable(const SwitchStmt *SS,
                                          const IntDomain &Dom) const {
   auto &Entries = SwitchTables[SS];
   for (auto &[EDom, Table] : Entries)
-    if (EDom.BitWidth == Dom.BitWidth &&
-        llvm::APSInt::compareValues(EDom.Lo, Dom.Lo) == 0 &&
-        llvm::APSInt::compareValues(EDom.Hi, Dom.Hi) == 0)
+    if (EDom == Dom)
       return Table;
 
   SwitchCaseTable Table;
@@ -2726,8 +2741,8 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
 
     if (const NamedDecl *Callee = getTrylockCallee(CallExp)) {
       IntDomain Dom = getTrylockCallDomain(CallExp);
-      IntRangeSet FalseSet = IntRangeSet::single(Dom, llvm::APSInt::get(0));
-      IntRangeSet TrueSet = FalseSet.complement(Dom);
+      IntRangeSet FalseSet = IntRangeSet::truthSet(Dom, false);
+      IntRangeSet TrueSet = IntRangeSet::truthSet(Dom, true);
       return {CallExp, Callee, std::move(Dom), std::move(TrueSet),
               std::move(FalseSet)};
     }
@@ -4010,12 +4025,6 @@ reprojectRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
   return Res;
 }
 
-static ThreadSafetyAnalyzer::IntRangeSet
-nonZeroRangeSet(const ThreadSafetyAnalyzer::IntDomain &Dom) {
-  return ThreadSafetyAnalyzer::IntRangeSet::single(Dom, llvm::APSInt::get(0))
-      .complement(Dom);
-}
-
 /// Range of addresses that a valid object, function, or dereferenced pointer
 /// can have. On 32-bit and wider targets, exclude the top 4 KiB page so that
 /// valid addresses are disjoint from negative errno sentinel pointers such as
@@ -4024,7 +4033,7 @@ static ThreadSafetyAnalyzer::IntRangeSet
 validObjectPtrRangeSet(QualType Ty, const ThreadSafetyAnalyzer::IntDomain &Dom,
                        const ASTContext &Ctx) {
   if (!Ty->isAnyPointerType() || Ctx.getIntWidth(Ctx.getUIntPtrType()) < 32)
-    return nonZeroRangeSet(Dom);
+    return ThreadSafetyAnalyzer::IntRangeSet::truthSet(Dom, true);
   llvm::APSInt One(llvm::APInt(Dom.BitWidth, 1), /*isUnsigned=*/false);
   llvm::APSInt TopPage(llvm::APInt(Dom.BitWidth, 4096), /*isUnsigned=*/false);
   return ThreadSafetyAnalyzer::IntRangeSet::closedRange(Dom, One,
@@ -4034,35 +4043,21 @@ validObjectPtrRangeSet(QualType Ty, const ThreadSafetyAnalyzer::IntDomain &Dom,
 static ThreadSafetyAnalyzer::IntRangeSet
 castDerivedToBaseRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
                           const ThreadSafetyAnalyzer::IntDomain &Dom) {
-  if (Src.empty())
-    return {};
-  auto Zero =
-      ThreadSafetyAnalyzer::IntRangeSet::single(Dom, llvm::APSInt::get(0));
-  ThreadSafetyAnalyzer::IntRangeSet Mapped = reprojectRangeSet(Src, Dom);
-  ThreadSafetyAnalyzer::IntRangeSet Res;
-  if (Mapped.intersectsSet(Zero))
-    Res = Res.unionWith(Zero);
-  if (!Mapped.subsetOfSet(Zero))
-    Res = Res.unionWith(nonZeroRangeSet(Dom));
+  using IntRangeSet = ThreadSafetyAnalyzer::IntRangeSet;
+  IntRangeSet Mapped = reprojectRangeSet(Src, Dom);
+  IntRangeSet Res;
+  if (Mapped.mayBeZero())
+    Res = IntRangeSet::truthSet(Dom, false);
+  if (Mapped.mayBeNonZero())
+    Res = Res.unionWith(IntRangeSet::truthSet(Dom, true));
   return Res;
 }
 
 static ThreadSafetyAnalyzer::IntRangeSet
 booleanizeRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
-                   const ThreadSafetyAnalyzer::IntDomain &SrcDom,
                    const ThreadSafetyAnalyzer::IntDomain &DstDom) {
-  if (Src.empty())
-    return {};
-  auto Zero =
-      ThreadSafetyAnalyzer::IntRangeSet::single(SrcDom, llvm::APSInt::get(0));
-  ThreadSafetyAnalyzer::IntRangeSet Res;
-  if (Src.intersectsSet(Zero))
-    Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
-        DstDom, llvm::APSInt::get(0)));
-  if (!Src.subsetOfSet(Zero))
-    Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
-        DstDom, llvm::APSInt::get(1)));
-  return Res;
+  return ThreadSafetyAnalyzer::IntRangeSet::boolSet(DstDom, Src.mayBeZero(),
+                                                    Src.mayBeNonZero());
 }
 
 static ThreadSafetyAnalyzer::IntRangeSet
@@ -4071,22 +4066,9 @@ castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
   if (Src.empty())
     return {};
   auto DstDom = ThreadSafetyAnalyzer::IntDomain::forType(DstTy, Ctx);
-  if (DstTy->isBooleanType()) {
-    // Boolean conversion is != 0, handled via booleanizeRangeSet by callers.
-    auto Zero =
-        ThreadSafetyAnalyzer::IntRangeSet::single(DstDom, llvm::APSInt::get(0));
-    ThreadSafetyAnalyzer::IntRangeSet Res;
-    for (const auto &[Lo, Hi] : Src.intervals()) {
-      if (llvm::APSInt::compareValues(Lo, llvm::APSInt::get(0)) <= 0 &&
-          llvm::APSInt::compareValues(Hi, llvm::APSInt::get(0)) >= 0)
-        Res = Res.unionWith(Zero);
-      if (llvm::APSInt::compareValues(Lo, llvm::APSInt::get(0)) != 0 ||
-          llvm::APSInt::compareValues(Hi, llvm::APSInt::get(0)) != 0)
-        Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
-            DstDom, llvm::APSInt::get(1)));
-    }
-    return Res;
-  }
+  // Boolean conversion is != 0.
+  if (DstTy->isBooleanType())
+    return booleanizeRangeSet(Src, DstDom);
 
   unsigned DstBits = Ctx.getIntWidth(DstTy);
   bool DstUnsigned = DstTy->isUnsignedIntegerOrEnumerationType();
@@ -4198,79 +4180,60 @@ negateRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src, QualType ResTy,
   return Res;
 }
 
+/// Whether \p L \p Opc \p R holds for some values of the non-empty sets \p L
+/// and \p R.
+static bool mayHold(BinaryOperator::Opcode Opc,
+                    const ThreadSafetyAnalyzer::IntRangeSet &L,
+                    const ThreadSafetyAnalyzer::IntRangeSet &R) {
+  switch (Opc) {
+  case BO_EQ:
+    return L.intersectsSet(R);
+  case BO_NE: {
+    llvm::APSInt LV, RV;
+    return !(L.isSingleValue(LV) && R.isSingleValue(RV) &&
+             llvm::APSInt::compareValues(LV, RV) == 0);
+  }
+  case BO_LT:
+    return llvm::APSInt::compareValues(L.intervals().front().first,
+                                       R.intervals().back().second) < 0;
+  case BO_LE:
+    return llvm::APSInt::compareValues(L.intervals().front().first,
+                                       R.intervals().back().second) <= 0;
+  case BO_GT:
+  case BO_GE:
+    return mayHold(BinaryOperator::reverseComparisonOp(Opc), R, L);
+  default:
+    llvm_unreachable("Unexpected comparison opcode");
+  }
+}
+
 static std::optional<ThreadSafetyAnalyzer::IntRangeSet> compareRangeSets(
     BinaryOperator::Opcode Opc, const ThreadSafetyAnalyzer::IntRangeSet &L,
     const ThreadSafetyAnalyzer::IntRangeSet &R,
     const ThreadSafetyAnalyzer::IntDomain &ResDom, bool IsMemberPtrComparison) {
+  using IntRangeSet = ThreadSafetyAnalyzer::IntRangeSet;
   if (L.empty() || R.empty())
-    return ThreadSafetyAnalyzer::IntRangeSet{};
-
-  bool CanBeTrue = false;
-  bool CanBeFalse = false;
+    return IntRangeSet{};
 
   if (IsMemberPtrComparison) {
-    if (Opc != BO_EQ && Opc != BO_NE)
+    if (!BinaryOperator::isEqualityOp(Opc))
       return std::nullopt;
-    llvm::APSInt Z = llvm::APSInt::get(0);
-    bool LNull = L.intersects(Z, Z);
-    bool LNonNull = !L.subsetOf(Z, Z);
-    bool RNull = R.intersects(Z, Z);
-    bool RNonNull = !R.subsetOf(Z, Z);
+    // Only null-ness is tracked for member pointers. Two non-null member
+    // pointers may or may not be equal.
+    bool LNull = L.mayBeZero(), LNonNull = L.mayBeNonZero();
+    bool RNull = R.mayBeZero(), RNonNull = R.mayBeNonZero();
     bool CanEq = (LNull && RNull) || (LNonNull && RNonNull);
     bool CanNe =
         (LNull && RNonNull) || (LNonNull && RNull) || (LNonNull && RNonNull);
-    CanBeTrue = (Opc == BO_EQ) ? CanEq : CanNe;
-    CanBeFalse = (Opc == BO_EQ) ? CanNe : CanEq;
-  } else {
-    const llvm::APSInt &LMin = L.intervals().front().first;
-    const llvm::APSInt &LMax = L.intervals().back().second;
-    const llvm::APSInt &RMin = R.intervals().front().first;
-    const llvm::APSInt &RMax = R.intervals().back().second;
-
-    switch (Opc) {
-    case BO_EQ: {
-      CanBeTrue = L.intersectsSet(R);
-      llvm::APSInt LV, RV;
-      CanBeFalse = !(L.isSingleValue(LV) && R.isSingleValue(RV) &&
-                     llvm::APSInt::compareValues(LV, RV) == 0);
-      break;
-    }
-    case BO_NE: {
-      llvm::APSInt LV, RV;
-      CanBeTrue = !(L.isSingleValue(LV) && R.isSingleValue(RV) &&
-                    llvm::APSInt::compareValues(LV, RV) == 0);
-      CanBeFalse = L.intersectsSet(R);
-      break;
-    }
-    case BO_LT:
-      CanBeTrue = llvm::APSInt::compareValues(LMin, RMax) < 0;
-      CanBeFalse = llvm::APSInt::compareValues(LMax, RMin) >= 0;
-      break;
-    case BO_LE:
-      CanBeTrue = llvm::APSInt::compareValues(LMin, RMax) <= 0;
-      CanBeFalse = llvm::APSInt::compareValues(LMax, RMin) > 0;
-      break;
-    case BO_GT:
-      CanBeTrue = llvm::APSInt::compareValues(LMax, RMin) > 0;
-      CanBeFalse = llvm::APSInt::compareValues(LMin, RMax) <= 0;
-      break;
-    case BO_GE:
-      CanBeTrue = llvm::APSInt::compareValues(LMax, RMin) >= 0;
-      CanBeFalse = llvm::APSInt::compareValues(LMin, RMax) < 0;
-      break;
-    default:
-      return std::nullopt;
-    }
+    return Opc == BO_EQ ? IntRangeSet::boolSet(ResDom, CanNe, CanEq)
+                        : IntRangeSet::boolSet(ResDom, CanEq, CanNe);
   }
-
-  ThreadSafetyAnalyzer::IntRangeSet Res;
-  if (CanBeFalse)
-    Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
-        ResDom, llvm::APSInt::get(0)));
-  if (CanBeTrue)
-    Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
-        ResDom, llvm::APSInt::get(1)));
-  return Res;
+  if (!BinaryOperator::isRelationalOp(Opc) &&
+      !BinaryOperator::isEqualityOp(Opc))
+    return std::nullopt;
+  return IntRangeSet::boolSet(
+      ResDom, mayHold(BinaryOperator::negateComparisonOp(Opc), L, R),
+      mayHold(Opc, L, R));
 }
 
 std::optional<ThreadSafetyAnalyzer::IntRangeSet>
@@ -4381,11 +4344,9 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
     case CK_IntegralToBoolean:
     case CK_PointerToBoolean:
     case CK_MemberPointerToBoolean: {
-      auto SubDom = getScalarDomain(CE->getSubExpr()->getType());
       auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
-      if (!SubDom || !Sub)
-        return std::nullopt;
-      return booleanizeRangeSet(*Sub, *SubDom, Dom);
+      return Sub ? std::optional<IntRangeSet>(booleanizeRangeSet(*Sub, Dom))
+                 : std::nullopt;
     }
     case CK_BooleanToSignedIntegral: {
       auto Sub = evaluatePureExprRange(CE->getSubExpr(), State, Depth + 1);
@@ -4517,19 +4478,10 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
       return IntRangeSet::single(Dom, NotV);
     }
     case UO_LNot: {
-      auto SubDom = getScalarDomain(UO->getSubExpr()->getType());
       auto Sub = evaluatePureExprRange(UO->getSubExpr(), State, Depth + 1);
-      if (!SubDom || !Sub)
+      if (!Sub)
         return std::nullopt;
-      IntRangeSet B = booleanizeRangeSet(*Sub, *SubDom, Dom);
-      llvm::APSInt Z = llvm::APSInt::get(0);
-      llvm::APSInt One = llvm::APSInt::get(1);
-      IntRangeSet Res;
-      if (B.intersects(One, One))
-        Res = Res.unionWith(IntRangeSet::single(Dom, Z));
-      if (B.intersects(Z, Z))
-        Res = Res.unionWith(IntRangeSet::single(Dom, One));
-      return Res;
+      return IntRangeSet::boolSet(Dom, Sub->mayBeNonZero(), Sub->mayBeZero());
     }
     default:
       return std::nullopt;
@@ -4553,28 +4505,18 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
       if (auto It = State.ShortCircuitedOps.find(BO);
           It != State.ShortCircuitedOps.end())
         return IntRangeSet::single(Dom, llvm::APSInt::get(It->second ? 1 : 0));
-      auto BoolDom = IntDomain::forType(ASTCtx->BoolTy, *ASTCtx);
-      auto EvalBool = [&](const Expr *Op) -> IntRangeSet {
-        auto OpDom = getScalarDomain(Op->getType());
+      // Whether the value of Op may be false and whether it may be true.
+      auto EvalBool = [&](const Expr *Op) -> std::pair<bool, bool> {
         auto OpR = evaluatePureExprRange(Op, State, Depth + 1);
-        if (!OpDom || !OpR)
-          return IntRangeSet::full(BoolDom);
-        return booleanizeRangeSet(*OpR, *OpDom, BoolDom);
+        if (!OpR)
+          return {true, true};
+        return {OpR->mayBeZero(), OpR->mayBeNonZero()};
       };
-      IntRangeSet LB = EvalBool(BO->getLHS());
-      IntRangeSet RB = EvalBool(BO->getRHS());
-      llvm::APSInt Z = llvm::APSInt::get(0);
-      llvm::APSInt One = llvm::APSInt::get(1);
-      bool L0 = LB.intersects(Z, Z), L1 = LB.intersects(One, One);
-      bool R0 = RB.intersects(Z, Z), R1 = RB.intersects(One, One);
-      bool Can0 = (BO->getOpcode() == BO_LAnd) ? (L0 || R0) : (L0 && R0);
-      bool Can1 = (BO->getOpcode() == BO_LAnd) ? (L1 && R1) : (L1 || R1);
-      IntRangeSet Res;
-      if (Can0)
-        Res = Res.unionWith(IntRangeSet::single(Dom, Z));
-      if (Can1)
-        Res = Res.unionWith(IntRangeSet::single(Dom, One));
-      return Res;
+      auto [L0, L1] = EvalBool(BO->getLHS());
+      auto [R0, R1] = EvalBool(BO->getRHS());
+      bool IsAnd = BO->getOpcode() == BO_LAnd;
+      return IntRangeSet::boolSet(Dom, IsAnd ? (L0 || R0) : (L0 && R0),
+                                  IsAnd ? (L1 && R1) : (L1 || R1));
     }
 
     if (E->getType()->isIntegralOrEnumerationType()) {
@@ -4615,23 +4557,21 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
   }
 
   if (const auto *COP = dyn_cast<AbstractConditionalOperator>(E)) {
-    auto CondDom = getScalarDomain(COP->getCond()->getType());
-    if (!CondDom)
+    if (!getScalarDomain(COP->getCond()->getType()))
       return std::nullopt;
-    auto BoolDom = IntDomain::forType(ASTCtx->BoolTy, *ASTCtx);
-    IntRangeSet CondB = IntRangeSet::full(BoolDom);
-    if (auto CR = evaluatePureExprRange(COP->getCond(), State, Depth + 1))
-      CondB = booleanizeRangeSet(*CR, *CondDom, BoolDom);
-    llvm::APSInt Z = llvm::APSInt::get(0);
-    llvm::APSInt One = llvm::APSInt::get(1);
+    bool MayBeTrue = true, MayBeFalse = true;
+    if (auto CR = evaluatePureExprRange(COP->getCond(), State, Depth + 1)) {
+      MayBeTrue = CR->mayBeNonZero();
+      MayBeFalse = CR->mayBeZero();
+    }
     IntRangeSet Res;
-    if (CondB.intersects(One, One)) {
+    if (MayBeTrue) {
       auto TR = evaluatePureExprRange(COP->getTrueExpr(), State, Depth + 1);
       if (!TR)
         return std::nullopt;
       Res = Res.unionWith(reprojectRangeSet(*TR, Dom));
     }
-    if (CondB.intersects(Z, Z)) {
+    if (MayBeFalse) {
       auto FR = evaluatePureExprRange(COP->getFalseExpr(), State, Depth + 1);
       if (!FR)
         return std::nullopt;
@@ -5225,8 +5165,7 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
   Cond = stripNoOpExprWrappers(Cond);
 
   if (auto CondDom = getScalarDomain(Cond->getType())) {
-    IntRangeSet Zero = IntRangeSet::single(*CondDom, llvm::APSInt::get(0));
-    IntRangeSet Allowed = WantTrue ? Zero.complement(*CondDom) : Zero;
+    IntRangeSet Allowed = IntRangeSet::truthSet(*CondDom, WantTrue);
     if (auto Cur = evaluatePureExprRange(Cond, State, Depth + 1)) {
       Allowed = Allowed.intersect(*Cur);
       if (Allowed.empty()) {
@@ -5482,8 +5421,7 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(
     auto VarDom = getScalarDomain(VD->getType());
     if (!VarDom)
       return;
-    IntRangeSet Zero = IntRangeSet::single(*VarDom, llvm::APSInt::get(0));
-    IntRangeSet Constraint = WantTrue ? Zero.complement(*VarDom) : Zero;
+    IntRangeSet Constraint = IntRangeSet::truthSet(*VarDom, WantTrue);
     IntRangeSet Cur = IntRangeSet::full(*VarDom);
     if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
       Cur = It->second;
@@ -5726,8 +5664,7 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
   const Expr *StrippedRaw = stripNoOpExprWrappers(RawCond);
   if (StrippedRaw != LeafCond) {
     if (auto RawDom = getScalarDomain(StrippedRaw->getType())) {
-      IntRangeSet Zero = IntRangeSet::single(*RawDom, llvm::APSInt::get(0));
-      IntRangeSet Allowed = TakeTrue ? Zero.complement(*RawDom) : Zero;
+      IntRangeSet Allowed = IntRangeSet::truthSet(*RawDom, TakeTrue);
       if (auto Cur = evaluatePureExprRange(StrippedRaw, State))
         Allowed = Allowed.intersect(*Cur);
       if (Allowed.empty()) {
@@ -6488,6 +6425,19 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     O.PendingAcquires.assign(InPending.begin(), InPending.end());
     Out.push_back(std::move(O));
   };
+  // Add a copy of O with the value V to Out.
+  auto PushValue = [&](ReturnEvalOutcome O, int V) {
+    O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(V));
+    Out.push_back(std::move(O));
+  };
+  // Add a copy of O with the value 0 if O.Values may be zero and a copy with
+  // the value 1 if O.Values may be non-zero to Out.
+  auto PushTruthValues = [&](ReturnEvalOutcome O) {
+    if (O.Values.mayBeZero())
+      PushValue(O, 0);
+    if (O.Values.mayBeNonZero())
+      PushValue(std::move(O), 1);
+  };
 
   if (!E || Depth > 24 || E->isTypeDependent() || E->isValueDependent()) {
     EmitDefault();
@@ -6674,20 +6624,8 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       SmallVector<ReturnEvalOutcome, 2> Sub;
       evaluateReturnOutcomes(CE->getSubExpr(), *SubDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Sub, Depth + 1);
-      IntRangeSet Zero = IntRangeSet::single(*SubDom, llvm::APSInt::get(0));
-      IntRangeSet NonZero = Zero.complement(*SubDom);
-      for (auto &SO : Sub) {
-        if (!SO.Values.intersect(Zero).empty()) {
-          ReturnEvalOutcome O = SO;
-          O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
-          Out.push_back(std::move(O));
-        }
-        if (!SO.Values.intersect(NonZero).empty()) {
-          ReturnEvalOutcome O = std::move(SO);
-          O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
-          Out.push_back(std::move(O));
-        }
-      }
+      for (auto &SO : Sub)
+        PushTruthValues(std::move(SO));
       ApplyExprConstraint();
       return;
     }
@@ -6813,19 +6751,11 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       SmallVector<ReturnEvalOutcome, 2> Sub;
       evaluateReturnOutcomes(UO->getSubExpr(), *SubDom, InLockset, InPending,
                              State, Ctx, UseVarRanges, Sub, Depth + 1);
-      IntRangeSet Zero = IntRangeSet::single(*SubDom, llvm::APSInt::get(0));
-      IntRangeSet NonZero = Zero.complement(*SubDom);
       for (auto &SO : Sub) {
-        if (!SO.Values.intersect(Zero).empty()) {
-          ReturnEvalOutcome O = SO;
-          O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
-          Out.push_back(std::move(O));
-        }
-        if (!SO.Values.intersect(NonZero).empty()) {
-          ReturnEvalOutcome O = std::move(SO);
-          O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
-          Out.push_back(std::move(O));
-        }
+        if (SO.Values.mayBeZero())
+          PushValue(SO, 1);
+        if (SO.Values.mayBeNonZero())
+          PushValue(std::move(SO), 0);
       }
       ApplyExprConstraint();
       return;
@@ -6870,18 +6800,8 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
             Out.push_back(std::move(RO));
             continue;
           }
-          llvm::APSInt Z = llvm::APSInt::get(0);
-          llvm::APSInt One = llvm::APSInt::get(1);
-          if (Cmp->intersects(Z, Z)) {
-            ReturnEvalOutcome O = RO;
-            O.Values = IntRangeSet::single(TargetDom, Z);
-            Out.push_back(std::move(O));
-          }
-          if (Cmp->intersects(One, One)) {
-            ReturnEvalOutcome O = std::move(RO);
-            O.Values = IntRangeSet::single(TargetDom, One);
-            Out.push_back(std::move(O));
-          }
+          RO.Values = std::move(*Cmp);
+          PushTruthValues(std::move(RO));
         }
       }
       ApplyExprConstraint();
@@ -6899,61 +6819,20 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       SmallVector<ReturnEvalOutcome, 2> LHSOut;
       evaluateReturnOutcomes(BO->getLHS(), *LDom, InLockset, InPending, State,
                              Ctx, UseVarRanges, LHSOut, Depth + 1);
-      IntRangeSet ZeroL = IntRangeSet::single(*LDom, llvm::APSInt::get(0));
-      IntRangeSet NonZeroL = ZeroL.complement(*LDom);
-      IntRangeSet ZeroR = IntRangeSet::single(*RDom, llvm::APSInt::get(0));
-      IntRangeSet NonZeroR = ZeroR.complement(*RDom);
-
+      bool IsAnd = BO->getOpcode() == BO_LAnd;
       for (const auto &LO : LHSOut) {
-        if (BO->getOpcode() == BO_LAnd) {
-          if (!LO.Values.intersect(ZeroL).empty()) {
-            ReturnEvalOutcome O = LO;
-            O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
-            Out.push_back(std::move(O));
-          }
-          if (!LO.Values.intersect(NonZeroL).empty()) {
-            SmallVector<ReturnEvalOutcome, 2> RHSOut;
-            evaluateReturnOutcomes(BO->getRHS(), *RDom, LO.Lockset,
-                                   LO.PendingAcquires, State, Ctx, UseVarRanges,
-                                   RHSOut, Depth + 1);
-            for (auto &RO : RHSOut) {
-              if (!RO.Values.intersect(ZeroR).empty()) {
-                ReturnEvalOutcome O = RO;
-                O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
-                Out.push_back(std::move(O));
-              }
-              if (!RO.Values.intersect(NonZeroR).empty()) {
-                ReturnEvalOutcome O = std::move(RO);
-                O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
-                Out.push_back(std::move(O));
-              }
-            }
-          }
-        } else {
-          if (!LO.Values.intersect(NonZeroL).empty()) {
-            ReturnEvalOutcome O = LO;
-            O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
-            Out.push_back(std::move(O));
-          }
-          if (!LO.Values.intersect(ZeroL).empty()) {
-            SmallVector<ReturnEvalOutcome, 2> RHSOut;
-            evaluateReturnOutcomes(BO->getRHS(), *RDom, LO.Lockset,
-                                   LO.PendingAcquires, State, Ctx, UseVarRanges,
-                                   RHSOut, Depth + 1);
-            for (auto &RO : RHSOut) {
-              if (!RO.Values.intersect(ZeroR).empty()) {
-                ReturnEvalOutcome O = RO;
-                O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(0));
-                Out.push_back(std::move(O));
-              }
-              if (!RO.Values.intersect(NonZeroR).empty()) {
-                ReturnEvalOutcome O = std::move(RO);
-                O.Values = IntRangeSet::single(TargetDom, llvm::APSInt::get(1));
-                Out.push_back(std::move(O));
-              }
-            }
-          }
-        }
+        // The right-hand side is not evaluated if the left-hand side is false
+        // (&&) or true (||).
+        if (IsAnd ? LO.Values.mayBeZero() : LO.Values.mayBeNonZero())
+          PushValue(LO, IsAnd ? 0 : 1);
+        if (!(IsAnd ? LO.Values.mayBeNonZero() : LO.Values.mayBeZero()))
+          continue;
+        SmallVector<ReturnEvalOutcome, 2> RHSOut;
+        evaluateReturnOutcomes(BO->getRHS(), *RDom, LO.Lockset,
+                               LO.PendingAcquires, State, Ctx, UseVarRanges,
+                               RHSOut, Depth + 1);
+        for (auto &RO : RHSOut)
+          PushTruthValues(std::move(RO));
       }
       ApplyExprConstraint();
       return;
@@ -6974,14 +6853,12 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     SmallVector<ReturnEvalOutcome, 2> CondOut;
     evaluateReturnOutcomes(COP->getCond(), *CondDom, InLockset, InPending,
                            State, Ctx, UseVarRanges, CondOut, Depth + 1);
-    IntRangeSet ZeroC = IntRangeSet::single(*CondDom, llvm::APSInt::get(0));
-    IntRangeSet NonZeroC = ZeroC.complement(*CondDom);
     for (const auto &CO : CondOut) {
-      if (!CO.Values.intersect(NonZeroC).empty())
+      if (CO.Values.mayBeNonZero())
         evaluateReturnOutcomes(COP->getTrueExpr(), TargetDom, CO.Lockset,
                                CO.PendingAcquires, State, Ctx, UseVarRanges,
                                Out, Depth + 1);
-      if (!CO.Values.intersect(ZeroC).empty())
+      if (CO.Values.mayBeZero())
         evaluateReturnOutcomes(COP->getFalseExpr(), TargetDom, CO.Lockset,
                                CO.PendingAcquires, State, Ctx, UseVarRanges,
                                Out, Depth + 1);
