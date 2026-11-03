@@ -1644,6 +1644,11 @@ public:
       const SmallVectorImpl<PendingTrylockAcquire> &InPending,
       const TrylockValueState &State, LocalVarContext Ctx, bool UseVarRanges,
       SmallVectorImpl<ReturnEvalOutcome> &Out, unsigned Depth);
+  void forkReturnOutcomes(SmallVectorImpl<ReturnEvalOutcome> &Outcomes,
+                          const Expr *E, const IntDomain &Dom,
+                          const TrylockValueState &State, LocalVarContext Ctx,
+                          bool UseVarRanges, const IntRangeSet *Allowed,
+                          unsigned Depth);
   void evaluateReturnWithPendingTrylocks(
       const Expr *RetVal, const FactSet &InLockset,
       const TrylockValueState &State, LocalVarContext Ctx,
@@ -6003,6 +6008,29 @@ static constexpr unsigned MaxReturnOutcomes = 64;
 /// that are tracked per block on paths that lead to a function exit.
 static constexpr unsigned MaxBundlesPerBlock = 64;
 
+/// Replace each of \p Outcomes by one copy per outcome of evaluating \p E in
+/// \p Dom with its lock state. The copies keep the values of the original
+/// outcome but get the lock state of the outcome of \p E. If \p Allowed is
+/// set, ignore the outcomes of \p E whose values are not in \p Allowed. Keep
+/// \p Outcomes unchanged if there would be no or too many copies.
+void ThreadSafetyAnalyzer::forkReturnOutcomes(
+    SmallVectorImpl<ReturnEvalOutcome> &Outcomes, const Expr *E,
+    const IntDomain &Dom, const TrylockValueState &State, LocalVarContext Ctx,
+    bool UseVarRanges, const IntRangeSet *Allowed, unsigned Depth) {
+  SmallVector<ReturnEvalOutcome, 2> Next;
+  for (const ReturnEvalOutcome &O : Outcomes) {
+    SmallVector<ReturnEvalOutcome, 2> EOuts;
+    evaluateReturnOutcomes(E, Dom, O.Lockset, O.PendingAcquires, State, Ctx,
+                           UseVarRanges, EOuts, Depth);
+    for (ReturnEvalOutcome &EO : EOuts)
+      if (!Allowed || !EO.Values.intersect(*Allowed).empty())
+        Next.push_back(
+            {O.Values, std::move(EO.Lockset), std::move(EO.PendingAcquires)});
+  }
+  if (!Next.empty() && Next.size() <= MaxReturnOutcomes)
+    Outcomes = std::move(Next);
+}
+
 /// Evaluate the return value \p RetVal. Before doing that, split the outcomes
 /// on every trylock call that may have succeeded on the current path but
 /// whose result is not referenced by \p RetVal, either because the result has
@@ -6041,30 +6069,15 @@ void ThreadSafetyAnalyzer::evaluateReturnWithPendingTrylocks(
            B.first->getLocation().getRawEncoding();
   });
 
-  struct Start {
-    FactSet Lockset;
-    SmallVector<PendingTrylockAcquire, 2> Pending;
-  };
-  SmallVector<Start, 2> Starts;
-  Starts.push_back({InLockset, {}});
-  TrylockValueState EmptyState;
+  // The lock states with which RetVal is evaluated. The values are unused.
+  SmallVector<ReturnEvalOutcome, 2> Starts;
+  Starts.push_back({IntRangeSet(), InLockset, {}});
   llvm::SmallPtrSet<const Expr *, 4> Done;
 
   auto Fork = [&](const Expr *DefE, LocalVarContext DefCtx,
                   const IntRangeSet *Allowed, const IntDomain &Dom) {
-    SmallVector<Start, 2> Next;
-    for (const Start &St : Starts) {
-      SmallVector<ReturnEvalOutcome, 2> Outs;
-      evaluateReturnOutcomes(DefE, Dom, St.Lockset, St.Pending, State, DefCtx,
-                             /*UseVarRanges=*/false, Outs);
-      for (ReturnEvalOutcome &O : Outs) {
-        if (Allowed && O.Values.intersect(*Allowed).empty())
-          continue;
-        Next.push_back({std::move(O.Lockset), std::move(O.PendingAcquires)});
-      }
-    }
-    if (!Next.empty() && Next.size() <= MaxReturnOutcomes)
-      Starts = std::move(Next);
+    forkReturnOutcomes(Starts, DefE, Dom, State, DefCtx,
+                       /*UseVarRanges=*/false, Allowed, /*Depth=*/0);
   };
 
   for (const auto &[VD, DefPair] : Defs) {
@@ -6095,9 +6108,10 @@ void ThreadSafetyAnalyzer::evaluateReturnWithPendingTrylocks(
     Fork(CE, Ctx, /*Allowed=*/nullptr, *Dom);
   }
 
-  for (const Start &St : Starts)
-    evaluateReturnOutcomes(RetVal, CurrentTrylockRetDom, St.Lockset, St.Pending,
-                           State, Ctx, /*UseVarRanges=*/true, Out);
+  for (const ReturnEvalOutcome &St : Starts)
+    evaluateReturnOutcomes(RetVal, CurrentTrylockRetDom, St.Lockset,
+                           St.PendingAcquires, State, Ctx,
+                           /*UseVarRanges=*/true, Out);
 }
 
 void ThreadSafetyAnalyzer::evaluateReturnOutcomes(
@@ -6507,34 +6521,16 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     }
 
     SmallVector<ReturnEvalOutcome, 2> CallOutcomes;
-    ReturnEvalOutcome InitO;
-    InitO.Values = IntRangeSet::full(TargetDom);
-    InitO.Lockset = InLockset;
-    InitO.PendingAcquires.assign(InPending.begin(), InPending.end());
-    CallOutcomes.push_back(std::move(InitO));
-
+    CallOutcomes.push_back({IntRangeSet::full(TargetDom),
+                            InLockset,
+                            {InPending.begin(), InPending.end()}});
     for (const Expr *Arg : CallExp->arguments()) {
       if (!exprHasUnmaterializedTrylock(Arg, Ctx, State, UseVarRanges,
                                         Depth + 1))
         continue;
-      auto ArgDom = getScalarDomain(Arg->getType());
-      if (!ArgDom)
-        continue;
-      SmallVector<ReturnEvalOutcome, 2> Next;
-      for (const ReturnEvalOutcome &CO : CallOutcomes) {
-        SmallVector<ReturnEvalOutcome, 2> ArgOuts;
-        evaluateReturnOutcomes(Arg, *ArgDom, CO.Lockset, CO.PendingAcquires,
-                               State, Ctx, UseVarRanges, ArgOuts, Depth + 1);
-        for (ReturnEvalOutcome &AO : ArgOuts) {
-          ReturnEvalOutcome Forked;
-          Forked.Values = IntRangeSet::full(TargetDom);
-          Forked.Lockset = std::move(AO.Lockset);
-          Forked.PendingAcquires = std::move(AO.PendingAcquires);
-          Next.push_back(std::move(Forked));
-        }
-      }
-      if (!Next.empty() && Next.size() <= MaxReturnOutcomes)
-        CallOutcomes = std::move(Next);
+      if (auto ArgDom = getScalarDomain(Arg->getType()))
+        forkReturnOutcomes(CallOutcomes, Arg, *ArgDom, State, Ctx, UseVarRanges,
+                           /*Allowed=*/nullptr, Depth + 1);
     }
 
     LocalVarLookupScope Lookup(*this, Ctx);
