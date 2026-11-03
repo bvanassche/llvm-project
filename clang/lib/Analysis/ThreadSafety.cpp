@@ -5594,25 +5594,9 @@ void ThreadSafetyAnalyzer::constrainValueStateOnEdgeImpl(
   }
 
   constrainLeafCondition(State, LeafCond, TakeTrue, EscapedVars);
-  if (State.Infeasible)
-    return;
-
-  if (StrippedRaw != LeafCond) {
-    if (auto RawDom = getScalarDomain(StrippedRaw->getType())) {
-      IntRangeSet Allowed = IntRangeSet::truthSet(*RawDom, TakeTrue);
-      if (auto Cur = evaluatePureExprRange(StrippedRaw, State))
-        Allowed = Allowed.intersect(*Cur);
-      if (Allowed.empty()) {
-        State.Infeasible = true;
-        return;
-      }
-      State.ExprRanges[StrippedRaw] = std::move(Allowed);
-    }
-    if (const auto *RawBO = dyn_cast<BinaryOperator>(StrippedRaw)) {
-      if (RawBO->isLogicalOp())
-        constrainLeafCondition(State, StrippedRaw, TakeTrue, EscapedVars);
-    }
-  }
+  // Also constrain the whole && / || chain.
+  if (StrippedRaw != LeafCond)
+    constrainLeafCondition(State, StrippedRaw, TakeTrue, EscapedVars);
 }
 
 void ThreadSafetyAnalyzer::materializeNarrowedTrylocks(
