@@ -1378,6 +1378,23 @@ public:
   void getMutexIDs(CapExprSet &Mtxs, AttrType *Attr, const Expr *Exp,
                    const NamedDecl *D, til::SExpr *Self = nullptr);
 
+  /// The capabilities that a call acquires and releases.
+  struct CallLockEffects {
+    CapExprSet ExclusiveLocksToAdd, SharedLocksToAdd;
+    CapExprSet ExclusiveLocksToRemove, SharedLocksToRemove,
+        GenericLocksToRemove;
+  };
+  bool collectLockEffects(const Attr *At, const Expr *Exp, const NamedDecl *D,
+                          til::SExpr *Self, CallLockEffects &Effects);
+
+  /// An implicit call at the end of the scope of a variable.
+  struct ScopeExitCall {
+    const NamedDecl *Callee;
+    til::SExpr *Self;
+    SourceLocation Loc;
+  };
+  std::optional<ScopeExitCall> getScopeExitCall(const CFGElement &BI);
+
   struct IntDomain {
     unsigned BitWidth = 0;
     llvm::APSInt Lo;
@@ -1993,6 +2010,54 @@ bool ThreadSafetyAnalyzer::inCurrentScope(const CapabilityExpr &CapE) {
   }
 
   return false;
+}
+
+/// If \p At is an acquire_capability or a release_capability attribute of
+/// \p D, add the capabilities that the call \p Exp acquires or releases to
+/// \p Effects and return true.
+bool ThreadSafetyAnalyzer::collectLockEffects(const Attr *At, const Expr *Exp,
+                                              const NamedDecl *D,
+                                              til::SExpr *Self,
+                                              CallLockEffects &Effects) {
+  if (const auto *A = dyn_cast<AcquireCapabilityAttr>(At)) {
+    getMutexIDs(A->isShared() ? Effects.SharedLocksToAdd
+                              : Effects.ExclusiveLocksToAdd,
+                A, Exp, D, Self);
+    return true;
+  }
+  if (const auto *A = dyn_cast<ReleaseCapabilityAttr>(At)) {
+    getMutexIDs(A->isGeneric()  ? Effects.GenericLocksToRemove
+                : A->isShared() ? Effects.SharedLocksToRemove
+                                : Effects.ExclusiveLocksToRemove,
+                A, Exp, D, Self);
+    return true;
+  }
+  return false;
+}
+
+/// Returns the call of a destructor with attributes or of a cleanup function
+/// that \p BI represents.
+std::optional<ThreadSafetyAnalyzer::ScopeExitCall>
+ThreadSafetyAnalyzer::getScopeExitCall(const CFGElement &BI) {
+  if (std::optional<CFGAutomaticObjDtor> AD = BI.getAs<CFGAutomaticObjDtor>()) {
+    const auto *DD = AD->getDestructorDecl(*ASTCtx);
+    // Function parameters as they are constructed in caller's context and
+    // the CFG does not contain the ctors. Ignore them as their
+    // capabilities cannot be analysed because of this missing
+    // information.
+    if (isa_and_nonnull<ParmVarDecl>(AD->getVarDecl()))
+      return std::nullopt;
+    if (!DD || !DD->hasAttrs())
+      return std::nullopt;
+    return ScopeExitCall{DD,
+                         SxBuilder.translateVariable(AD->getVarDecl(), nullptr),
+                         AD->getTriggerStmt()->getEndLoc()};
+  }
+  if (std::optional<CFGCleanupFunction> CF = BI.getAs<CFGCleanupFunction>())
+    return ScopeExitCall{CF->getFunctionDecl(),
+                         SxBuilder.translateVariable(CF->getVarDecl(), nullptr),
+                         CF->getVarDecl()->getLocation()};
+  return std::nullopt;
 }
 
 /// Add a new lock to the lockset, warning if the lock is already there.
@@ -6641,63 +6706,36 @@ void ThreadSafetyAnalyzer::applyScopeExitCleanups(FactSet &StateSet,
                          bool FullyRemove) {
     if (!Callee || !Callee->hasAttrs())
       return;
-    CapExprSet ExclusiveLocksToAdd, SharedLocksToAdd;
-    CapExprSet ExclusiveLocksToRemove, SharedLocksToRemove,
-        GenericLocksToRemove;
-
+    CallLockEffects Effects;
     for (const Attr *At : Callee->attrs()) {
-      switch (At->getKind()) {
-      case attr::AcquireCapability: {
-        const auto *A = cast<AcquireCapabilityAttr>(At);
-        getMutexIDs(A->isShared() ? SharedLocksToAdd : ExclusiveLocksToAdd, A,
-                    Exp, Callee, Self);
-        break;
-      }
-      case attr::AssertCapability: {
-        const auto *A = cast<AssertCapabilityAttr>(At);
-        CapExprSet AssertLocks;
-        getMutexIDs(AssertLocks, A, Exp, Callee, Self);
-        for (const auto &AssertLock : AssertLocks) {
-          if (!AssertLock.shouldIgnore() &&
-              !StateSet.findLock(FactMan, AssertLock)) {
-            StateSet.removeLock(FactMan, !AssertLock);
-            StateSet.addLock(FactMan,
-                             FactMan.createFact<LockableFactEntry>(
-                                 AssertLock,
-                                 A->isShared() ? LK_Shared : LK_Exclusive, Loc,
-                                 FactEntry::Asserted));
-          }
+      if (collectLockEffects(At, Exp, Callee, Self, Effects))
+        continue;
+      const auto *A = dyn_cast<AssertCapabilityAttr>(At);
+      if (!A)
+        continue;
+      CapExprSet AssertLocks;
+      getMutexIDs(AssertLocks, A, Exp, Callee, Self);
+      for (const auto &AssertLock : AssertLocks) {
+        if (!AssertLock.shouldIgnore() &&
+            !StateSet.findLock(FactMan, AssertLock)) {
+          StateSet.removeLock(FactMan, !AssertLock);
+          StateSet.addLock(
+              FactMan, FactMan.createFact<LockableFactEntry>(
+                           AssertLock, A->isShared() ? LK_Shared : LK_Exclusive,
+                           Loc, FactEntry::Asserted));
         }
-        break;
-      }
-      case attr::ReleaseCapability: {
-        const auto *A = cast<ReleaseCapabilityAttr>(At);
-        if (A->isGeneric())
-          getMutexIDs(GenericLocksToRemove, A, Exp, Callee, Self);
-        else if (A->isShared())
-          getMutexIDs(SharedLocksToRemove, A, Exp, Callee, Self);
-        else
-          getMutexIDs(ExclusiveLocksToRemove, A, Exp, Callee, Self);
-        break;
-      }
-      default:
-        break;
       }
     }
 
-    auto QuietRemove = [&](const CapabilityExpr &Cp) {
+    for (const CapabilityExpr &Cp : llvm::concat<const CapabilityExpr>(
+             Effects.ExclusiveLocksToRemove, Effects.SharedLocksToRemove,
+             Effects.GenericLocksToRemove)) {
       if (Cp.shouldIgnore())
-        return;
+        continue;
       if (const FactEntry *LDat = StateSet.findLock(FactMan, Cp))
         LDat->handleUnlock(StateSet, FactMan, Cp, Loc, FullyRemove,
                            QuietHandler);
-    };
-    for (const auto &M : ExclusiveLocksToRemove)
-      QuietRemove(M);
-    for (const auto &M : SharedLocksToRemove)
-      QuietRemove(M);
-    for (const auto &M : GenericLocksToRemove)
-      QuietRemove(M);
+    }
 
     auto QuietAdd = [&](const CapabilityExpr &Cp, LockKind LK) {
       if (Cp.shouldIgnore())
@@ -6711,9 +6749,9 @@ void ThreadSafetyAnalyzer::applyScopeExitCleanups(FactSet &StateSet,
         StateSet.addLock(FactMan, Entry);
       }
     };
-    for (const auto &M : ExclusiveLocksToAdd)
+    for (const auto &M : Effects.ExclusiveLocksToAdd)
       QuietAdd(M, LK_Exclusive);
-    for (const auto &M : SharedLocksToAdd)
+    for (const auto &M : Effects.SharedLocksToAdd)
       QuietAdd(M, LK_Shared);
   };
 
@@ -6741,22 +6779,9 @@ void ThreadSafetyAnalyzer::applyScopeExitCleanups(FactSet &StateSet,
     if (!OnlyAfterReturn && SeenReturn)
       continue;
 
-    if (BI.getKind() == CFGElement::AutomaticObjectDtor) {
-      CFGAutomaticObjDtor AD = BI.castAs<CFGAutomaticObjDtor>();
-      if (isa_and_nonnull<ParmVarDecl>(AD.getVarDecl()))
-        continue;
-      const auto *DD = AD.getDestructorDecl(*ASTCtx);
-      if (!DD || !DD->hasAttrs())
-        continue;
-      ApplyCallee(DD, /*Exp=*/nullptr,
-                  SxBuilder.translateVariable(AD.getVarDecl(), nullptr),
-                  AD.getTriggerStmt()->getEndLoc(), /*FullyRemove=*/true);
-    } else if (BI.getKind() == CFGElement::CleanupFunction) {
-      const CFGCleanupFunction &CF = BI.castAs<CFGCleanupFunction>();
-      ApplyCallee(CF.getFunctionDecl(), /*Exp=*/nullptr,
-                  SxBuilder.translateVariable(CF.getVarDecl(), nullptr),
-                  CF.getVarDecl()->getLocation(), /*FullyRemove=*/true);
-    }
+    if (std::optional<ScopeExitCall> Call = getScopeExitCall(BI))
+      ApplyCallee(Call->Callee, /*Exp=*/nullptr, Call->Self, Call->Loc,
+                  /*FullyRemove=*/true);
   }
 }
 
@@ -7302,8 +7327,9 @@ void BuildLockset::handleCall(const Expr *Exp, const NamedDecl *D,
   // context-sensitive.
   auto PreContextForThisScope =
       LVarCtx.switchToContextForScope(DualLocalVarContext::Pre);
-  CapExprSet ExclusiveLocksToAdd, SharedLocksToAdd;
-  CapExprSet ExclusiveLocksToRemove, SharedLocksToRemove, GenericLocksToRemove;
+  ThreadSafetyAnalyzer::CallLockEffects Effects;
+  auto &[ExclusiveLocksToAdd, SharedLocksToAdd, ExclusiveLocksToRemove,
+         SharedLocksToRemove, GenericLocksToRemove] = Effects;
   CapExprSet ScopedReqsAndExcludes;
 
   // Figure out if we're constructing an object of scoped lockable class
@@ -7334,10 +7360,7 @@ void BuildLockset::handleCall(const Expr *Exp, const NamedDecl *D,
       case attr::AcquireCapability: {
         auto PostContextForThisScope =
             LVarCtx.switchToContextForScope(DualLocalVarContext::Post);
-        const auto *A = cast<AcquireCapabilityAttr>(At);
-        Analyzer->getMutexIDs(A->isShared() ? SharedLocksToAdd
-                                            : ExclusiveLocksToAdd,
-                              A, Exp, D, Self);
+        Analyzer->collectLockEffects(At, Exp, D, Self, Effects);
         break;
       }
 
@@ -7360,16 +7383,9 @@ void BuildLockset::handleCall(const Expr *Exp, const NamedDecl *D,
 
       // When we encounter an unlock function, we need to remove unlocked
       // mutexes from the lockset, and flag a warning if they are not there.
-      case attr::ReleaseCapability: {
-        const auto *A = cast<ReleaseCapabilityAttr>(At);
-        if (A->isGeneric())
-          Analyzer->getMutexIDs(GenericLocksToRemove, A, Exp, D, Self);
-        else if (A->isShared())
-          Analyzer->getMutexIDs(SharedLocksToRemove, A, Exp, D, Self);
-        else
-          Analyzer->getMutexIDs(ExclusiveLocksToRemove, A, Exp, D, Self);
+      case attr::ReleaseCapability:
+        Analyzer->collectLockEffects(At, Exp, D, Self, Effects);
         break;
-      }
 
       case attr::RequiresCapability: {
         const auto *A = cast<RequiresCapabilityAttr>(At);
@@ -7418,26 +7434,17 @@ void BuildLockset::handleCall(const Expr *Exp, const NamedDecl *D,
       CapExprSet DeclaredLocks;
       for (const Attr *At : Param->attrs()) {
         switch (At->getKind()) {
-        case attr::AcquireCapability: {
-          const auto *A = cast<AcquireCapabilityAttr>(At);
-          Analyzer->getMutexIDs(A->isShared() ? SharedLocksToAdd
-                                              : ExclusiveLocksToAdd,
-                                A, Exp, D, Self);
-          Analyzer->getMutexIDs(DeclaredLocks, A, Exp, D, Self);
+        case attr::AcquireCapability:
+          Analyzer->collectLockEffects(At, Exp, D, Self, Effects);
+          Analyzer->getMutexIDs(DeclaredLocks, cast<AcquireCapabilityAttr>(At),
+                                Exp, D, Self);
           break;
-        }
 
-        case attr::ReleaseCapability: {
-          const auto *A = cast<ReleaseCapabilityAttr>(At);
-          if (A->isGeneric())
-            Analyzer->getMutexIDs(GenericLocksToRemove, A, Exp, D, Self);
-          else if (A->isShared())
-            Analyzer->getMutexIDs(SharedLocksToRemove, A, Exp, D, Self);
-          else
-            Analyzer->getMutexIDs(ExclusiveLocksToRemove, A, Exp, D, Self);
-          Analyzer->getMutexIDs(DeclaredLocks, A, Exp, D, Self);
+        case attr::ReleaseCapability:
+          Analyzer->collectLockEffects(At, Exp, D, Self, Effects);
+          Analyzer->getMutexIDs(DeclaredLocks, cast<ReleaseCapabilityAttr>(At),
+                                Exp, D, Self);
           break;
-        }
 
         case attr::RequiresCapability: {
           const auto *A = cast<RequiresCapabilityAttr>(At);
@@ -8785,33 +8792,12 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
           break;
         }
         // Ignore BaseDtor and MemberDtor for now.
-        case CFGElement::AutomaticObjectDtor: {
-          CFGAutomaticObjDtor AD = BI.castAs<CFGAutomaticObjDtor>();
-          const auto *DD = AD.getDestructorDecl(AC.getASTContext());
-          // Function parameters as they are constructed in caller's context and
-          // the CFG does not contain the ctors. Ignore them as their
-          // capabilities cannot be analysed because of this missing
-          // information.
-          if (isa_and_nonnull<ParmVarDecl>(AD.getVarDecl()))
-            break;
-          if (!DD || !DD->hasAttrs())
-            break;
-
-          LocksetBuilder.handleCall(
-              nullptr, DD,
-              SxBuilder.translateVariable(AD.getVarDecl(), nullptr),
-              AD.getTriggerStmt()->getEndLoc());
+        case CFGElement::AutomaticObjectDtor:
+        case CFGElement::CleanupFunction:
+          if (std::optional<ScopeExitCall> Call = getScopeExitCall(BI))
+            LocksetBuilder.handleCall(/*Exp=*/nullptr, Call->Callee, Call->Self,
+                                      Call->Loc);
           break;
-        }
-
-        case CFGElement::CleanupFunction: {
-          const CFGCleanupFunction &CF = BI.castAs<CFGCleanupFunction>();
-          LocksetBuilder.handleCall(
-              /*Exp=*/nullptr, CF.getFunctionDecl(),
-              SxBuilder.translateVariable(CF.getVarDecl(), nullptr),
-              CF.getVarDecl()->getLocation());
-          break;
-        }
 
         case CFGElement::TemporaryDtor: {
           auto TD = BI.castAs<CFGTemporaryDtor>();
