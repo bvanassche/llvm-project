@@ -1844,6 +1844,41 @@ int *c_addrof_maybe_null(int c)
   return &s->b;
 }
 
+// Addresses of members and array elements that contain a trylock call.
+struct c_addrof_s *c_addrof_s_trylock(void)
+    __attribute__((try_acquire_capability(1, mu1)));
+
+int *c_addrof_trylock_checked(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *p = c_addrof_s_trylock();
+  return p ? &p->b : 0;
+}
+
+int *c_addrof_trylock_checked_subscript(int i)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *p = c_addrof_s_trylock();
+  return p ? &p->arr[i] : 0;
+}
+
+int *c_decay_trylock_checked(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *p = c_addrof_s_trylock();
+  return p ? p->arr : 0;
+}
+
+// &p->b is not null if c_addrof_s_trylock() fails and returns null.
+int *c_addrof_trylock_unchecked(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  return &c_addrof_s_trylock()->b; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+// The address is valid whether or not the trylock call in the index
+// succeeds.
+int *c_addrof_trylock_index(struct c_addrof_s *s) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  return &s->arr[mutex_exclusive_trylock(&mu1)]; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
 // _Generic controlling and unselected expressions are unevaluated.
 void test_generic_unevaluated_c(int unk) {
   int r = unk;

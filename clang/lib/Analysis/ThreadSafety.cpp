@@ -7193,6 +7193,81 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     if (O.Values.mayBeNonZero())
       PushValue(std::move(O), 1);
   };
+  // Add the outcomes for the address of lvalue LV, which contains a trylock
+  // call, to Out. Like evaluatePureExprRange(), consider the address of a
+  // member or an array element of an object that is accessed through a valid
+  // pointer valid.
+  auto EmitLValueAddress = [&](const Expr *LV) {
+    // Find the pointer that is dereferenced to access LV and, for an array
+    // subscript, the index.
+    const Expr *PtrE = nullptr, *IdxE = nullptr;
+    for (const Expr *Cur = LV; Cur;) {
+      Cur = stripNoOpExprWrappers(Cur);
+      if (const auto *ME = dyn_cast<MemberExpr>(Cur)) {
+        if (!isa<FieldDecl, IndirectFieldDecl>(ME->getMemberDecl()))
+          break;
+        if (ME->isArrow()) {
+          PtrE = ME->getBase();
+          break;
+        }
+        Cur = ME->getBase();
+        continue;
+      }
+      if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(Cur)) {
+        PtrE = ASE->getBase();
+        IdxE = ASE->getIdx();
+        break;
+      }
+      if (const auto *UO = dyn_cast<UnaryOperator>(Cur);
+          UO && UO->getOpcode() == UO_Deref && !UO->getType()->isFunctionType())
+        PtrE = UO->getSubExpr();
+      break;
+    }
+    if (!PtrE)
+      return EmitDefault();
+    IntRangeSet ValidPtr =
+        validObjectPtrRangeSet(E->getType(), TargetDom, *ASTCtx);
+    if (!exprHasUnmaterializedTrylock(PtrE, Ctx, State, UseVarRanges,
+                                      Depth + 1)) {
+      // The trylock calls are in the array index. The validity of the
+      // address does not depend on their values.
+      auto IdxDom = IdxE ? getScalarDomain(IdxE->getType()) : std::nullopt;
+      if (!IdxDom)
+        return EmitDefault();
+      TrylockValueState EmptyState;
+      bool Valid;
+      {
+        llvm::SaveAndRestore AssumeNonNull(AssumeDerefNonNull, true);
+        Valid = isValidObjectLValue(LV, UseVarRanges ? State : EmptyState,
+                                    Depth + 1);
+      }
+      SmallVector<ReturnEvalOutcome, 2> Outs;
+      Outs.push_back({IntRangeSet::full(TargetDom),
+                      InLockset,
+                      {InPending.begin(), InPending.end()}});
+      forkReturnOutcomes(Outs, IdxE, *IdxDom, State, Ctx, UseVarRanges,
+                         /*Allowed=*/nullptr, Depth + 1);
+      for (ReturnEvalOutcome &O : Outs) {
+        O.Values = Valid ? ValidPtr : IntRangeSet::full(TargetDom);
+        Out.push_back(std::move(O));
+      }
+      return;
+    }
+    if (IdxE &&
+        exprHasUnmaterializedTrylock(IdxE, Ctx, State, UseVarRanges, Depth + 1))
+      return EmitDefault();
+    // The dereferenced pointer contains the trylock calls. Consider the
+    // address valid for the outcomes in which the pointer may be valid.
+    auto PtrDom = getScalarDomain(PtrE->getType());
+    if (!PtrDom)
+      return EmitDefault();
+    IntRangeSet ValidBase =
+        validObjectPtrRangeSet(PtrE->getType(), *PtrDom, *ASTCtx);
+    MapSub(PtrE, PtrDom, [&](const IntRangeSet &V) {
+      return V.intersect(ValidBase).empty() ? IntRangeSet::full(TargetDom)
+                                            : ValidPtr;
+    });
+  };
 
   if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
     if (BO->isLogicalOp() && UseVarRanges) {
@@ -7227,6 +7302,14 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
   }
 
   if (const auto *CE = dyn_cast<CastExpr>(E)) {
+    if (CE->getCastKind() == CK_ArrayToPointerDecay) {
+      // Like &*p, *p decays to the value of p.
+      const Expr *Sub = stripNoOpExprWrappers(CE->getSubExpr());
+      if (const auto *Deref = dyn_cast<UnaryOperator>(Sub);
+          Deref && Deref->getOpcode() == UO_Deref)
+        return EvalSub(Deref->getSubExpr(), TargetDom, Out);
+      return EmitLValueAddress(Sub);
+    }
     if (!isRangeMappableCast(CE))
       return EmitDefault();
     // Evaluate the operand of a cast that preserves the value in TargetDom.
@@ -7288,7 +7371,7 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
       if (const auto *Deref = dyn_cast_or_null<UnaryOperator>(Sub);
           Deref && Deref->getOpcode() == UO_Deref)
         return EvalSub(Deref->getSubExpr(), TargetDom, Out);
-      return EmitDefault();
+      return EmitLValueAddress(Sub);
     }
     case UO_Plus:
       return EvalSub(UO->getSubExpr(), TargetDom, Out);
