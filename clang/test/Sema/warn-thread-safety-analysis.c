@@ -1704,7 +1704,7 @@ void test_recursive_identity_helper_c(int ok) {
   }
 }
 
-// Address-of on dereferenced, subscripted, member, or weak lvalues may be null.
+// Address-of on a null dereferenced pointer or on a weak object may be null.
 extern int c_weak_obj __attribute__((weak));
 int c_nonweak_obj;
 
@@ -1732,6 +1732,97 @@ int *c_addrof_nonweak(void)
     __attribute__((try_acquire_capability(1, mu1))) {
   mutex_exclusive_lock(&mu1);
   return &c_nonweak_obj;
+}
+
+// A returned address of a member or an array element of an object that is
+// accessed through a pointer is assumed to be valid unless the pointer is
+// known to be null. Branch conditions do not make this assumption.
+struct c_addrof_s {
+  int a;
+  int b;
+  int arr[4];
+  int *ptr;
+};
+
+int *c_addrof_arrow(struct c_addrof_s *s, int fail)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  if (fail) {
+    mutex_unlock(&mu1);
+    return 0;
+  }
+  return &s->b;
+}
+
+int *c_addrof_arrow_first(struct c_addrof_s *s)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &s->a;
+}
+
+int *c_addrof_deref_member(struct c_addrof_s *s)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &(*s).b;
+}
+
+int *c_addrof_subscript(int *p, int i)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &p[i];
+}
+
+int *c_addrof_member_array_subscript(struct c_addrof_s *s, int i)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &s->arr[i];
+}
+
+int *c_addrof_member_ptr_subscript(struct c_addrof_s *s, int i)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &s->ptr[i];
+}
+
+int *c_addrof_after_deref(struct c_addrof_s *s)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  s->a = 1;
+  return &s->b;
+}
+
+int *c_decay_member_array(struct c_addrof_s *s)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return s->arr;
+}
+
+int *c_addrof_arrow_null(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *s = 0;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return &s->b; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_addrof_subscript_null(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *p = 0;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return &p[0]; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_decay_deref_null(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int (*pa)[4] = 0;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return *pa; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int c_addrof_arrow_branch(struct c_addrof_s *s) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  if (&s->b == 0) // expected-warning{{comparison of address of 's->b' equal to a null pointer is always false}}
+    return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+  return 0;
 }
 
 // _Generic controlling and unselected expressions are unevaluated.

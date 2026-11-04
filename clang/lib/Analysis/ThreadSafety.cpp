@@ -1717,6 +1717,10 @@ public:
   std::optional<IntRangeSet>
   evaluatePureExprRange(const Expr *E, const TrylockValueState &State,
                         unsigned Depth = 0) const;
+  bool isValidDerefPointer(const Expr *PtrE, const TrylockValueState &State,
+                           unsigned Depth) const;
+  bool isValidObjectLValue(const Expr *E, const TrylockValueState &State,
+                           unsigned Depth) const;
   bool constrainExprComparison(
       TrylockValueState &State, const Expr *VarSide,
       BinaryOperator::Opcode EffectiveOp, const llvm::APSInt &KVal,
@@ -4854,6 +4858,66 @@ static bool isKnownValidObjectOrFunctionLValue(const Expr *E) {
   return false;
 }
 
+/// Whether the pointer \p PtrE, which is dereferenced by a member access or
+/// an array subscript, points to a valid object. While evaluating return
+/// values (AssumeDerefNonNull), assume that a dereferenced pointer is valid
+/// unless that contradicts what is known about its value. Otherwise, e.g. for
+/// branch conditions, require that the pointer is known not to be null since
+/// code built with -fno-delete-null-pointer-checks may compute the address of
+/// a member of a null pointer before checking that pointer.
+bool ThreadSafetyAnalyzer::isValidDerefPointer(const Expr *PtrE,
+                                               const TrylockValueState &State,
+                                               unsigned Depth) const {
+  PtrE = stripNoOpExprWrappers(PtrE);
+  if (isa<CXXThisExpr>(PtrE))
+    return true;
+  std::optional<IntRangeSet> R = evaluatePureExprRange(PtrE, State, Depth);
+  if (!AssumeDerefNonNull)
+    return R && !R->empty() && !R->mayBeZero();
+  if (!R)
+    return true;
+  auto Dom = getScalarDomain(PtrE->getType());
+  if (!Dom)
+    return false;
+  return !R->intersect(validObjectPtrRangeSet(PtrE->getType(), *Dom, *ASTCtx))
+              .empty();
+}
+
+/// Whether the address of lvalue \p E is the address of a valid object or
+/// function. In addition to the lvalues accepted by
+/// isKnownValidObjectOrFunctionLValue(), this accepts members and array
+/// elements of objects that are accessed through a valid pointer, e.g.
+/// &p->member, &p[i] and &p->array[i].
+bool ThreadSafetyAnalyzer::isValidObjectLValue(const Expr *E,
+                                               const TrylockValueState &State,
+                                               unsigned Depth) const {
+  while (E) {
+    if (Depth > MaxConstrainExprDepth)
+      return false;
+    E = stripNoOpExprWrappers(E);
+    if (isKnownValidObjectOrFunctionLValue(E))
+      return true;
+    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+      if (!isa<FieldDecl, IndirectFieldDecl>(ME->getMemberDecl()))
+        return false;
+      if (ME->isArrow())
+        return isValidDerefPointer(ME->getBase(), State, Depth + 1);
+      E = ME->getBase();
+      ++Depth;
+      continue;
+    }
+    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E))
+      return isValidDerefPointer(ASE->getBase(), State, Depth + 1);
+    // (*p).member is equivalent to p->member. The &*p case is handled by the
+    // callers without assuming that p is valid.
+    if (const auto *UO = dyn_cast<UnaryOperator>(E);
+        UO && UO->getOpcode() == UO_Deref && !UO->getType()->isFunctionType())
+      return isValidDerefPointer(UO->getSubExpr(), State, Depth + 1);
+    return false;
+  }
+  return false;
+}
+
 std::optional<ThreadSafetyAnalyzer::IntRangeSet>
 ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
                                             const TrylockValueState &State,
@@ -4916,10 +4980,20 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
     case CK_NullToMemberPointer:
       return IntRangeSet::single(Dom, llvm::APSInt::get(0));
     case CK_ArrayToPointerDecay:
-    case CK_FunctionToPointerDecay:
-      if (isKnownValidObjectOrFunctionLValue(CE->getSubExpr()))
+    case CK_FunctionToPointerDecay: {
+      // Like &*p, *p decays to the value of p.
+      const Expr *Sub = stripNoOpExprWrappers(CE->getSubExpr());
+      if (const auto *Deref = dyn_cast<UnaryOperator>(Sub);
+          Deref && Deref->getOpcode() == UO_Deref) {
+        auto SubR =
+            evaluatePureExprRange(Deref->getSubExpr(), State, Depth + 1);
+        return SubR ? std::optional(reprojectRangeSet(*SubR, Dom))
+                    : std::nullopt;
+      }
+      if (isValidObjectLValue(Sub, State, Depth + 1))
         return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
       return std::nullopt;
+    }
     default:
       break;
     }
@@ -4992,7 +5066,7 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
         return SubR ? std::optional(reprojectRangeSet(*SubR, Dom))
                     : std::nullopt;
       }
-      if (isKnownValidObjectOrFunctionLValue(Sub))
+      if (isValidObjectLValue(Sub, State, Depth + 1))
         return validObjectPtrRangeSet(E->getType(), Dom, *ASTCtx);
       return std::nullopt;
     }
