@@ -1825,6 +1825,25 @@ int c_addrof_arrow_branch(struct c_addrof_s *s) // expected-note@+1 {{mutex acqu
   return 0;
 }
 
+// Same as above but without a Sema diagnostic about the null comparison.
+int c_addrof_subscript_branch(struct c_addrof_s *s, int i) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  if (&s->ptr[i] == 0)
+    return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+  return 0;
+}
+
+// A pointer that may be null without being known to be null is considered
+// valid.
+struct c_addrof_s c_addrof_obj;
+
+int *c_addrof_maybe_null(int c)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *s = c ? 0 : &c_addrof_obj;
+  mutex_exclusive_lock(&mu1);
+  return &s->b;
+}
+
 // _Generic controlling and unselected expressions are unevaluated.
 void test_generic_unevaluated_c(int unk) {
   int r = unk;
