@@ -4847,6 +4847,10 @@ static bool isKnownValidObjectOrFunctionLValue(const Expr *E) {
         return !FD->isWeak();
       if (!isa<FieldDecl, IndirectFieldDecl>(MD))
         return false;
+      // The address of a reference member is the address of the object that
+      // it is bound to and not an address inside the base object.
+      if (MD->getType()->isReferenceType())
+        return false;
       if (ME->isArrow())
         return isa_and_nonnull<CXXThisExpr>(
             stripNoOpExprWrappers(ME->getBase()));
@@ -4887,7 +4891,8 @@ bool ThreadSafetyAnalyzer::isValidDerefPointer(const Expr *PtrE,
 /// function. In addition to the lvalues accepted by
 /// isKnownValidObjectOrFunctionLValue(), this accepts members and array
 /// elements of objects that are accessed through a valid pointer, e.g.
-/// &p->member, &p[i] and &p->array[i].
+/// &p->member, &p[i] and &p->array[i], and objects that references are bound
+/// to.
 bool ThreadSafetyAnalyzer::isValidObjectLValue(const Expr *E,
                                                const TrylockValueState &State,
                                                unsigned Depth) const {
@@ -4897,8 +4902,21 @@ bool ThreadSafetyAnalyzer::isValidObjectLValue(const Expr *E,
     E = stripNoOpExprWrappers(E);
     if (isKnownValidObjectOrFunctionLValue(E))
       return true;
+    // A reference is bound to a valid object or function. Like the validity
+    // of a dereferenced pointer, only assume this while evaluating return
+    // values since code built with -fno-delete-null-pointer-checks may bind
+    // a reference to the target of a null pointer.
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+      return VD && VD->getType()->isReferenceType() && !VD->isWeak() &&
+             AssumeDerefNonNull;
+    }
     if (const auto *ME = dyn_cast<MemberExpr>(E)) {
-      if (!isa<FieldDecl, IndirectFieldDecl>(ME->getMemberDecl()))
+      const ValueDecl *MD = ME->getMemberDecl();
+      if (MD->getType()->isReferenceType())
+        return isa<FieldDecl, IndirectFieldDecl, VarDecl>(MD) &&
+               !MD->isWeak() && AssumeDerefNonNull;
+      if (!isa<FieldDecl, IndirectFieldDecl>(MD))
         return false;
       if (ME->isArrow())
         return isValidDerefPointer(ME->getBase(), State, Depth + 1);
@@ -7204,7 +7222,8 @@ void ThreadSafetyAnalyzer::evaluateReturnOutcomesImpl(
     for (const Expr *Cur = LV; Cur;) {
       Cur = stripNoOpExprWrappers(Cur);
       if (const auto *ME = dyn_cast<MemberExpr>(Cur)) {
-        if (!isa<FieldDecl, IndirectFieldDecl>(ME->getMemberDecl()))
+        if (!isa<FieldDecl, IndirectFieldDecl>(ME->getMemberDecl()) ||
+            ME->getMemberDecl()->getType()->isReferenceType())
           break;
         if (ME->isArrow()) {
           PtrE = ME->getBase();
