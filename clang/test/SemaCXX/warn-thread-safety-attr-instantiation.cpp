@@ -65,6 +65,10 @@ void use_instantiated_success_values() {
     data = 1;
     unlock();
   }
+  if (try_static_member() == 0) {
+    data = 2;
+    unlock();
+  }
 }
 
 // An invalid attribute on a function parameter of a function template must
@@ -276,4 +280,49 @@ struct __attribute__((capability("mutex"))) VariadicCapMutex {
   int TryAllRange(Mus &...mus)
       __attribute__((try_acquire_capability_range(0, 0, mus...)));
 };
+void use_variadic_cap_mutex(VariadicCapMutex &vmu) {
+  if (vmu.TryAllRange() == 0)
+    vmu.Unlock(); // expected-warning {{releasing mutex 'vmu' that was not held}}
+}
+
+// The analysis ignores range attributes whose return type check failed after
+// return type deduction.
+Mutex deduced_mu;
+auto deduced_bool_range()
+    __attribute__((try_acquire_capability_range(0, 1, deduced_mu))); // expected-warning {{'try_acquire_capability_range' attribute only applies to functions and function pointers or references that return a non-boolean integer, unscoped enumeration, or pointer type; type here is 'bool'; ignoring the attribute}}
+auto deduced_bool_range() { return true; }
+auto deduced_out_of_range()
+    __attribute__((try_acquire_capability_range(200, 300, deduced_mu))); // expected-warning {{'try_acquire_capability_range' attribute range [200, 300] does not contain any value of return type 'signed char'; ignoring the attribute}}
+auto deduced_out_of_range() { return (signed char)0; }
+void unlock_deduced() __attribute__((release_capability(deduced_mu)));
+
+#define DEDUCED_DUAL_RANGES(m)                                                 \
+  __attribute__((try_acquire_capability_range(0, 0, m),                        \
+                 try_acquire_capability_range(200, 300, m)))
+auto deduced_macro_partial_valid()
+    DEDUCED_DUAL_RANGES(deduced_mu); // expected-warning {{'try_acquire_capability_range' attribute range [200, 300] does not contain any value of return type 'signed char'; ignoring the attribute}}
+auto deduced_macro_partial_valid() { return (signed char)1; }
+
+void use_deduced_ranges() {
+  if (deduced_bool_range())
+    unlock_deduced(); // expected-warning {{releasing mutex 'deduced_mu' that was not held}}
+  if (deduced_out_of_range() == 0)
+    unlock_deduced(); // expected-warning {{releasing mutex 'deduced_mu' that was not held}}
+  if (deduced_macro_partial_valid() == 0)
+    unlock_deduced();
+}
+
+struct __attribute__((capability("mutex"))) ImplicitExplicitThisCapMutex {
+  bool TryLockImplicitFirst() __attribute__((try_acquire_capability(true)));
+  bool TryLockExplicitFirst()
+      __attribute__((try_acquire_capability(true, this)));
+};
+bool ImplicitExplicitThisCapMutex::TryLockImplicitFirst()
+    __attribute__((try_acquire_capability(true, this))) {
+  return false;
+}
+bool ImplicitExplicitThisCapMutex::TryLockExplicitFirst()
+    __attribute__((try_acquire_capability(true))) {
+  return false;
+}
 

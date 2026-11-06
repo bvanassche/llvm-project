@@ -415,8 +415,9 @@ public:
   const til::SCFG *getCFG() const { return Scfg; }
   til::SCFG *getCFG() { return Scfg; }
 
-  void setLookupLocalVarExpr(std::function<const Expr *(const NamedDecl *)> F) {
-    LookupLocalVarExpr = std::move(F);
+  std::function<const Expr *(const NamedDecl *)>
+  setLookupLocalVarExpr(std::function<const Expr *(const NamedDecl *)> F) {
+    return std::exchange(LookupLocalVarExpr, std::move(F));
   }
 
 private:

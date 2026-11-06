@@ -318,4 +318,26 @@ void sls_fun_bad_12() {
     expected-warning{{releasing mutex 'sls_mu' that was not held}}
 }
 
+int pch_protected GUARDED_BY(sls_mu);
+
+void sls_trylock_range_ok() {
+  int r = sls_mu.TryLockRange();
+  if (r >= 0 && r <= 1) {
+    pch_protected = 1;
+    sls_mu.Unlock();
+  }
+  int sr = sls_mu.ReaderTryLockRange();
+  if (sr == 0) {
+    int v = pch_protected;
+    (void)v;
+    sls_mu.Unlock();
+  }
+}
+
+void sls_trylock_range_bad() {
+  if (sls_mu.TryLockRange() >= 0) {
+    pch_protected = 1; // expected-warning{{writing variable 'pch_protected' requires holding mutex 'sls_mu' exclusively}}
+  }
+}
+
 #endif

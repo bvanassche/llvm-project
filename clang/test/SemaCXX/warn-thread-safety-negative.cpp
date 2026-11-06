@@ -195,3 +195,48 @@ class TemplateClass {
 void test() { TemplateClass<int> TC; }
 
 }  // end namespace DoubleAttribute
+
+namespace TryAcquireRangeNegative {
+
+class Foo {
+  Mutex mu;
+  int a GUARDED_BY(mu);
+
+  int tryLockErrno() TRY_ACQUIRE_RANGE(0, __INT_MAX__, mu);
+  int tryLockSharedErrno() TRY_ACQUIRE_SHARED_RANGE(0, __INT_MAX__, mu);
+  void needNotHeld() EXCLUSIVE_LOCKS_REQUIRED(!mu);
+
+public:
+  void missingNegCap() {
+    if (tryLockErrno() >= 0) { // expected-warning {{acquiring mutex 'mu' requires negative capability '!mu'}}
+      a = 1;
+      mu.Unlock();
+    }
+  }
+
+  void hasNegCap() EXCLUSIVE_LOCKS_REQUIRED(!mu) {
+    int r = tryLockErrno();
+    if (r < 0) {
+      needNotHeld();
+      return;
+    }
+    if (r == 0) {
+      // Narrowing an already-acquired range trylock must not re-check !mu.
+      a = 2;
+    }
+    a = 3;
+    mu.Unlock();
+    needNotHeld();
+  }
+
+  void sharedHasNegCap() EXCLUSIVE_LOCKS_REQUIRED(!mu) {
+    if (tryLockSharedErrno() >= 0) {
+      int v = a;
+      (void)v;
+      mu.Unlock();
+      needNotHeld();
+    }
+  }
+};
+
+}  // end namespace TryAcquireRangeNegative

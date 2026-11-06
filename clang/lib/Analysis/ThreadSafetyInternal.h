@@ -15,6 +15,7 @@
 #ifndef LLVM_CLANG_LIB_ANALYSIS_THREADSAFETYINTERNAL_H
 #define LLVM_CLANG_LIB_ANALYSIS_THREADSAFETYINTERNAL_H
 
+#include "ThreadSafetyRanges.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/Analysis/Analyses/PostOrderCFGView.h"
@@ -29,7 +30,6 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ImmutableMap.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -759,6 +759,23 @@ struct LLVM_LIBRARY_VISIBILITY UnderlyingCapability {
   UnderlyingCapabilityKind Kind;
 };
 
+/// The reentrancy depth of \p Fact, or zero if \p Fact is not a lockable
+/// fact.
+inline unsigned getFactReentrancyDepth(const FactEntry &Fact) {
+  if (const auto *LFE = dyn_cast<LockableFactEntry>(&Fact))
+    return LFE->getReentrancyDepth();
+  return 0;
+}
+
+/// Whether to keep \p B instead of \p A when joining two facts for the same
+/// capability without a diagnostic: the shared fact subsumes the exclusive
+/// fact, and the non-asserted fact is the one to track.
+inline bool preferJoinedFact(const FactEntry &A, const FactEntry &B) {
+  if (A.kind() != B.kind())
+    return B.kind() == LK_Shared;
+  return A.asserted() && !B.asserted();
+}
+
 class LLVM_LIBRARY_VISIBILITY ScopedLockableFactEntry final
     : public FactEntry,
       private llvm::TrailingObjects<ScopedLockableFactEntry,
@@ -915,6 +932,13 @@ private:
   }
 };
 
+/// The maximum number of intervals of a range tracked for a trylock
+/// condition. Wider ranges are over-approximated so that range operations
+/// do not grow with the number of conditions.
+static constexpr unsigned MaxStateRangeIntervals = 16;
+/// The maximum recursion depth of evaluateTrylockRangeCond().
+static constexpr unsigned MaxRangeCondDepth = 256;
+
 /// Class which implements the core thread safety analysis routines.
 class LLVM_LIBRARY_VISIBILITY ThreadSafetyAnalyzer {
   friend class BuildLockset;
@@ -950,26 +974,151 @@ public:
   void getMutexIDs(CapExprSet &Mtxs, AttrType *Attr, const Expr *Exp,
                    const NamedDecl *D, til::SExpr *Self = nullptr);
 
-  template <class AttrType>
-  void getMutexIDs(CapExprSet &Mtxs, AttrType *Attr, const Expr *Exp,
-                   const NamedDecl *D, const CFGBlock *PredBlock,
-                   const CFGBlock *CurrBlock, Expr *BrE, bool Neg);
+  using IntDomain = threadSafety::IntDomain;
+  using IntRangeSet = threadSafety::IntRangeSet;
 
-  const CallExpr *getTrylockCallExpr(const Stmt *Cond, LocalVarContext C,
-                                     bool &Negate);
+  /// The values that select each case label of a switch statement and the
+  /// values that select the default label (or skip the switch body).
+  struct SwitchCaseTable {
+    bool Valid = false;
+    llvm::SmallDenseMap<const SwitchCase *, IntRangeSet, 8> CaseSets;
+    IntRangeSet DefaultSet;
+  };
+  // Switch case tables per switch statement and integer domain. Computing
+  // these once per switch statement keeps the cost of handling all edges of
+  // a switch statement O(N log N) instead of O(N^3).
+  llvm::DenseMap<
+      const SwitchStmt *,
+      SmallVector<std::pair<IntDomain, std::unique_ptr<SwitchCaseTable>>, 1>>
+      SwitchTables;
+  /// Return the case table for \p SS in domain \p Dom.
+  const SwitchCaseTable &getSwitchCaseTable(const SwitchStmt *SS,
+                                            const IntDomain &Dom);
 
-  using TerminatorTrylockCall =
-      std::tuple<const CallExpr *, const NamedDecl *,
-                 std::optional<llvm::scope_exit<std::function<void()>>>>;
+  /// A trylock call that has been executed and whose result has been tested
+  /// by a branch condition on the current path. Values are the values that
+  /// the call may have returned on the current path. AcquiredAttrs maps the
+  /// attributes whose capabilities have been acquired by branching on the
+  /// result of the call and are still held to the values that the call may
+  /// have returned on the paths on which they are held. These capabilities
+  /// are held on every path, except at the entry of a block with several
+  /// predecessors until the attributes whose capabilities are not held on
+  /// every predecessor have been removed.
+  /// ConsumedValues maps the attributes whose capabilities have been
+  /// acquired by branching on the result of the call and then released to
+  /// the values that the call may have returned on the paths on which they
+  /// have been released. Branching on the result of the call again does not
+  /// acquire the capabilities of an attribute for these values.
+  struct PendingTrylockRange {
+    using AttrValueMap = llvm::SmallDenseMap<const Attr *, IntRangeSet, 2>;
+    const CallExpr *Call;
+    LocalVarContext CallCtx = LocalVarContext(nullptr);
+    IntDomain Dom;
+    IntRangeSet Values;
+    AttrValueMap AcquiredAttrs;
+    AttrValueMap ConsumedValues;
+  };
+  using PendingTrylockRanges = SmallVector<PendingTrylockRange, 1>;
 
-  TerminatorTrylockCall getTerminatorTrylockCall(const CFGBlock *Block,
-                                                 bool &Negate);
+  struct TrylockRangeCondResult {
+    const CallExpr *Call = nullptr;
+    const NamedDecl *Callee = nullptr;
+    LocalVarContext CallCtx = LocalVarContext(nullptr);
+    IntDomain Dom;
+    IntRangeSet TrueSet;
+    IntRangeSet FalseSet;
+    /// For the condition of a terminator that is a logical operator, the
+    /// values of the call for which its left-hand side short-circuits to the
+    /// successor that the right-hand side reaches if it is false (for '&&')
+    /// or true (for '||'), bypassing the block with the terminator.
+    IntRangeSet ShortCircuitSet = {};
+  };
+
+  const Expr *skipValuePreservingWrappers(const Expr *E, LocalVarContext *C);
+  const CallExpr *unwrapValuePreservingToCallExpr(const Expr *E,
+                                                  LocalVarContext &C);
+  const CallExpr *unwrapTrylockValueExpr(const Expr *E, LocalVarContext &C);
+  bool isGuaranteedZeroOrOneExpr(const Expr *E, LocalVarContext C);
+  TrylockRangeCondResult evaluateTrylockRangeCond(const Stmt *Cond,
+                                                  LocalVarContext C,
+                                                  unsigned Depth = 0);
+  TrylockRangeCondResult evaluateTrylockRangeCondImpl(const Stmt *Cond,
+                                                      LocalVarContext C,
+                                                      unsigned Depth);
+  /// Helper of evaluateTrylockRangeCondImpl() for comparisons.
+  TrylockRangeCondResult evaluateTrylockCmpCond(const BinaryOperator *BOP,
+                                                LocalVarContext C,
+                                                unsigned Depth);
+  /// Helper of evaluateTrylockRangeCondImpl() for logical operators.
+  TrylockRangeCondResult evaluateTrylockLogicalOpCond(const BinaryOperator *BOP,
+                                                      LocalVarContext C,
+                                                      unsigned Depth);
+  /// Evaluate \p ConstSide, the operand of the comparison \p BOP that is
+  /// compared with a trylock result, as a constant.
+  std::optional<llvm::APSInt>
+  evaluateTrylockCmpConstSide(const Expr *ConstSide, const BinaryOperator *BOP);
+  /// Recognize GNU binary conditional expressions (x ?: false_const) Op K.
+  TrylockRangeCondResult
+  evaluateTrylockBinaryCondCmp(const Expr *CondSide, const Expr *ConstSide,
+                               BinaryOperator::Opcode SideOp, LocalVarContext C,
+                               const BinaryOperator *BOP);
+  /// Evaluate the equality comparison \p BOP of the boolean trylock
+  /// condition \p BoolSide with the constant \p ConstSide.
+  TrylockRangeCondResult evaluateTrylockBoolEq(const Expr *BoolSide,
+                                               const Expr *ConstSide,
+                                               LocalVarContext C,
+                                               const BinaryOperator *BOP,
+                                               unsigned Depth);
+  // Results of evaluateTrylockRangeCond(), keyed by the condition and the
+  // root of the local variable context. Each entry retains its
+  // LocalVarContext so the root pointer remains valid for the lifetime of the
+  // cache. Memoization keeps the evaluation of chains of logical operators on
+  // variables linear instead of exponential.
+  llvm::DenseMap<std::pair<const Stmt *, const void *>,
+                 std::pair<LocalVarContext, TrylockRangeCondResult>>
+      RangeCondCache;
+  llvm::DenseMap<std::pair<const CFGBlock *, const void *>,
+                 std::pair<LocalVarContext, TrylockRangeCondResult>>
+      TerminatorCondCache;
+  const PostOrderCFGView *CurrentSortedGraph = nullptr;
+  bool HasTrylockCall = false;
+  // For each trylock call branched on by a terminator, the last block in
+  // CurrentSortedGraph whose terminator branches on that call.
+  llvm::DenseMap<const CallExpr *, const CFGBlock *> LastTrylockCondBlock;
+  bool BuiltLogicalOpTermBlock = false;
+  llvm::DenseMap<const BinaryOperator *, unsigned> LogicalOpTermBlock;
+  LocalVarContext getLogicalOpLHSContext(const BinaryOperator *BOP,
+                                         LocalVarContext C);
+  TrylockRangeCondResult evaluateTerminatorTrylockCond(const Stmt *Cond,
+                                                       LocalVarContext C,
+                                                       unsigned Depth = 0);
+  bool getTerminatorTrylockCond(const CFGBlock *Block,
+                                TrylockRangeCondResult &Res,
+                                const SwitchCaseTable *&Table,
+                                SmallVectorImpl<const CastExpr *> &SwitchCasts);
 
   void getEdgeLockset(FactSet &Result, const FactSet &ExitSet,
-                      const CFGBlock *PredBlock, const CFGBlock *CurrBlock);
+                      const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
+                      PendingTrylockRanges *Pending = nullptr);
+  void getTrylockMutexIDs(CapExprSet &Mtxs, const Attr *A, const Expr *Exp,
+                          const NamedDecl *D);
+  bool collectTrylockCaps(const Attr *A, const Expr *CallExp,
+                          const NamedDecl *Callee, CapExprSet &ExclusiveCaps,
+                          CapExprSet &SharedCaps);
+  void addTrylockFacts(FactSet &FSet, const CapExprSet &ExclusiveCaps,
+                       const CapExprSet &SharedCaps, SourceLocation Loc);
+  std::optional<IntRangeSet> getTrylockSuccessSet(const Attr *A,
+                                                  const IntDomain &Dom) const;
+  std::optional<IntRangeSet>
+  getCombinedTrylockSuccessSet(const Attr *A, const Expr *CallExp,
+                               const NamedDecl *Callee, const IntDomain &Dom,
+                               bool ExactInt = true);
 
-  void getTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps);
+  void getTerminatorTrylockCaps(const CFGBlock *Block, CapExprSet &Caps,
+                                const PendingTrylockRanges *Pending = nullptr);
 
+  std::optional<IntDomain> getScalarDomain(QualType Ty) const;
+  IntDomain getTrylockCallDomain(const CallExpr *CallExp) const;
   // Subtrees of unevaluated operands, e.g. of noexcept or of the arguments of
   // __builtin_constant_p(). These may be CFG elements but are not executed.
   llvm::SmallPtrSet<const Stmt *, 8> UnevaluatedStmts;
@@ -977,6 +1126,31 @@ public:
   // Their destructors and cleanup functions do not run either.
   llvm::SmallPtrSet<const VarDecl *, 4> UnevaluatedVarDecls;
   void collectUnevaluatedStmts(CFG *CFGraph);
+
+  /// If beta warnings are enabled, makes the SExpr builder look up local
+  /// variables in a local variable context for the lifetime of this object.
+  class LocalVarLookupScope {
+    ThreadSafetyAnalyzer &Analyzer;
+    bool Active;
+    std::function<const Expr *(const NamedDecl *)> Prev;
+
+  public:
+    /// Look up local variables in a copy of \p Ctx.
+    LocalVarLookupScope(ThreadSafetyAnalyzer &Analyzer, LocalVarContext Ctx)
+        : Analyzer(Analyzer), Active(Analyzer.Handler.issueBetaWarnings()) {
+      if (Active)
+        Prev = Analyzer.SxBuilder.setLookupLocalVarExpr(
+            [&Analyzer, Ctx](const NamedDecl *D) mutable -> const Expr * {
+              return Analyzer.LocalVarMap.lookupExpr(D, Ctx);
+            });
+    }
+    ~LocalVarLookupScope() {
+      if (Active)
+        Analyzer.SxBuilder.setLookupLocalVarExpr(std::move(Prev));
+    }
+    LocalVarLookupScope(const LocalVarLookupScope &) = delete;
+    LocalVarLookupScope &operator=(const LocalVarLookupScope &) = delete;
+  };
 
   bool join(const FactEntry &A, const FactEntry &B, SourceLocation JoinLoc,
             LockErrorKind EntryLEK);
@@ -992,6 +1166,14 @@ public:
   }
 
   void markEscapedLocalVars(AnalysisDeclContext &AC);
+  void joinPendingTrylockRanges(ArrayRef<PendingTrylockRanges> PredEdgePendings,
+                                bool HasUnvisitedPred,
+                                PendingTrylockRanges &EntryPending);
+  void dropUnheldPendingAcquires(PendingTrylockRanges &EntryPending,
+                                 const CFGBlockInfo *CurrBlockInfo);
+  void updatePendingTrylockRanges(PendingTrylockRanges &EntryPending,
+                                  const CFGBlock *CurrBlock,
+                                  const CFGBlockInfo *CurrBlockInfo);
   void runAnalysis(AnalysisDeclContext &AC);
 
   void warnIfMutexNotHeld(const FactSet &FSet, const NamedDecl *D,
@@ -1012,8 +1194,11 @@ public:
                      ProtectedOperationKind POK);
 };
 
+// Defined in ThreadSafety.cpp.
 LLVM_LIBRARY_VISIBILITY Expr *ignoreNoOpCastSingleStep(Expr *E);
 LLVM_LIBRARY_VISIBILITY const DeclRefExpr *unwrapDirectLValueDRE(const Expr *E);
+LLVM_LIBRARY_VISIBILITY const DeclRefExpr *
+unwrapDirectModifiedDRE(const Stmt *S);
 LLVM_LIBRARY_VISIBILITY void
 collectModifiedLValueDREs(const Expr *E,
                           SmallVectorImpl<const DeclRefExpr *> &DREs,
@@ -1023,16 +1208,46 @@ collectAddrOfDREs(const Expr *E, SmallVectorImpl<const DeclRefExpr *> &DREs,
                   unsigned Depth = 0);
 LLVM_LIBRARY_VISIBILITY void forEachInvalidatedCallOrCtorArgDRE(
     const Stmt *S, llvm::function_ref<void(const DeclRefExpr *)> Fn);
-LLVM_LIBRARY_VISIBILITY bool getStaticBooleanValue(Expr *E, bool &TCond);
+LLVM_LIBRARY_VISIBILITY bool
+getStaticBooleanValue(const Expr *E, const ASTContext &Ctx, bool &TCond);
+/// The value of the integral or enumeration expression \p E if it can be
+/// computed without side effects and without undefined behavior when \p E
+/// is evaluated at run time, or std::nullopt otherwise. Unlike
+/// getIntegralOrEnumConstantExpr(), \p E is not evaluated in a manifestly
+/// constant-evaluated context, e.g. __builtin_is_constant_evaluated()
+/// evaluates to false, and no diagnostics are emitted.
+LLVM_LIBRARY_VISIBILITY std::optional<llvm::APSInt>
+evaluateRuntimeIntConstant(const Expr *E, const ASTContext &Ctx);
+LLVM_LIBRARY_VISIBILITY bool isTrylockAttr(const Attr *A);
+LLVM_LIBRARY_VISIBILITY bool isSharedTrylockAttr(const Attr *A);
+LLVM_LIBRARY_VISIBILITY bool trylockAttrAppliesTo(const Attr *A,
+                                                  QualType RetTy);
+LLVM_LIBRARY_VISIBILITY const NamedDecl *
+getTrylockCallee(const CallExpr *CallExp);
 LLVM_LIBRARY_VISIBILITY bool
 isEvaluatedUnaryExprOrTypeTrait(const UnaryExprOrTypeTraitExpr *TE);
+
+// Defined in ThreadSafetyValueEval.cpp.
 LLVM_LIBRARY_VISIBILITY bool neverReturns(const CFGBlock *B);
 LLVM_LIBRARY_VISIBILITY const Expr *unpackConstruction(const Expr *E);
+LLVM_LIBRARY_VISIBILITY bool isConversionFunctionCast(const CastExpr *CE);
+LLVM_LIBRARY_VISIBILITY bool isValuePreservingCast(const CastExpr *CE,
+                                                   const ASTContext &Ctx);
+LLVM_LIBRARY_VISIBILITY bool isBuiltinExpectCall(const CallExpr *CallExp);
 LLVM_LIBRARY_VISIBILITY void
 forEachDeclVLAExpr(const DeclStmt *DS, bool IncludeTopLevelVLA,
                    llvm::function_ref<void(const Expr *)> Fn);
 LLVM_LIBRARY_VISIBILITY void
 forEachTypeVLAExpr(QualType QT, llvm::function_ref<void(const Expr *)> Fn);
+LLVM_LIBRARY_VISIBILITY bool stmtContainsExpr(const Stmt *Root,
+                                              const Expr *Target);
+
+// Defined in ThreadSafetyTrylockCond.cpp.
+LLVM_LIBRARY_VISIBILITY std::pair<bool, bool>
+getBranchEdgeKinds(const CFGBlock *Pred, const CFGBlock *Succ);
+LLVM_LIBRARY_VISIBILITY ThreadSafetyAnalyzer::IntRangeSet
+getSwitchEdgeSet(const ThreadSafetyAnalyzer::SwitchCaseTable &Table,
+                 const CFGBlock *Succ);
 
 } // namespace threadSafety
 } // namespace clang

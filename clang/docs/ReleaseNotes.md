@@ -545,6 +545,35 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   or cannot represent any value of the range are ignored, and new
   `-Wthread-safety-attributes` warnings diagnose them.
 
+- The thread safety analysis now also recognizes relational and equality
+  comparisons of the return value of a `try_acquire_capability` or
+  `try_acquire_shared_capability` function with arbitrary constants, compound
+  `&&` and `||` conditions, and `switch` statements on the return value. For
+  `try_acquire_capability(true, ...)` any non-zero return value indicates
+  success, and for `try_acquire_capability(false, ...)` only zero indicates
+  success; comparing the return value of a `try_acquire_capability(false, ...)`
+  function with a non-zero constant such as `EBUSY` (e.g.
+  `if (trylock(&mu) == EBUSY) return;`) therefore no longer assumes that the
+  capability was acquired on the other branch and now warns on subsequent
+  unguarded accesses. In addition, the left-hand side of `&&` or `||` is now
+  evaluated in the local-variable context before the right-hand side, and with
+  `-Wthread-safety-beta` the capability arguments of a trylock call whose result
+  is stored in a local variable are evaluated in the local-variable context at
+  the call site rather than at the branch.
+
+- At call sites of functions annotated with a `try_acquire_*` attribute, the
+  thread safety analysis now combines separate branch conditions that test the
+  same result. If a capability acquired by a trylock call is released on one
+  path before joining with a path that still holds it, re-branching on the
+  trylock result at the join now warns that the capability is not held on every
+  path.
+
+- The thread safety analysis no longer looks through the definition of a local
+  variable that holds a trylock result if the variable is `static`, `volatile`
+  or `__block`, or if it escapes, e.g. because its address is taken or because
+  it is captured by reference. Such a variable may be modified without the
+  analysis noticing.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed a false-positive `-Wimplicit-fallthrough` warning when

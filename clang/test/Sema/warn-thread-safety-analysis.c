@@ -1,5 +1,7 @@
-// RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -Wthread-safety-pointer -Wthread-safety-beta %s
-// RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -Wthread-safety-pointer -Wthread-safety-beta -fexperimental-late-parse-attributes -DLATE_PARSING %s
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fsyntax-only -verify -Wthread-safety -Wthread-safety-pointer -Wthread-safety-beta %s
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fsyntax-only -verify -Wthread-safety -Wthread-safety-pointer -Wthread-safety-beta -fexperimental-late-parse-attributes -DLATE_PARSING %s
+// RUN: %clang_cc1 -triple i686-unknown-linux-gnu -fsyntax-only -verify -Wthread-safety -Wthread-safety-pointer -Wthread-safety-beta %s
+// RUN: %clang_cc1 -triple x86_64-pc-windows-msvc -fsyntax-only -verify -Wthread-safety -Wthread-safety-pointer -Wthread-safety-beta %s
 
 #define LOCKABLE            __attribute__ ((lockable))
 #define REENTRANT_CAPABILITY __attribute__ ((reentrant_capability))
@@ -736,6 +738,15 @@ void test_trylock_void_conditional_via_var(void) {
   mutex_unlock(&mu1);
 }
 
+int mutex_trylock_errno(struct Mutex *mu)
+    __attribute__((try_acquire_capability_range(0, __INT_MAX__, mu)));
+int mutex_shared_trylock_errno(struct Mutex *mu)
+    __attribute__((try_acquire_shared_capability_range(0, __INT_MAX__, mu)));
+int mutex_trylock_zero(struct Mutex *mu)
+    __attribute__((try_acquire_capability_range(0, 0, mu)));
+int mutex_trylock_1_to_10(struct Mutex *mu)
+    __attribute__((try_acquire_capability_range(1, 10, mu)));
+
 struct Task *next_task(void);
 
 // Incrementing or decrementing a local variable must keep BuildLockset's
@@ -763,6 +774,721 @@ void test_incdec_preserves_local_var_ctx(int count) {
     mutex_unlock(&t->mu);
   }
 }
+
+void test_trylock_range_c(void) {
+  int err;
+  if ((err = mutex_trylock_errno(&mu1)) < 0)
+    return;
+  work_data = 1;
+  mutex_unlock(&mu1);
+
+  if (__builtin_expect(mutex_trylock_zero(&mu1) != 0, 0))
+    return;
+  work_data = 2;
+  mutex_unlock(&mu1);
+
+  if (!mutex_trylock_zero(&mu1)) {
+    work_data = 3;
+    mutex_unlock(&mu1);
+  }
+
+  if (mutex_shared_trylock_errno(&mu1) >= 0) {
+    int v = work_data;
+    (void)v;
+    work_data = 4; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1);
+  }
+
+  switch (mutex_trylock_1_to_10(&mu1)) {
+  case 1 ... 10:
+    work_data = 5;
+    mutex_unlock(&mu1);
+    break;
+  default:
+    work_data = 6; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    break;
+  }
+
+  // Signed-to-unsigned conversion wraps negative values to positive, so >= 0U
+  // is tautologically true and must not acquire the capability.
+  if (mutex_trylock_errno(&mu1) >= 0U) {
+    work_data = 7; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+
+  // Narrowing conversion may truncate non-zero failure codes to 0.
+  signed char narrow = mutex_trylock_zero(&mu1);
+  if (narrow == 0) {
+    work_data = 8; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+
+  // Bit-field assignments truncate the stored value.
+  struct { int bf : 2; } s;
+  if ((s.bf = mutex_trylock_zero(&mu1)) == 0) {
+    work_data = 9; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+}
+
+// Pointer return types on try_acquire_[shared_]capability_range.
+#define TEST_IS_ERR_VALUE_MACRO(x)                                             \
+  __builtin_expect(                                                            \
+      !!((__UINTPTR_TYPE__)(void *)(x) >= (__UINTPTR_TYPE__)-4095), 0)
+
+struct CGroupObj {
+  int id;
+};
+
+struct CGroupObj *c_ptr_range_lock_live(int ok)
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1)));
+
+struct CGroupObj *c_ptr_range_shared_nonnull(int mode)
+    __attribute__((try_acquire_shared_capability_range(1, (__UINTPTR_TYPE__)-4096, mu1)));
+
+void *c_ptr_range_map_or_failed(void)
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-2, mu1)));
+
+void test_ptr_range_callers_c(int ok, int mode) {
+  struct CGroupObj *cgrp = c_ptr_range_lock_live(ok);
+  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)cgrp))
+    return;
+  work_data = 1;
+  mutex_unlock(&mu1);
+
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)c_ptr_range_lock_live(ok))) {
+    work_data = 2;
+    mutex_unlock(&mu1);
+  }
+
+  // Range [1, -4096]: both NULL and ERR_PTR indicate failure.
+  struct CGroupObj *sc = c_ptr_range_shared_nonnull(mode);
+  if (sc && !TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)sc)) {
+    int v = work_data;
+    (void)v;
+    mutex_unlock(&mu1);
+  }
+
+  // Missing NULL check when 0 is outside [1, -4096].
+  struct CGroupObj *sc2 = c_ptr_range_shared_nonnull(mode);
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)sc2)) {
+    int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+    (void)v;
+  }
+
+  // MAP_FAILED ((void *)-1) sentinel comparison.
+  void *mapped = c_ptr_range_map_or_failed();
+  if (mapped != (void *)(__INTPTR_TYPE__)-1) {
+    work_data = 3;
+    mutex_unlock(&mu1);
+  }
+
+  // Switch on uintptr_t cast of pointer range trylock.
+  switch ((__UINTPTR_TYPE__)c_ptr_range_lock_live(ok)) {
+  case (__UINTPTR_TYPE__)-4095 ... (__UINTPTR_TYPE__)-1:
+    work_data = 4; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    break;
+  default:
+    work_data = 5;
+    mutex_unlock(&mu1);
+    break;
+  }
+}
+
+// A null check followed by a separate IS_ERR() check decides the result of a
+// call that returns NULL or an error pointer on failure.
+void test_split_null_and_err_checks_c(int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (!p)
+    return;
+  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    return;
+  int v = work_data;
+  (void)v;
+  mutex_unlock(&mu1);
+}
+
+void test_split_err_and_null_checks_c(int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    return;
+  if (!p)
+    return;
+  int v = work_data;
+  (void)v;
+  mutex_unlock(&mu1);
+}
+
+// The null check alone does not decide the result.
+void test_split_null_check_only_c(int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (!p)
+    return;
+  int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+  (void)v;
+}
+
+// Each iteration executes the call again.
+void test_split_checks_in_loop_c(int mode, int n) {
+  for (int i = 0; i < n; i++) {
+    struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+    if (!p)
+      continue;
+    if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+      continue;
+    int v = work_data;
+    (void)v;
+    mutex_unlock(&mu1);
+  }
+}
+
+void test_split_checks_irreducible_bypass_c(int mode, int check_null) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (!check_null) {
+    goto Z;
+  } else {
+    if (!p)
+      return;
+  }
+Y:
+  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+Z:
+    if (mode)
+      goto Y;
+    return;
+  }
+  int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+  (void)v;
+  mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+}
+
+void test_split_checks_diamond_rebranch_c(int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (!p)
+    return;
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    do_some_work();
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+    int v = work_data;
+    (void)v;
+    mutex_unlock(&mu1);
+  }
+}
+
+void test_split_checks_unlock_then_rebranch_bad_c(int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (!p)
+    return;
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    mutex_unlock(&mu1);
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+}
+
+int c_trylock_two_ranges(struct Mutex *m1, struct Mutex *m2)
+    __attribute__((try_acquire_capability_range(1, 2, *m1)))
+    __attribute__((try_acquire_capability_range(2, 2, *m2)));
+
+void test_split_checks_multi_attr_c(void) {
+  int r = c_trylock_two_ranges(&mu1, &mu2);
+  if (r < 1 || r > 2)
+    return;
+  if (r < 2) {
+    mutex_unlock(&mu1);
+    return;
+  }
+  work_data = 1;
+  mutex_unlock(&mu2);
+  mutex_unlock(&mu1);
+}
+
+int c_trylock_only_three(void)
+    __attribute__((try_acquire_capability_range(3, 3, mu1)));
+
+void test_split_checks_stacked_switch_cases_c(void) {
+  int r = c_trylock_only_three();
+  switch (r) {
+  case 1:
+  case 2 ... 3:
+    if (r != 3)
+      return;
+    work_data = 1;
+    mutex_unlock(&mu1);
+    break;
+  default:
+    break;
+  }
+}
+
+int c_multi_range_same_cap(void)
+    __attribute__((try_acquire_capability_range(1, 2, mu1)))
+    __attribute__((try_acquire_capability_range(4, 5, mu1)));
+
+void test_multi_range_same_cap_caller_c(void) {
+  int r = c_multi_range_same_cap();
+  if (r < 1)
+    return;
+  if (r == 3)
+    return;
+  if (r > 5)
+    return;
+  work_data = 1;
+  mutex_unlock(&mu1);
+}
+
+// A contradictory branch on a previously narrowed trylock variable must not
+// overwrite the variable's pending range on the reachable branch, nor falsely
+// acquire the capability on the dead branch.
+void test_split_checks_contradictory_rebranch_c(int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (p)
+    return;
+  if (p) {
+    int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+    (void)v;
+  }
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+    int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+    (void)v;
+  }
+}
+
+void test_split_checks_unrelated_lhs_and_trylock_rhs_c(int ok, int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (!p)
+    return;
+  if (ok && TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    return;
+  int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+  (void)v;
+}
+
+// The capability is not acquired on the short-circuit confluence edge of
+// '&&' or '||' if the left-hand side may also reach the successor without
+// deciding the result of the call.
+struct CGroupObj *c_ptr_range_nonnull(int mode)
+    __attribute__((try_acquire_capability_range(1, (__UINTPTR_TYPE__)-4096, mu1)));
+
+void test_short_circuit_and_unrelated_operand_c(int ok, int mode) {
+  struct CGroupObj *p = c_ptr_range_nonnull(mode);
+  if (p && ok && TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    return;
+  if (!p || TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    return;
+  work_data = 1;
+  mutex_unlock(&mu1);
+}
+
+void test_short_circuit_or_unrelated_operand_c(int ok, int mode) {
+  struct CGroupObj *p = c_ptr_range_nonnull(mode);
+  if (!p || !ok || !TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    return;
+}
+
+// Short-circuit confluence, partial else join, and loop back-edge must
+// not retain a narrowed PendingTrylockRange from only one predecessor.
+void test_split_checks_short_circuit_or_c(int cond, int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (cond || p) {
+    if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+      int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+      (void)v;
+    }
+  }
+}
+
+void test_split_checks_else_join_c(int cond, int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (!p) {
+    if (cond)
+      return;
+  }
+  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    return;
+  int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+  (void)v;
+}
+
+// Partial capability acquisition joined with a path that did not acquire
+// the capability must clear AcquiredAttrs when the capability is not in
+// EntrySet, and retain AcquiredAttrs when it is held in EntrySet.
+struct CGroupObj *c_ptr_partial_two_locks(int mode)
+    __attribute__((try_acquire_capability_range(1, (__UINTPTR_TYPE__)-1, mu1)))
+    __attribute__((try_acquire_capability_range(1, (__UINTPTR_TYPE__)-4096, mu2)));
+
+void test_split_checks_partial_acquire_join_c(int cond, int mode) {
+  struct CGroupObj *p = c_ptr_partial_two_locks(mode); // expected-note{{mutex acquired here}}
+  if (!p)
+    return;
+  if (cond) {
+    mutex_unlock(&mu1);
+  }
+  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) { // expected-warning{{mutex 'mu1' is not held on every path through here}}
+    return;
+  }
+  work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  mutex_unlock(&mu2);
+}
+
+// 3.3 & 3.4: ConsumedAttrs across loop back-edges, 3-predecessor joins with
+// partial EntryPending, and conditional unlock before re-branching.
+void test_split_checks_consumed_in_loop_c(int n, int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (!p)
+    return;
+  for (int i = 0; i < n; ++i) {
+    if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+      mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+    }
+  }
+}
+
+void test_three_preds_partial_entry_pending_c(int mode, int bypass_null_check) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode); // expected-note{{mutex acquired here}}
+  if (!bypass_null_check) {
+    if (!p)
+      return;
+    if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+      int v = work_data;
+      (void)v;
+    }
+  }
+  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) { // expected-warning{{mutex 'mu1' is not held on every path through here}}
+  }
+}
+
+void test_cond_unlock_before_rebranch_c(int cond) {
+  int r = mutex_exclusive_trylock(&mu1); // expected-note{{mutex acquired here}}
+  if (r) {
+    if (cond)
+      mutex_unlock(&mu1);
+  }
+  if (r) { // expected-warning{{mutex 'mu1' is not held on every path through here}}
+  }
+}
+
+void test_cond_unlock_logical_and_before_rebranch_c(int c) {
+  int r = mutex_exclusive_trylock(&mu1); // expected-note{{mutex acquired here}}
+  int done = 0;
+  if (r && c) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+    done = 1;
+  }
+  if (r && !done) { // expected-warning{{mutex 'mu1' is not held on every path through here}}
+  }
+}
+
+// Releasing a capability on all paths that acquired it before joining with a
+// path where the trylock was not tested prevents a later check from acquiring
+// the capability, even if that check is only reached on the latter path,
+// because the analysis does not track the correlation with 'c'.
+void test_untested_branch_join_after_unlock_c(int c) {
+  int r = mutex_exclusive_trylock(&mu1);
+  if (c) {
+    if (r) {
+      work_data = 1;
+      mutex_unlock(&mu1);
+    }
+  }
+  if (!c) {
+    if (r) {
+      work_data = 2; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+      mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+    }
+  }
+}
+
+// A capability that has been released on a path must not be acquired again
+// after joining with a path on which the result has not been tested.
+void test_consumed_on_one_branch_c(int c) {
+  int r = mutex_exclusive_trylock(&mu1);
+  if (c) {
+    if (r) {
+      work_data = 1;
+      mutex_unlock(&mu1);
+    }
+  }
+  if (r) {
+    work_data = 2; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+  }
+}
+
+// A capability that has not been released must still be acquired after
+// joining with a path on which the result has not been tested.
+void test_untested_branch_join_without_unlock_c(int c) {
+  int r = mutex_exclusive_trylock(&mu1);
+  if (c) {
+    if (!r)
+      return;
+    work_data = 1;
+  }
+  if (r) {
+    work_data = 2;
+    mutex_unlock(&mu1);
+  }
+}
+
+// As above, the analysis does not track the correlation between 'done' and
+// whether the capability has been released.
+void test_short_circuit_join_after_unlock_c(int c) {
+  int r = mutex_exclusive_trylock(&mu1);
+  int done = 0;
+  if (c && r) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+    done = 1;
+  }
+  if (!done && r) {
+    work_data = 2; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+  }
+}
+
+int c_trylock_one_or_two(void)
+    __attribute__((try_acquire_capability_range(1, 2, mu1)));
+
+void test_disjoint_range_checks_after_unlock_c(void) {
+  int r = c_trylock_one_or_two();
+  if (r == 1) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+  }
+  if (r == 2) {
+    work_data = 2;
+    mutex_unlock(&mu1);
+  }
+}
+
+// A capability that has been released on some paths must not be acquired
+// again by a later branch on the result of the trylock call for the values
+// that the call returned on these paths, neither after a join at which the
+// result may have any value nor after a loop.
+void test_rebranch_after_unlock_join_c(void) {
+  int r = mutex_exclusive_trylock(&mu1);
+  if (r)
+    mutex_unlock(&mu1);
+  if (r) {
+    work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+  }
+}
+
+int c_trylock_1_to_100(void)
+    __attribute__((try_acquire_capability_range(1, 100, mu1)));
+
+void test_rebranch_after_unlock_and_loop_c(int n) {
+  int r = c_trylock_1_to_100();
+  if (r < 0)
+    return;
+  if (r >= 1 && r <= 100)
+    mutex_unlock(&mu1);
+  for (int i = 0; i < n; ++i) {
+  }
+  if (r >= 1 && r <= 100) {
+    work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+  }
+}
+
+void test_disjoint_range_checks_after_unlock_and_loop_c(int n) {
+  int r = c_trylock_one_or_two();
+  if (r == 1) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+  }
+  for (int i = 0; i < n; ++i) {
+  }
+  if (r == 2) {
+    work_data = 2;
+    mutex_unlock(&mu1);
+  }
+}
+
+void c_side_effect(void);
+
+// A capability that is held on every path at a join must be recorded as
+// released by a later unlock, even if it has been released and acquired
+// again on one of the paths.
+void test_unlock_after_relock_join_c(int c) {
+  int r = mutex_exclusive_trylock(&mu1);
+  if (!r)
+    return;
+  if (r == 1) {
+    mutex_unlock(&mu1);
+    if (c)
+      c_side_effect();
+    mutex_exclusive_lock(&mu1);
+  }
+  mutex_unlock(&mu1); // expected-note{{mutex released here}}
+  if (r == 2) {
+    work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+  }
+}
+
+// Releasing a capability for some values of the result must not prevent
+// branching on the result again from acquiring it for the other values.
+void test_split_unlock_c(void) {
+  int r = mutex_exclusive_trylock(&mu1);
+  if (!r)
+    return;
+  if (r == 1) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+  }
+  if (r != 1) {
+    work_data = 2;
+    mutex_unlock(&mu1);
+  }
+}
+
+void test_split_unlock_range_c(void) {
+  int r = c_trylock_one_or_two();
+  if (r < 1 || r > 2)
+    return;
+  if (r == 1) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+  }
+  if (r == 2) {
+    work_data = 2;
+    mutex_unlock(&mu1);
+  }
+}
+
+void test_rebranch_disjoint_from_consumed_c(void) {
+  int r = c_trylock_one_or_two();
+  if (r == 1) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+  }
+  if (r == 2)
+    work_data = 2;
+  if (r == 2)
+    mutex_unlock(&mu1);
+}
+
+void test_rebranch_on_subset_of_range_c(void) {
+  int r = c_trylock_one_or_two();
+  if (r == 2)
+    work_data = 2;
+  if (r == 2)
+    mutex_unlock(&mu1);
+}
+
+int work_data2 GUARDED_BY(mu2);
+int c_trylock_overlapping_ranges(void)
+    __attribute__((try_acquire_capability_range(1, 2, mu1)))
+    __attribute__((try_acquire_capability_range(2, 3, mu2)));
+
+// The values for which the capabilities of one attribute have been released
+// do not affect the capabilities of another attribute.
+void test_consumed_per_attribute_c(void) {
+  int r = c_trylock_overlapping_ranges();
+  if (r == 3) {
+    work_data2 = 1;
+    mutex_unlock(&mu2);
+  }
+  if (r >= 1 && r <= 2) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+  }
+  if (r == 2) {
+    work_data2 = 2;
+    mutex_unlock(&mu2);
+  }
+}
+
+// A capability that is released on a path on which the result has the same
+// values as on a path that still holds it is not held on every path.
+void test_split_unlock_rebranch_mismatch_c(int c) {
+  int r = c_trylock_one_or_two(); // expected-note{{mutex acquired here}}
+  if (r == 1) {
+    if (c)
+      mutex_unlock(&mu1);
+  }
+  if (r == 1) { // expected-warning{{mutex 'mu1' is not held on every path through here}}
+  }
+}
+
+// Many sequential trylock checks whose results are not tested again in later
+// blocks.
+void test_many_sequential_trylocks_c(void) {
+#define TRYLOCK_STEP(i)                                                        \
+  struct Mutex m##i;                                                           \
+  int t##i = mutex_exclusive_trylock(&m##i);                                   \
+  if (!t##i)                                                                   \
+    goto out##i;
+#define UNLOCK_STEP(i)                                                         \
+  mutex_unlock(&m##i);                                                         \
+  out##i:;
+#define TRYLOCK_GROUP8(base)                                                   \
+  TRYLOCK_STEP(base##0)                                                        \
+  TRYLOCK_STEP(base##1)                                                        \
+  TRYLOCK_STEP(base##2)                                                        \
+  TRYLOCK_STEP(base##3)                                                        \
+  TRYLOCK_STEP(base##4)                                                        \
+  TRYLOCK_STEP(base##5)                                                        \
+  TRYLOCK_STEP(base##6)                                                        \
+  TRYLOCK_STEP(base##7)
+#define UNLOCK_GROUP8(base)                                                    \
+  UNLOCK_STEP(base##7)                                                         \
+  UNLOCK_STEP(base##6)                                                         \
+  UNLOCK_STEP(base##5)                                                         \
+  UNLOCK_STEP(base##4)                                                         \
+  UNLOCK_STEP(base##3)                                                         \
+  UNLOCK_STEP(base##2)                                                         \
+  UNLOCK_STEP(base##1)                                                         \
+  UNLOCK_STEP(base##0)
+
+  TRYLOCK_GROUP8(a)
+  TRYLOCK_GROUP8(b)
+  TRYLOCK_GROUP8(c)
+  TRYLOCK_GROUP8(d)
+  TRYLOCK_GROUP8(e)
+  TRYLOCK_GROUP8(f)
+  TRYLOCK_GROUP8(g)
+  TRYLOCK_GROUP8(h)
+
+  UNLOCK_GROUP8(h)
+  UNLOCK_GROUP8(g)
+  UNLOCK_GROUP8(f)
+  UNLOCK_GROUP8(e)
+  UNLOCK_GROUP8(d)
+  UNLOCK_GROUP8(c)
+  UNLOCK_GROUP8(b)
+  UNLOCK_GROUP8(a)
+
+#undef UNLOCK_GROUP8
+#undef TRYLOCK_GROUP8
+#undef UNLOCK_STEP
+#undef TRYLOCK_STEP
+}
+
+// Signed pointer comparisons, e.g. (long)ptr < 0, in callers.
+void test_signed_ptr_cmp_callers_c(int ok) {
+  if ((__INTPTR_TYPE__)c_ptr_range_lock_live(ok) < 0)
+    return;
+  work_data = 33;
+  mutex_unlock(&mu1);
+
+  struct CGroupObj *p = c_ptr_range_lock_live(ok);
+  if (0 <= (__INTPTR_TYPE__)p) {
+    work_data = 34;
+    mutex_unlock(&mu1);
+  }
+
+  // [-4096, INTPTR_MAX] includes the error pointers [-4095, -1].
+  if ((__INTPTR_TYPE__)c_ptr_range_lock_live(ok) >= -4096) {
+    work_data = 35; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  } else {
+    work_data = 36;
+    mutex_unlock(&mu1);
+  }
+}
+
+// Value-changing argument conversions must not be looked through.
+long long c_llong_range_lock(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1)));
 
 // _Generic controlling and unselected expressions are unevaluated.
 void test_generic_unevaluated_c(int unk) {
@@ -825,6 +1551,16 @@ void test_unevaluated_stmt_expr_decls_c(int unk) {
     work_data = 47;
     mutex_unlock(&mu1);
   }
+}
+
+// Combining an unrelated condition with a trylock variable check in && or ||
+// only narrows the trylock variable on the branch where both (for &&) or
+// neither (for ||) hold.
+void test_unrelated_lhs_and_trylock_rhs_c(int ok) {
+  int r = mutex_exclusive_trylock(&mu1);
+  if (ok && !r)
+    return;
+  work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
 }
 
 // We had a problem where we'd skip all attributes that follow a late-parsed

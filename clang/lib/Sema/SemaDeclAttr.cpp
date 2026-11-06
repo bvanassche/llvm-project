@@ -558,7 +558,8 @@ static QualType getThreadSafetyAttrReturnType(const Decl *D) {
 /// Check the success value of a try_acquire_capability or
 /// try_acquire_shared_capability attribute. The return type of the function
 /// is not checked because these attributes have always been accepted on
-/// functions with any return type.
+/// functions with any return type. The analysis ignores such an attribute if
+/// the return type is not a boolean, integer, enumeration or pointer type.
 static bool checkTryAcquireCapabilitySuccessValue(Sema &S,
                                                   const AttributeCommonInfo &AL,
                                                   Expr *Arg, bool IsShared) {
@@ -589,7 +590,7 @@ static bool checkTryAcquireCapabilityRangeReturnType(
     Sema &S, const Decl *D, const AttributeCommonInfo &AL,
     const Expr *FirstExpr, const Expr *LastExpr,
     std::optional<llvm::APSInt> FirstVal, std::optional<llvm::APSInt> LastVal) {
-  // The range is compared with the return value. Hence, the return
+  // The analysis compares the return value with the range. Hence, the return
   // type must be a non-boolean integer, unscoped enumeration, or pointer type
   // and the range must contain at least one value of the return type (with
   // pointers modeled in the uintptr_t domain).

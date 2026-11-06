@@ -34,7 +34,10 @@ add_clang_library(clangAnalysis
   ThreadSafety.cpp
   ThreadSafetyCommon.cpp
   ThreadSafetyLogical.cpp
+  ThreadSafetyRanges.cpp
   ThreadSafetyTIL.cpp
+  ThreadSafetyTrylockCond.cpp
+  ThreadSafetyValueEval.cpp
   UninitializedValues.cpp
   UnsafeBufferUsage.cpp
 

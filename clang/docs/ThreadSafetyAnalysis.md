@@ -495,9 +495,15 @@ attribute of the same declaration for the same capability, i.e. that has the
 same access mode but a different success value, or a different access mode but
 the same success value, and that attribute is ignored.
 
-Because the analysis doesn't support conditional locking, a capability is
-treated as acquired after the first branch on the return value of a try-acquire
-function.
+Because the analysis doesn't support general conditional locking, a capability
+is treated by callers as acquired after branching on the return value of a
+try-acquire function. Callers handle `TRY_ACQUIRE(true, ...)` like
+`TRY_ACQUIRE_RANGE` with a range of all non-zero return values and
+`TRY_ACQUIRE(false, ...)` like a range that only contains zero. Hence the return
+value may also be compared with other constants or used in a `switch` statement.
+A floating-point or complex return value can only be tested for being non-zero,
+e.g. `if (try_lock())`; comparisons of such a value with constants are not
+recognized.
 
 ```c++
 Mutex mu;
@@ -527,6 +533,46 @@ as `ACQUIRE`. Pointer return values are compared as unsigned integers of type
 `uintptr_t`; because `low` and `high` must satisfy `low <= high` when evaluated
 as constant expressions, ranges that exclude negative errno sentinel pointers
 use unsigned bounds such as `TRY_ACQUIRE_RANGE(1, (uintptr_t)-4096 - 1, mu)`.
+
+```c++
+Mutex mu;
+int a GUARDED_BY(mu);
+
+int try_lock_or_errno() TRY_ACQUIRE_RANGE(0, __INT_MAX__, mu);
+
+int foo() {
+  int ret = try_lock_or_errno();
+  if (ret < 0)
+    return ret;
+  a = 0;         // Ok, ret is in [0, __INT_MAX__].
+  mu.Unlock();
+  return 0;
+}
+```
+
+At call sites of `TRY_ACQUIRE` and `TRY_ACQUIRE_RANGE` functions, the branch
+conditions on a path must establish that the return value is within the success
+range. A single condition suffices, and so do separate checks of the same
+result, e.g. `if (!p) return;` followed by
+`if (IS_ERR_VALUE((uintptr_t)p)) return;`: the values that a condition leaves
+possible are remembered until a later condition decides whether the capability
+has been acquired, until the call is executed again, or until paths on which the
+call has not been tested join. If a capability acquired by a try-acquire call is
+released on one path before joining with a path that still holds it,
+re-branching on the result at the join diagnoses the lockset mismatch. A
+capability that has been acquired by branching on the result and released
+afterwards is not acquired again by a later branch on the same result for the
+values that the result may have had where the capability has been released,
+e.g. `if (r == 1) unlock(); if (r == 2) ...` acquires the capability again but
+`if (r) unlock(); if (r) ...` does not. Because the analysis is not
+path-sensitive, this also holds after joining with a path on which the result
+has not been tested, e.g. in
+`if (c) { if (r) unlock(); } if (!c) { if (r) ... }` the second branch on `r`
+does not acquire the capability. When a
+return value is stored in a local variable before branching, the analysis only
+looks through ordinary local variables that are not `static`, `volatile`, or
+`__block`, and that do not escape (e.g. by having their address taken or being
+captured by reference).
 
 If the return type is not a non-boolean integer, unscoped enumeration, or
 pointer type, if the range does not contain any value of the return type, or if

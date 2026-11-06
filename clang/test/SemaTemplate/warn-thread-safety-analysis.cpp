@@ -215,7 +215,7 @@ int tryConstexprDtorRange(bool ok)
 void callConstexprDtorRange() {
   int r = tryConstexprDtorRange<int>(true);
   if (r >= 0 && r <= 1) {
-    globalMu.Unlock(); // expected-warning {{releasing mutex 'globalMu' that was not held}}
+    globalMu.Unlock();
   }
 }
 #endif
