@@ -1319,6 +1319,7 @@ cc_library(
         "lib/Analysis/LifetimeSafety/*.cpp",
         "lib/Analysis/LifetimeSafety/*.h",
         "lib/Analysis/*.cpp",
+        "lib/Analysis/*.h",
     ]) + [
         ":analysis_htmllogger_gen",
     ],
