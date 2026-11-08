@@ -1273,6 +1273,82 @@ int c_loop_multi_break_var_and_direct_trylock_valid(void)
   return 0;
 }
 
+// Inferring pointer non-nullness from unconditional memory dereferences.
+struct CNetDev {
+  struct Mutex lock;
+  int reg_state;
+  int moving_ns;
+};
+
+struct CNetDev *c_deref_nonnull_valid(struct CNetDev *dev)
+    __attribute__((try_acquire_capability(1, dev->lock))) {
+  mutex_exclusive_lock(&dev->lock);
+  if (dev->reg_state > 1 || dev->moving_ns) {
+    mutex_unlock(&dev->lock);
+    return (void *)0;
+  }
+  do_some_work();
+  return dev;
+}
+
+// Arguments of __builtin_constant_p() are not evaluated.
+struct CNetDev *c_builtin_constant_p_not_deref_bad(struct CNetDev *dev)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  (void)__builtin_constant_p(dev->reg_state);
+  return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+// A null check after a dereference must not be treated as dead code.
+struct CNetDev *c_deref_then_null_check_bad(struct CNetDev *dev)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  int v = dev->reg_state;
+  (void)v;
+  if (!dev)
+    return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+  return dev;
+}
+
+struct CNetDev *c_addr_of_member_not_deref_bad(struct CNetDev *dev)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  int *p = &dev->reg_state;
+  (void)p;
+  (void)sizeof(*dev);
+  return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+struct CNetDev *c_short_circuit_deref_not_unconditional_bad(struct CNetDev *dev,
+                                                            int cond)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  int ok = cond && dev->reg_state;
+  (void)ok;
+  return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+struct CNetDev *c_deref_then_reassign_in_stmtexpr_bad(struct CNetDev *dev,
+                                                      struct CNetDev *other)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  int v = ((void)dev->reg_state, ({ dev = other; 0; }));
+  (void)v;
+  return dev; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+// A statement expression returning a dereferenced pointer preserves the
+// non-null assumption.
+struct CNetDev c_netdev_obj;
+
+struct CNetDev *c_deref_nonnull_stmtexpr_return_valid(int c)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct CNetDev *q = c ? (struct CNetDev *)0 : &c_netdev_obj;
+  q->reg_state = 1;
+  mutex_exclusive_lock(&mu1);
+  return ({ q; });
+}
+
 // Pointer return types on try_acquire_[shared_]capability_range.
 #define TEST_IS_ERR_VALUE_MACRO(x)                                             \
   __builtin_expect(                                                            \
@@ -2247,6 +2323,177 @@ int *c_addrof_nonweak(void)
     __attribute__((try_acquire_capability(1, mu1))) {
   mutex_exclusive_lock(&mu1);
   return &c_nonweak_obj;
+}
+
+// A returned address of a member or an array element of an object that is
+// accessed through a pointer is assumed to be valid unless the pointer is
+// known to be null. Branch conditions do not make this assumption.
+struct c_addrof_s {
+  int a;
+  int b;
+  int arr[4];
+  int *ptr;
+};
+
+int *c_addrof_arrow(struct c_addrof_s *s, int fail)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  if (fail) {
+    mutex_unlock(&mu1);
+    return 0;
+  }
+  return &s->b;
+}
+
+int *c_addrof_arrow_first(struct c_addrof_s *s)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &s->a;
+}
+
+int *c_addrof_deref_member(struct c_addrof_s *s)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &(*s).b;
+}
+
+int *c_addrof_subscript(int *p, int i)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &p[i];
+}
+
+int *c_addrof_member_array_subscript(struct c_addrof_s *s, int i)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &s->arr[i];
+}
+
+int *c_addrof_member_ptr_subscript(struct c_addrof_s *s, int i)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &s->ptr[i];
+}
+
+int *c_addrof_after_deref(struct c_addrof_s *s)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  s->a = 1;
+  return &s->b;
+}
+
+int *c_decay_member_array(struct c_addrof_s *s)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return s->arr;
+}
+
+int *c_addrof_arrow_null(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *s = 0;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return &s->b; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_addrof_subscript_null(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *p = 0;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return &p[0]; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_decay_deref_null(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int (*pa)[4] = 0;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return *pa; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int c_addrof_arrow_branch(struct c_addrof_s *s) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  if (&s->b == 0) // expected-warning{{comparison of address of 's->b' equal to a null pointer is always false}}
+    return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+  return 0;
+}
+
+// Same as above but without a Sema diagnostic about the null comparison.
+int c_addrof_subscript_branch(struct c_addrof_s *s, int i) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  if (&s->ptr[i] == 0)
+    return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+  return 0;
+}
+
+static inline int c_addrof_subscript_helper(struct c_addrof_s *s, int i) {
+  if (&s->ptr[i] == 0)
+    return 1;
+  return 0;
+}
+
+int c_addrof_subscript_inline_branch(struct c_addrof_s *s, int i) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  return c_addrof_subscript_helper(s, i); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+// A pointer whose known value range includes null is not assumed to be valid
+// unless it has been dereferenced in an evaluated context.
+struct c_addrof_s c_addrof_obj;
+
+int *c_addrof_maybe_null_first_bad(int c)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *s = c ? 0 : &c_addrof_obj;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return &s->a; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_addrof_maybe_null(int c)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *s = c ? 0 : &c_addrof_obj;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return &s->b; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_addrof_maybe_null_after_deref_valid(int c)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *s = c ? 0 : &c_addrof_obj;
+  s->a = 1;
+  mutex_exclusive_lock(&mu1);
+  return &s->a;
+}
+
+// Addresses of members and array elements that contain a trylock call.
+struct c_addrof_s *c_addrof_s_trylock(void)
+    __attribute__((try_acquire_capability(1, mu1)));
+
+int *c_addrof_trylock_checked(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *p = c_addrof_s_trylock();
+  return p ? &p->b : 0;
+}
+
+int *c_addrof_trylock_checked_subscript(int i)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *p = c_addrof_s_trylock();
+  return p ? &p->arr[i] : 0;
+}
+
+int *c_decay_trylock_checked(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct c_addrof_s *p = c_addrof_s_trylock();
+  return p ? p->arr : 0;
+}
+
+// &p->b is not null if c_addrof_s_trylock() fails and returns null.
+int *c_addrof_trylock_unchecked(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  return &c_addrof_s_trylock()->b; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+// The address is valid whether or not the trylock call in the index
+// succeeds.
+int *c_addrof_trylock_index(struct c_addrof_s *s) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  return &s->arr[mutex_exclusive_trylock(&mu1)]; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
 }
 
 // _Generic controlling and unselected expressions are unevaluated.

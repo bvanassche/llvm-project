@@ -611,6 +611,12 @@ When verifying `TRY_ACQUIRE` and `TRY_ACQUIRE_RANGE` function bodies under
   that returns a pointer excludes some non-zero values, e.g. error codes encoded
   as pointers, a return of such an address while holding the capability is
   reported because the address might be one of these values.
+- Member or element addresses formed through dereferenced pointers or
+  references, such as `&p->member`, `&p[i]`, or `&r`, are treated as valid
+  addresses too when evaluating `return` values, unless the pointer may be null
+  according to its known value range. They are not treated as valid addresses in
+  branch conditions, which preserves soundness under
+  `-fno-delete-null-pointer-checks`.
 - A capability that is acquired through a local pointer whose value cannot be
   resolved, e.g. because it has been loaded by inline assembly, is not assumed
   to be the expected capability, even if it might refer to the same object.

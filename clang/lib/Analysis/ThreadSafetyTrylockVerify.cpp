@@ -715,6 +715,136 @@ void TrylockBodyVerifier::materializeNarrowedTrylocks(
   }
 }
 
+const ValueDecl *
+TrylockBodyVerifier::getDereferencedPtrExprVar(const Expr *PtrE) const {
+  while (PtrE) {
+    PtrE = stripNoOpExprWrappers(PtrE);
+    if (const auto *CE = dyn_cast<CastExpr>(PtrE)) {
+      QualType SubTy = CE->getSubExpr()->getType();
+      QualType DstTy = CE->getType();
+      if (CE->getCastKind() == CK_LValueToRValue) {
+        PtrE = CE->getSubExpr();
+        continue;
+      }
+      if ((CE->getCastKind() == CK_BitCast ||
+           CE->getCastKind() == CK_DerivedToBase ||
+           CE->getCastKind() == CK_UncheckedDerivedToBase) &&
+          DstTy->isAnyPointerType() && SubTy->isAnyPointerType()) {
+        PtrE = CE->getSubExpr();
+        continue;
+      }
+      return nullptr;
+    }
+    if (const auto *CallExp = dyn_cast<CallExpr>(PtrE)) {
+      if (isBuiltinExpectCall(CallExp)) {
+        PtrE = CallExp->getArg(0);
+        continue;
+      }
+      return nullptr;
+    }
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(PtrE)) {
+      const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
+      if (!VD || !VD->getType()->isAnyPointerType() ||
+          !Analyzer.isTrackableLocalVar(VD, EscapedVars))
+        return nullptr;
+      return VD;
+    }
+    return nullptr;
+  }
+  return nullptr;
+}
+
+const ValueDecl *
+TrylockBodyVerifier::getAccessedLValuePtrVar(const Expr *LV) const {
+  while (LV) {
+    LV = LV->IgnoreParens();
+    if (const auto *CE = dyn_cast<CastExpr>(LV)) {
+      if (CE->getCastKind() == CK_NoOp ||
+          CE->getCastKind() == CK_DerivedToBase ||
+          CE->getCastKind() == CK_UncheckedDerivedToBase) {
+        LV = CE->getSubExpr();
+        continue;
+      }
+    }
+    if (const auto *ME = dyn_cast<MemberExpr>(LV)) {
+      if (!isa<FieldDecl, IndirectFieldDecl>(ME->getMemberDecl()))
+        return nullptr;
+      if (ME->isArrow())
+        return getDereferencedPtrExprVar(ME->getBase());
+      LV = ME->getBase();
+      continue;
+    }
+    if (const auto *UO = dyn_cast<UnaryOperator>(LV)) {
+      if (UO->getOpcode() == UO_Deref && !UO->getType()->isFunctionType())
+        return getDereferencedPtrExprVar(UO->getSubExpr());
+      return nullptr;
+    }
+    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(LV)) {
+      const Expr *Base = ASE->getBase()->IgnoreParens();
+      if (const auto *CE = dyn_cast<CastExpr>(Base);
+          CE && CE->getCastKind() == CK_ArrayToPointerDecay) {
+        LV = CE->getSubExpr();
+        continue;
+      }
+      return getDereferencedPtrExprVar(Base);
+    }
+    return nullptr;
+  }
+  return nullptr;
+}
+
+const ValueDecl *
+TrylockBodyVerifier::getDereferencedPtrInStmt(const Stmt *S) const {
+  if (!S)
+    return nullptr;
+
+  // The thread safety analysis builds its CFG with all statements added as
+  // separate CFG elements (setAllAlwaysAdd()), and this function is called
+  // for each element in execution order. Hence, only examine S itself and not
+  // its subexpressions. This evaluates each dereference against the pointer
+  // value at the time of the dereference and visits each AST node only once.
+  // Most statements in unevaluated contexts are not CFG elements. The
+  // arguments of builtins like __builtin_constant_p() are CFG elements but
+  // updateValueStateForStmt() skips these.
+  const ValueDecl *VD = nullptr;
+  if (const auto *CE = dyn_cast<CallExpr>(S)) {
+    if (CE->isUnevaluatedBuiltinCall(*Analyzer.ASTCtx))
+      return nullptr;
+    if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(CE)) {
+      if (const CXXMethodDecl *MD = MCE->getMethodDecl();
+          MD && !MD->isStatic() && !hasThreadSafetyCallEffects(MD, MCE)) {
+        if (const auto *ME =
+                dyn_cast<MemberExpr>(MCE->getCallee()->IgnoreParens())) {
+          if (ME->isArrow())
+            VD = getDereferencedPtrExprVar(ME->getBase());
+          else
+            VD = getAccessedLValuePtrVar(ME->getBase());
+        }
+      }
+    } else if (const auto *OCE = dyn_cast<CXXOperatorCallExpr>(CE)) {
+      OverloadedOperatorKind OOK = OCE->getOperator();
+      if ((OCE->isAssignmentOp() || OOK == OO_PlusPlus ||
+           OOK == OO_MinusMinus) &&
+          OCE->getNumArgs() >= 1 && OCE->getArg(0)->isGLValue() &&
+          !hasThreadSafetyCallEffects(
+              dyn_cast_or_null<NamedDecl>(OCE->getCalleeDecl()), OCE))
+        VD = getAccessedLValuePtrVar(OCE->getArg(0));
+    }
+  } else if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
+    if (BO->isAssignmentOp())
+      VD = getAccessedLValuePtrVar(BO->getLHS());
+  } else if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
+    if (UO->isIncrementDecrementOp())
+      VD = getAccessedLValuePtrVar(UO->getSubExpr());
+  } else if (const auto *CastE = dyn_cast<CastExpr>(S)) {
+    if (CastE->getCastKind() == CK_LValueToRValue)
+      VD = getAccessedLValuePtrVar(CastE->getSubExpr());
+  }
+  return (VD && !llvm::is_contained(Analyzer.getSubtreeModifiedVars(S), VD))
+             ? VD
+             : nullptr;
+}
+
 /// Drop the ranges of local variables that are out of scope in \p B. Their
 /// values cannot be used anymore, and dropping them keeps the size of the
 /// value state proportional to the number of variables in scope. A trylock
@@ -788,8 +918,10 @@ void TrylockBodyVerifier::pruneOutOfScopeVars(TrylockValueState &State,
   });
   for (const ValueDecl *VD : DeadDefs)
     retireVarDef(State, VD, /*NewRHS=*/nullptr);
-  for (const ValueDecl *VD : Dead)
+  for (const ValueDecl *VD : Dead) {
     State.VarRanges.erase(VD);
+    State.DerefNonNullVars.erase(VD);
+  }
 }
 
 void TrylockBodyVerifier::recordStmtMetadata(const Stmt *S,
@@ -912,12 +1044,15 @@ void TrylockBodyVerifier::updateVarFromExpr(TrylockValueState &State,
                                             LocalVarContext StmtCtx) {
   VD = cast<ValueDecl>(VD->getCanonicalDecl());
   retireVarDef(State, VD, RHS);
+  State.DerefNonNullVars.erase(VD);
   if (!Analyzer.isTrackableLocalVar(VD, EscapedVars) || !RHS) {
     State.VarRanges.erase(VD);
     State.UnmaterializedVarDefs.erase(VD);
     return;
   }
   const ValueDecl *SrcVD = Analyzer.extractTrackableVarExpr(RHS, EscapedVars);
+  if (SrcVD && State.DerefNonNullVars.contains(SrcVD))
+    State.DerefNonNullVars.insert(VD);
   auto DefIt = SrcVD ? State.UnmaterializedVarDefs.find(SrcVD)
                      : State.UnmaterializedVarDefs.end();
   if (DefIt != State.UnmaterializedVarDefs.end()) {
@@ -966,6 +1101,13 @@ void TrylockBodyVerifier::updateValueStateForStmtImpl(TrylockValueState &State,
     }
   }
 
+  // Record the dereference separately instead of narrowing the range of VD
+  // such that a later null check is not treated as infeasible. Code built
+  // with -fno-delete-null-pointer-checks may dereference a pointer before
+  // checking it.
+  if (const ValueDecl *DerefVD = getDereferencedPtrInStmt(S))
+    State.DerefNonNullVars.insert(DerefVD);
+
   if (const auto *DS = dyn_cast<DeclStmt>(S)) {
     forEachDeclVLAExpr(DS, /*IncludeTopLevelVLA=*/false, [&](const Expr *Sz) {
       llvm::SmallPtrSet<const ValueDecl *, 4> ModVars;
@@ -973,6 +1115,7 @@ void TrylockBodyVerifier::updateValueStateForStmtImpl(TrylockValueState &State,
       for (const ValueDecl *ModVD : ModVars) {
         retireVarDef(State, ModVD, /*NewRHS=*/nullptr);
         State.VarRanges.erase(ModVD);
+        State.DerefNonNullVars.erase(ModVD);
       }
     });
     forEachEvaluatedDeclVLAStmt(DS, *Analyzer.ASTCtx,
@@ -995,6 +1138,7 @@ void TrylockBodyVerifier::updateValueStateForStmtImpl(TrylockValueState &State,
       if (const auto *VD =
               dyn_cast<ValueDecl>(ModDRE->getDecl()->getCanonicalDecl())) {
         retireVarDef(State, VD, /*NewRHS=*/nullptr);
+        State.DerefNonNullVars.erase(VD);
         State.VarRanges.erase(VD);
       }
     }
@@ -1031,6 +1175,7 @@ void TrylockBodyVerifier::updateValueStateForStmtImpl(TrylockValueState &State,
         State.ExprRanges[stripNoOpExprWrappers(BO)] = It->second;
     } else {
       retireVarDef(State, VD, /*NewRHS=*/nullptr);
+      State.DerefNonNullVars.erase(VD);
       if (Analyzer.isTrackableLocalVar(VD, EscapedVars) &&
           VD->getType()->isIntegralOrEnumerationType()) {
         auto L = Analyzer.evaluatePureExprRange(BO->getLHS(), State,
@@ -1066,6 +1211,7 @@ void TrylockBodyVerifier::updateValueStateForStmtImpl(TrylockValueState &State,
     if (!VD)
       return;
     retireVarDef(State, VD, /*NewRHS=*/nullptr);
+    State.DerefNonNullVars.erase(VD);
     if (Analyzer.isTrackableLocalVar(VD, EscapedVars) &&
         VD->getType()->isIntegralOrEnumerationType()) {
       if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end()) {
@@ -1099,13 +1245,18 @@ void TrylockBodyVerifier::updateValueStateForStmtImpl(TrylockValueState &State,
     if (const CompoundStmt *CS = SE->getSubStmt(); CS && !CS->body_empty()) {
       if (const auto *LastExpr = dyn_cast<Expr>(CS->body_back())) {
         if (auto Dom = Analyzer.getScalarDomain(SE->getType())) {
-          if (auto R = Analyzer.evaluatePureExprRange(
-                  LastExpr, State, RangeEvalCtx{&EscapedVars}))
+          auto R = Analyzer.evaluatePureExprRange(LastExpr, State,
+                                                  RangeEvalCtx{&EscapedVars});
+          auto RDeref = Analyzer.evaluatePureExprRange(
+              LastExpr, State,
+              RangeEvalCtx{&EscapedVars, /*AssumeDerefValid=*/true});
+          const bool Same =
+              (!R && !RDeref) || (R && RDeref && R->subsetOfSet(*RDeref) &&
+                                  RDeref->subsetOfSet(*R));
+          if (Same) {
             State.ExprRanges[stripNoOpExprWrappers(SE)] =
-                reprojectRangeSet(*R, *Dom);
-          else
-            State.ExprRanges[stripNoOpExprWrappers(SE)] =
-                IntRangeSet::full(*Dom);
+                R ? reprojectRangeSet(*R, *Dom) : IntRangeSet::full(*Dom);
+          }
         }
       }
     }
@@ -1363,7 +1514,7 @@ public:
   ReturnValueForker(TrylockBodyVerifier &Verifier,
                     const TrylockValueState &State)
       : Verifier(Verifier), Analyzer(Verifier.Analyzer), State(State),
-        RetEC{&Verifier.EscapedVars} {}
+        RetEC{&Verifier.EscapedVars, /*AssumeDerefValid=*/true} {}
 
   /// Fork \p Forks on the trylock calls that evaluating \p E executes. \p E
   /// is evaluated in the local variable context \p Ctx, with the values that
@@ -2200,7 +2351,8 @@ void TrylockBodyVerifier::evaluateReturnWithPendingTrylocks(
   ReturnEvalOutcome Conservative;
   Conservative.Values = IntRangeSet::full(CurrentTrylockRetDom);
   if (RetVal) {
-    const RangeEvalCtx RetEC{&EscapedVars};
+    const ThreadSafetyAnalyzer::RangeEvalCtx RetEC{&EscapedVars,
+                                                   /*AssumeDerefValid=*/true};
     if (auto R = Analyzer.evaluatePureExprRange(RetVal, State, RetEC))
       if (IntRangeSet Mapped = reprojectRangeSet(*R, CurrentTrylockRetDom);
           !Mapped.empty())
@@ -3147,6 +3299,7 @@ void TrylockBodyVerifier::enterLoopHeader() {
 void TrylockBodyVerifier::eraseModifiedVar(const ValueDecl *VD) {
   retireVarDef(CurrValState, VD, /*NewRHS=*/nullptr);
   CurrValState.VarRanges.erase(VD);
+  CurrValState.DerefNonNullVars.erase(VD);
 }
 
 // A block of an irreducible cycle may be entered from outside the

@@ -906,11 +906,83 @@ int nested_conditionals() TRY1 {
   return T6(0) ? 0 : T6(3) ? 0 : T6(0) ? 0 : T6(3) ? 0 : T6(0) ? 0 : T6(3) ? 0 : 0;
 }
 
+//===----------------------------------------------------------------------===//
+// Addresses of members, array elements and objects that references are bound
+// to.
+//===----------------------------------------------------------------------===//
+
+#define TRY_MU __attribute__((try_acquire_capability(1, mu)))
+
 struct AddrS {
   int a;
   int arr[4];
   int &ref;
+
+  int *this_member_subscript() TRY_MU {
+    lock(&mu);
+    return &this->arr[1];
+  }
 };
+
+int *addrof_ref(int &r) TRY_MU {
+  lock(&mu);
+  return &r;
+}
+
+int *addrof_ref_member(AddrS &s) TRY_MU {
+  lock(&mu);
+  return &s.a;
+}
+
+int *addrof_ref_member_subscript(AddrS &s, int i) TRY_MU {
+  lock(&mu);
+  return &s.arr[i];
+}
+
+int *addrof_ref_field(AddrS *s) TRY_MU {
+  lock(&mu);
+  return &s->ref;
+}
+
+int *addrof_local_ref_field(AddrS s) TRY_MU {
+  lock(&mu);
+  return &s.ref;
+}
+
+int *decay_ref_array(int (&a)[4]) TRY_MU {
+  lock(&mu);
+  return a;
+}
+
+extern int &weak_ref __attribute__((weak));
+
+int *addrof_weak_ref() TRY_MU {
+  lock(&mu); // beta-note{{mutex acquired here}}
+  return &weak_ref; // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+// Branch conditions do not assume that a reference is bound to an object.
+int addrof_ref_branch(int &r) TRY_MU { // beta-note{{mutex acquired here}}
+  if (&r == nullptr) // expected-warning{{reference cannot be bound to dereferenced null pointer in well-defined C++ code; comparison may be assumed to always evaluate to false}}
+    return 1; // beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+  return 0;
+}
+
+// An overloaded operator[] is a call and not an array subscript. Calls that
+// return a reference are not modeled.
+struct AddrVec {
+  int &operator[](int i);
+};
+
+int *addrof_overloaded_subscript(AddrVec *v, int i) TRY_MU {
+  lock(&mu); // beta-note{{mutex acquired here}}
+  return &(*v)[i]; // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int *addrof_null_base_subscript() TRY_MU { // beta-note{{mutex acquired here}}
+  AddrS *p = nullptr;
+  return &p->arr[0]; // beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
 
 // Pointer-to-data-member literal &AddrS::a is non-null.
 int AddrS::*try_memptr_impl(bool ok)

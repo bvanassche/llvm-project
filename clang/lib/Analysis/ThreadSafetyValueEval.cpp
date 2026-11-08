@@ -1202,8 +1202,8 @@ const ValueDecl *ThreadSafetyAnalyzer::extractTrackableVarExpr(
   return nullptr;
 }
 
-/// Range of addresses that a valid object or function can have, i.e. all
-/// non-null addresses.
+/// Range of addresses that a valid object, function, or dereferenced pointer
+/// can have, i.e. all non-null addresses.
 ThreadSafetyAnalyzer::IntRangeSet threadSafety::validObjectPtrRangeSet(
     const ThreadSafetyAnalyzer::IntDomain &Dom) {
   return ThreadSafetyAnalyzer::IntRangeSet::truthSet(Dom, true);
@@ -1246,6 +1246,86 @@ static bool isKnownValidObjectOrFunctionLValue(const Expr *E) {
       E = ME->getBase();
       continue;
     }
+    return false;
+  }
+  return false;
+}
+
+/// Whether the pointer \p PtrE, which is dereferenced by a member access or
+/// an array subscript, points to a valid object. While evaluating return
+/// values (EC.AssumeDerefValid), assume that a pointer with an unknown range
+/// is valid. Otherwise, e.g. for branch conditions, require that the pointer
+/// is known not to be null since code built with
+/// -fno-delete-null-pointer-checks may compute the address of a member of a
+/// null pointer before checking that pointer.
+bool ThreadSafetyAnalyzer::isValidDerefPointer(const Expr *PtrE,
+                                               const TrylockValueState &State,
+                                               const RangeEvalCtx &EC,
+                                               unsigned Depth) {
+  PtrE = stripNoOpExprWrappers(PtrE);
+  if (isa<CXXThisExpr>(PtrE))
+    return true;
+  std::optional<IntRangeSet> R = evaluatePureExprRange(PtrE, State, EC, Depth);
+  if (!R)
+    return EC.AssumeDerefValid;
+  return !R->empty() && !R->mayBeZero();
+}
+
+/// Whether the address of lvalue \p E is the address of a valid object or
+/// function. In addition to the lvalues accepted by
+/// isKnownValidObjectOrFunctionLValue(), this accepts members and array
+/// elements of objects that are accessed through a valid pointer, e.g.
+/// &p->member, &p[i] and &p->array[i], and objects that references are bound
+/// to.
+bool ThreadSafetyAnalyzer::isValidObjectLValue(const Expr *E,
+                                               const TrylockValueState &State,
+                                               const RangeEvalCtx &EC,
+                                               unsigned Depth) {
+  while (E) {
+    if (++EvalStepCount > MaxEvalSteps || Depth > MaxConstrainExprDepth) {
+      InlineEvalHitCutoff = true;
+      return false;
+    }
+    E = stripNoOpExprWrappers(E);
+    if (isKnownValidObjectOrFunctionLValue(E))
+      return true;
+    // A reference is bound to a valid object or function. Like the validity
+    // of a dereferenced pointer, only assume this while evaluating return
+    // values since code built with -fno-delete-null-pointer-checks may bind
+    // a reference to the target of a null pointer.
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+      return VD && VD->getType()->isReferenceType() && !VD->isWeak() &&
+             EC.AssumeDerefValid;
+    }
+    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+      const ValueDecl *MD = ME->getMemberDecl();
+      if (MD->getType()->isReferenceType())
+        return isa<FieldDecl, IndirectFieldDecl, VarDecl>(MD) &&
+               !MD->isWeak() && EC.AssumeDerefValid;
+      if (!isa<FieldDecl, IndirectFieldDecl>(MD))
+        return false;
+      if (ME->isArrow())
+        return isValidDerefPointer(ME->getBase(), State, EC, Depth + 1);
+      E = ME->getBase();
+      ++Depth;
+      continue;
+    }
+    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
+      const Expr *Base = ASE->getBase()->IgnoreParens();
+      if (const auto *CE = dyn_cast<CastExpr>(Base);
+          CE && CE->getCastKind() == CK_ArrayToPointerDecay) {
+        E = CE->getSubExpr();
+        ++Depth;
+        continue;
+      }
+      return isValidDerefPointer(Base, State, EC, Depth + 1);
+    }
+    // (*p).member is equivalent to p->member. The &*p case is handled by the
+    // callers without assuming that p is valid.
+    if (const auto *UO = dyn_cast<UnaryOperator>(E);
+        UO && UO->getOpcode() == UO_Deref && !UO->getType()->isFunctionType())
+      return isValidDerefPointer(UO->getSubExpr(), State, EC, Depth + 1);
     return false;
   }
   return false;
@@ -1347,8 +1427,10 @@ void threadSafety::eraseModifiedVarsFromState(
     ThreadSafetyAnalyzer::TrylockValueState &State,
     llvm::ArrayRef<const ValueDecl *> ModVars,
     const llvm::SmallPtrSetImpl<const Expr *> *PinnedExprs) {
-  for (const ValueDecl *VD : ModVars)
+  for (const ValueDecl *VD : ModVars) {
     State.VarRanges.erase(VD);
+    State.DerefNonNullVars.erase(VD);
+  }
   // The recorded value of a call is the value that the call returned, which
   // modifying a variable afterwards does not change. Keep these such that the
   // outcome of a trylock call is not forgotten, e.g. in the condition of
@@ -1467,11 +1549,6 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
     if (const Expr *Inner = getCachedPureStmtExpr(SE))
       if (auto R = evaluatePureExprRange(Inner, State, EC, Depth + 1))
         return reprojectRangeSet(*R, Dom);
-    // The statements before the last one have already been executed when the
-    // value of a statement expression is used. If the last expression only
-    // refers to variables that are declared by the statement expression,
-    // which cannot be modified after it, its value is the value of the last
-    // expression in State, e.g. for '({ bool r = trylock(&mu); r; })'.
     if (const Expr *Last = getStmtExprLocalValue(SE, *ASTCtx))
       if (auto R = evaluatePureExprRange(Last, State, EC, Depth + 1))
         return reprojectRangeSet(*R, Dom);
@@ -1507,9 +1584,21 @@ ThreadSafetyAnalyzer::evaluatePureDeclRefRange(const DeclRefExpr *DRE,
       if (auto ICE = evaluateRuntimeIntConstant(DRE, *ASTCtx))
         return IntRangeSet::single(Dom, *ICE);
   }
+  std::optional<IntRangeSet> R;
   if (auto It = State.VarRanges.find(VD); It != State.VarRanges.end())
-    return reprojectRangeSet(It->second, Dom);
-  return std::nullopt;
+    R = reprojectRangeSet(It->second, Dom);
+  if (EC.AssumeDerefValid && State.DerefNonNullVars.contains(VD)) {
+    // The pointer has been dereferenced, so assume that it points to a valid
+    // object, i.e. that it is not null, unless that contradicts what is
+    // known about its value. Branch conditions do not use this assumption
+    // because code built with -fno-delete-null-pointer-checks may check a
+    // pointer for null after having dereferenced it.
+    IntRangeSet ValidPtr = validObjectPtrRangeSet(Dom);
+    IntRangeSet NonNull = R ? R->intersect(ValidPtr) : ValidPtr;
+    if (!NonNull.empty())
+      return NonNull;
+  }
+  return R;
 }
 
 std::optional<ThreadSafetyAnalyzer::IntRangeSet>
@@ -1532,7 +1621,7 @@ ThreadSafetyAnalyzer::evaluatePureCastRange(const CastExpr *CE,
           evaluatePureExprRange(Deref->getSubExpr(), State, EC, Depth + 1);
       return SubR ? std::optional(reprojectRangeSet(*SubR, Dom)) : std::nullopt;
     }
-    if (isKnownValidObjectOrFunctionLValue(Sub))
+    if (isValidObjectLValue(Sub, State, EC, Depth + 1))
       return validObjectPtrRangeSet(Dom);
     return std::nullopt;
   }
@@ -1579,8 +1668,8 @@ ThreadSafetyAnalyzer::evaluatePureCallRange(const CallExpr *CallExp,
   SmallVector<std::optional<IntRangeSet>, 4> ArgRanges =
       evaluateInlineArgRanges(CallExp, State, EC, Depth + 1);
   llvm::FoldingSetNodeID CacheID;
-  bool CanCache =
-      profileInlineCallCacheKey(CacheID, InlineInfo->DefFD, 0, ArgRanges);
+  bool CanCache = profileInlineCallCacheKey(
+      CacheID, InlineInfo->DefFD, EC.AssumeDerefValid ? 1 : 0, ArgRanges);
   if (CanCache)
     if (auto It = InlineCallRangeCache.find_as(CacheID);
         It != InlineCallRangeCache.end())
@@ -1635,7 +1724,7 @@ ThreadSafetyAnalyzer::evaluatePureUnaryRange(const UnaryOperator *UO,
           evaluatePureExprRange(Deref->getSubExpr(), State, EC, Depth + 1);
       return SubR ? std::optional(reprojectRangeSet(*SubR, Dom)) : std::nullopt;
     }
-    if (isKnownValidObjectOrFunctionLValue(Sub))
+    if (isValidObjectLValue(Sub, State, EC, Depth + 1))
       return validObjectPtrRangeSet(Dom);
     return std::nullopt;
   }
@@ -1740,8 +1829,8 @@ ThreadSafetyAnalyzer::evaluatePureBinaryRange(const BinaryOperator *BO,
       if (RHSRefsLHSMod)
         eraseModifiedVarsFromState(RHSState, LHSMod, EC.PinnedExprs);
       if (Depth < 8 && EC.EscapedVars && !LHSRefsRHSMod) {
-        constrainLeafCondition(RHSState, BO->getLHS(), /*WantTrue=*/IsAnd, EC,
-                               Depth + 1);
+        constrainLeafCondition(RHSState, BO->getLHS(), /*WantTrue=*/IsAnd,
+                               EC.withDeref(false), Depth + 1);
       }
       RHSBool = RHSState.Infeasible ? std::make_pair(false, false)
                                     : EvalBool(BO->getRHS(), RHSState);
@@ -1864,8 +1953,8 @@ ThreadSafetyAnalyzer::evaluatePureConditionalRange(
       std::optional<IntRangeSet> FR;
       if (Depth < 8 && EC.EscapedVars && !CommonRefsFalseMod) {
         TrylockValueState FalseState = State;
-        constrainLeafCondition(FalseState, Common, /*WantTrue=*/false, EC,
-                               Depth + 1);
+        constrainLeafCondition(FalseState, Common, /*WantTrue=*/false,
+                               EC.withDeref(false), Depth + 1);
         FR = FalseState.Infeasible
                  ? IntRangeSet{}
                  : evaluatePureExprRange(BCO->getFalseExpr(), FalseState, EC,
@@ -1909,8 +1998,8 @@ ThreadSafetyAnalyzer::evaluatePureConditionalRange(
     if (Depth < 8 && EC.EscapedVars && !CondRefsArmMod) {
       TrylockValueState ArmState = State;
       {
-        constrainLeafCondition(ArmState, COP->getCond(), WantTrue, EC,
-                               Depth + 1);
+        constrainLeafCondition(ArmState, COP->getCond(), WantTrue,
+                               EC.withDeref(false), Depth + 1);
       }
       if (ArmState.Infeasible)
         return IntRangeSet{};
@@ -2101,6 +2190,7 @@ void threadSafety::unionIntoValueState(
       Dst.AcquiredTrylockAttrs.insert(K);
   Dst.DiscardedTrylockCalls.insert(Src.DiscardedTrylockCalls.begin(),
                                    Src.DiscardedTrylockCalls.end());
+  llvm::set_intersect(Dst.DerefNonNullVars, Src.DerefNonNullVars);
 }
 
 /// If \p CallExp calls a trivial inline helper that returns its only argument
@@ -2168,7 +2258,7 @@ void ThreadSafetyAnalyzer::forEachInlineReturn(
     return F(Info.SingleRet, Init);
   TrylockValueState TState = Init;
   TrylockValueState FState = Init;
-  RangeEvalCtx CalleeEC = EC.withEscaped(&Info.CalleeEscaped);
+  RangeEvalCtx CalleeEC = EC.withEscaped(&Info.CalleeEscaped).withDeref(false);
   constrainLeafCondition(TState, Info.CondExpr, /*WantTrue=*/true, CalleeEC,
                          Depth);
   constrainLeafCondition(FState, Info.CondExpr, /*WantTrue=*/false, CalleeEC,

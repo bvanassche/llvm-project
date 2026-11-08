@@ -1097,6 +1097,10 @@ public:
     // Trylock results that are no longer stored in any variable. The
     // capabilities of these calls may still have been acquired.
     SmallVector<OverwrittenTrylockDef, 1> OverwrittenTrylockDefs;
+    // Pointer variables that have been dereferenced unconditionally since
+    // their last modification. These are assumed to be non-null when
+    // evaluating their value, unless a branch condition contradicts that.
+    llvm::SmallPtrSet<const ValueDecl *, 4> DerefNonNullVars;
     llvm::SmallDenseMap<const ValueDecl *,
                         std::pair<const Expr *, LocalVarContext>, 2>
         UnmaterializedVarDefs;
@@ -1289,6 +1293,10 @@ public:
     /// The escaped local variables of the function or inline helper whose
     /// body contains the expression. Null outside trylock implementations.
     const llvm::SmallPtrSetImpl<const ValueDecl *> *EscapedVars = nullptr;
+    /// Whether a dereferenced pointer may be assumed to be valid. Only set
+    /// while evaluating return values, such that null checks after a
+    /// dereference remain feasible in branch conditions.
+    bool AssumeDerefValid = false;
     /// The expressions whose entries in TrylockValueState::ExprRanges record
     /// the values that these evaluated to while evaluating the expression
     /// that contains them, e.g. the trylock calls, conditions and variable
@@ -1296,6 +1304,11 @@ public:
     /// in another operand does not change these values.
     const llvm::SmallPtrSetImpl<const Expr *> *PinnedExprs = nullptr;
 
+    RangeEvalCtx withDeref(bool V) const {
+      RangeEvalCtx C = *this;
+      C.AssumeDerefValid = V;
+      return C;
+    }
     RangeEvalCtx
     withEscaped(const llvm::SmallPtrSetImpl<const ValueDecl *> *E) const {
       RangeEvalCtx C = *this;
@@ -1329,6 +1342,10 @@ public:
   std::optional<IntRangeSet> evaluatePureConditionalRange(
       const AbstractConditionalOperator *COP, const IntDomain &Dom,
       const TrylockValueState &State, const RangeEvalCtx &EC, unsigned Depth);
+  bool isValidDerefPointer(const Expr *PtrE, const TrylockValueState &State,
+                           const RangeEvalCtx &EC, unsigned Depth);
+  bool isValidObjectLValue(const Expr *E, const TrylockValueState &State,
+                           const RangeEvalCtx &EC, unsigned Depth);
   bool constrainExprComparison(TrylockValueState &State, const Expr *VarSide,
                                BinaryOperator::Opcode EffectiveOp,
                                const llvm::APSInt &KVal, const RangeEvalCtx &EC,
@@ -1816,6 +1833,13 @@ private:
                             LocalVarContext DefCtx, QualType Ty,
                             const IntRangeSet *Allowed);
   void materializeNarrowedTrylocks(FactSet &Lockset, TrylockValueState &State);
+  /// If \p PtrE is a trackable local pointer variable, possibly behind
+  /// casts, return its canonical declaration.
+  const ValueDecl *getDereferencedPtrExprVar(const Expr *PtrE) const;
+  /// Return the trackable local pointer variable dereferenced by accessing
+  /// the lvalue \p LV, if any.
+  const ValueDecl *getAccessedLValuePtrVar(const Expr *LV) const;
+  const ValueDecl *getDereferencedPtrInStmt(const Stmt *S) const;
   void recordStmtMetadata(const Stmt *S, LocalVarContext StmtCtx);
   void updateValueStateForStmt(TrylockValueState &State, const Stmt *S,
                                LocalVarContext StmtCtx);
