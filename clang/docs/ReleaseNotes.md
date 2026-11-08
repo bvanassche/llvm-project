@@ -526,6 +526,16 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   value as `false`. A type-dependent success value such as `T::value` is now
   accepted and checked when the template is instantiated.
 
+- A `try_acquire_capability` or `try_acquire_shared_capability` attribute on a
+  redeclaration that differs in kind, success value, or capabilities from all
+  such attributes of the earlier declaration is now ignored, and a new
+  `-Wthread-safety-attributes` warning (enabled by `-Wthread-safety`) diagnoses
+  it. Before, the function was treated as having both attributes. The same
+  applies to such an attribute that contradicts an earlier such attribute of the
+  same declaration for the same capability, i.e. that has the same access mode
+  but a different success value, or a different access mode but the same success
+  value.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed a false-positive `-Wimplicit-fallthrough` warning when

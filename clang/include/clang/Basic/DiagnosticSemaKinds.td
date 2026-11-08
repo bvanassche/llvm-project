@@ -4412,6 +4412,14 @@ def err_attribute_argument_out_of_bounds_extra_info : Error<
 def warn_thread_attribute_trylock_non_binary_value : Warning<
   "%0 attribute success value %1 is treated as 'true'">,
   InGroup<ThreadSafetyAttributes>, DefaultIgnore;
+def warn_thread_attribute_conflicting_redecl : Warning<
+  "%0 attribute on redeclaration conflicts with previous declaration; "
+  "ignoring the attribute">,
+  InGroup<ThreadSafetyAttributes>, DefaultIgnore;
+def warn_thread_attribute_conflicting_attr : Warning<
+  "%0 attribute conflicts with an earlier attribute on the same declaration; "
+  "ignoring the attribute">,
+  InGroup<ThreadSafetyAttributes>, DefaultIgnore;
 
 // Thread Safety Analysis
 def warn_unlock_but_no_lock : Warning<"releasing %0 '%1' that was not held">,

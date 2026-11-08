@@ -1103,6 +1103,9 @@ void Sema::InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
       instantiateAttrOnDecl(*this, TemplateArgs, TmplAttr, New);
     }
   }
+  if (!LateAttrs)
+    checkInstantiatedTryAcquireRedecls(
+        New->getPreviousDecl() ? New->getPreviousDecl() : New, New);
 }
 
 void Sema::InstantiateLateAttrs(
@@ -1112,14 +1115,19 @@ void Sema::InstantiateLateAttrs(
   assert(
       CurrentInstantiationScope == OuterMostScope &&
       "late attributes instantiated outside the scope they were deferred in");
+  llvm::SmallPtrSet<Decl *, 4> CheckedDecls;
   for (const LateInstantiatedAttribute &LA : LateAttrs) {
     CurrentInstantiationScope = LA.Scope;
     instantiateAttrOnDecl(*this, TemplateArgs, LA.TmplAttr, LA.NewDecl);
+    CheckedDecls.insert(LA.NewDecl);
     // Exiting the saved scopes restores the outermost one.
     LocalInstantiationScope::deleteScopes(LA.Scope, OuterMostScope);
     assert(CurrentInstantiationScope == OuterMostScope &&
            "deferred scope did not extend the outermost scope");
   }
+  for (Decl *D : CheckedDecls)
+    checkInstantiatedTryAcquireRedecls(
+        D->getPreviousDecl() ? D->getPreviousDecl() : D, D);
   LateAttrs.clear();
 }
 
@@ -1246,6 +1254,8 @@ void Sema::instantiateRedeclThreadSafetyAttrs(FunctionDecl *New,
         continue;
       instantiateAttrOnDecl(*this, TemplateArgs, TmplAttr, Inst);
     }
+    if (!Inst->isTemplated())
+      checkInstantiatedTryAcquireRedecls(Inst, Inst);
   };
   for (FunctionDecl *Inst : DependentInsts)
     InstantiateOn(Inst);

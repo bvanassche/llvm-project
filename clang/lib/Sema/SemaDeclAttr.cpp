@@ -541,6 +541,338 @@ static bool checkTryAcquireCapabilitySuccessValue(Sema &S,
   return false;
 }
 
+static const Expr *stripTryAcquireCapWrapper(const Expr *E,
+                                             bool StripAddrDeref = true) {
+  while (E) {
+    E = E->IgnoreParenImpCasts();
+    if (const auto *BTE = dyn_cast<CXXBindTemporaryExpr>(E))
+      E = BTE->getSubExpr();
+    else if (const auto *EWC = dyn_cast<ExprWithCleanups>(E))
+      E = EWC->getSubExpr();
+    else if (const auto *UO = dyn_cast<UnaryOperator>(E);
+             StripAddrDeref && UO &&
+             (UO->getOpcode() == UO_AddrOf || UO->getOpcode() == UO_Deref))
+      E = UO->getSubExpr();
+    else
+      break;
+  }
+  return E;
+}
+
+static bool isSharedTryAcquireAttr(const Attr *A) {
+  return cast<TryAcquireCapabilityAttr>(A)->isShared();
+}
+
+static ArrayRef<Expr *> getTryAcquireAttrCapArgs(const Attr *A) {
+  const auto *TAC = cast<TryAcquireCapabilityAttr>(A);
+  return {TAC->args_begin(), TAC->args_size()};
+}
+
+/// The index of \p PVD among the parameters of a declaration of one of the
+/// functions \p Owners, if \p PVD is such a parameter.
+static std::optional<unsigned> getOwnParamIndex(const ParmVarDecl *PVD,
+                                                ArrayRef<const Decl *> Owners) {
+  const auto *PFD = dyn_cast_or_null<FunctionDecl>(PVD->getDeclContext());
+  for (const Decl *Owner : Owners)
+    if (const auto *FD = dyn_cast_or_null<FunctionDecl>(Owner);
+        FD && PFD && FD->getCanonicalDecl() == PFD->getCanonicalDecl())
+      return PVD->getFunctionScopeIndex();
+  return std::nullopt;
+}
+
+/// Whether the capability expressions \p E1 and \p E2 in trylock attributes
+/// of declarations of \p Owners name the same capability. Unlike
+/// Stmt::Profile(), a parameter of the declared function is identified by its
+/// index, independently of its type and of the redeclaration it belongs to,
+/// a parameter of another function by its declaration, and an implicit 'this'
+/// is the same as an explicit one.
+static bool sameTryAcquireCap(const Expr *E1, const Expr *E2,
+                              ArrayRef<const Decl *> Owners,
+                              const ASTContext &Ctx, bool TopLevel = true) {
+  E1 = stripTryAcquireCapWrapper(E1, TopLevel);
+  E2 = stripTryAcquireCapWrapper(E2, TopLevel);
+  if (!E1 || !E2)
+    return E1 == E2;
+  if (isa<CXXThisExpr>(E1) && isa<CXXThisExpr>(E2))
+    return true;
+  if (const auto *DRE1 = dyn_cast<DeclRefExpr>(E1)) {
+    const auto *DRE2 = dyn_cast<DeclRefExpr>(E2);
+    if (!DRE2)
+      return false;
+    const auto *P1 = dyn_cast<ParmVarDecl>(DRE1->getDecl());
+    const auto *P2 = dyn_cast<ParmVarDecl>(DRE2->getDecl());
+    std::optional<unsigned> I1 =
+        P1 ? getOwnParamIndex(P1, Owners) : std::nullopt;
+    std::optional<unsigned> I2 =
+        P2 ? getOwnParamIndex(P2, Owners) : std::nullopt;
+    if (I1 || I2)
+      return I1 == I2;
+    return DRE1->getDecl()->getCanonicalDecl() ==
+           DRE2->getDecl()->getCanonicalDecl();
+  }
+  if (const auto *ME1 = dyn_cast<MemberExpr>(E1)) {
+    const auto *ME2 = dyn_cast<MemberExpr>(E2);
+    return ME2 && ME1->isArrow() == ME2->isArrow() &&
+           ME1->getMemberDecl()->getCanonicalDecl() ==
+               ME2->getMemberDecl()->getCanonicalDecl() &&
+           sameTryAcquireCap(ME1->getBase(), ME2->getBase(), Owners, Ctx,
+                             /*TopLevel=*/false);
+  }
+  if (const auto *UO1 = dyn_cast<UnaryOperator>(E1)) {
+    const auto *UO2 = dyn_cast<UnaryOperator>(E2);
+    return UO2 && UO1->getOpcode() == UO2->getOpcode() &&
+           sameTryAcquireCap(UO1->getSubExpr(), UO2->getSubExpr(), Owners, Ctx,
+                             /*TopLevel=*/false);
+  }
+  llvm::FoldingSetNodeID ID1, ID2;
+  E1->Profile(ID1, Ctx, /*Canonical=*/true);
+  E2->Profile(ID2, Ctx, /*Canonical=*/true);
+  return ID1 == ID2;
+}
+
+/// The success values of a trylock attribute, i.e. the truth value of its
+/// success value. std::nullopt if the success value is not known yet.
+static std::optional<SmallVector<llvm::APSInt, 2>>
+getTryAcquireSuccessValues(const Attr *A, const ASTContext &Ctx) {
+  const auto *TAC = cast<TryAcquireCapabilityAttr>(A);
+  auto Val =
+      threadSafety::getIntegralOrEnumConstantExpr(TAC->getSuccessValue(), Ctx);
+  if (!Val)
+    return std::nullopt;
+  return SmallVector<llvm::APSInt, 2>{llvm::APSInt::get(Val->getBoolValue())};
+}
+
+static bool isNonStaticCapabilityMethod(const Decl *D) {
+  const auto *MD = dyn_cast_or_null<CXXMethodDecl>(D);
+  if (!MD || MD->isStatic())
+    return false;
+  const CXXRecordDecl *RD = MD->getParent();
+  return checkRecordDeclForAttr<CapabilityAttr>(RD) ||
+         (isa<CXXConstructorDecl>(MD) &&
+          checkRecordDeclForAttr<ScopedLockableAttr>(RD));
+}
+
+/// Whether the trylock attributes \p A1 and \p A2 on \p D are identical: they
+/// have the same kind, the same success values and the same capability
+/// arguments. std::nullopt if a success value is not known yet.
+static std::optional<bool>
+areIdenticalTryAcquireAttrs(const Decl *D, const Attr *A1, const Attr *A2,
+                            const ASTContext &Ctx,
+                            const Decl *OtherD = nullptr) {
+  auto V1 = getTryAcquireSuccessValues(A1, Ctx);
+  auto V2 = getTryAcquireSuccessValues(A2, Ctx);
+  if (!V1 || !V2)
+    return std::nullopt;
+  if (A1->getKind() != A2->getKind() ||
+      isSharedTryAcquireAttr(A1) != isSharedTryAcquireAttr(A2) ||
+      !llvm::equal(*V1, *V2, [](const llvm::APSInt &X, const llvm::APSInt &Y) {
+        return llvm::APSInt::isSameValue(X, Y);
+      }))
+    return false;
+  ArrayRef<Expr *> Args1 = getTryAcquireAttrCapArgs(A1);
+  ArrayRef<Expr *> Args2 = getTryAcquireAttrCapArgs(A2);
+  auto IsImplicitOrExplicitThis = [](ArrayRef<Expr *> Args) {
+    return Args.empty() ||
+           (Args.size() == 1 &&
+            isa_and_nonnull<CXXThisExpr>(stripTryAcquireCapWrapper(Args[0])));
+  };
+  if (isNonStaticCapabilityMethod(D) && IsImplicitOrExplicitThis(Args1) &&
+      IsImplicitOrExplicitThis(Args2))
+    return true;
+  // The order of the capability arguments does not matter.
+  auto IsSubset = [&](ArrayRef<Expr *> Sub, ArrayRef<Expr *> Super) {
+    return llvm::all_of(Sub, [&](const Expr *C1) {
+      return llvm::any_of(Super, [&](const Expr *C2) {
+        return sameTryAcquireCap(C1, C2, {D, OtherD}, Ctx);
+      });
+    });
+  };
+  return IsSubset(Args1, Args2) && IsSubset(Args2, Args1);
+}
+
+/// Whether the trylock attributes \p A1 and \p A2, which have been written on
+/// the same declaration \p D, contradict each other for a capability argument
+/// they share: with the same access mode but different success values, the
+/// capability would be acquired whatever the function returns, and with
+/// different access modes but the same success value, it would be acquired
+/// both exclusively and shared. std::nullopt if a success value is not known
+/// yet.
+static std::optional<bool>
+areContradictoryTryAcquireAttrs(const Decl *D, const Attr *A1, const Attr *A2,
+                                const ASTContext &Ctx) {
+  auto V1 = getTryAcquireSuccessValues(A1, Ctx);
+  auto V2 = getTryAcquireSuccessValues(A2, Ctx);
+  if (!V1 || !V2)
+    return std::nullopt;
+  bool SameMode = isSharedTryAcquireAttr(A1) == isSharedTryAcquireAttr(A2);
+  bool SameValue = llvm::APSInt::isSameValue(V1->front(), V2->front());
+  if (SameMode == SameValue)
+    return false;
+  ArrayRef<Expr *> Args1 = getTryAcquireAttrCapArgs(A1);
+  ArrayRef<Expr *> Args2 = getTryAcquireAttrCapArgs(A2);
+  auto IsImplicitOrExplicitThis = [](ArrayRef<Expr *> Args) {
+    return Args.empty() || llvm::any_of(Args, [](const Expr *C) {
+             return isa_and_nonnull<CXXThisExpr>(stripTryAcquireCapWrapper(C));
+           });
+  };
+  if (isNonStaticCapabilityMethod(D) && IsImplicitOrExplicitThis(Args1) &&
+      IsImplicitOrExplicitThis(Args2))
+    return true;
+  return llvm::any_of(Args1, [&](const Expr *C1) {
+    return llvm::any_of(Args2, [&](const Expr *C2) {
+      return sameTryAcquireCap(C1, C2, {D}, Ctx);
+    });
+  });
+}
+
+/// Diagnose the trylock attribute \p NewAttr on \p D if it contradicts one of
+/// the trylock attributes in \p EarlierAttrs that have been written on \p D,
+/// or that apply to \p D if \p IncludeInherited is true. Return true if
+/// \p NewAttr should be ignored.
+static bool checkContradictoryTryAcquireAttr(Sema &S, const Decl *D,
+                                             ArrayRef<Attr *> EarlierAttrs,
+                                             const Attr *NewAttr,
+                                             bool IncludeInherited = false) {
+  for (const Attr *A : EarlierAttrs) {
+    if ((A->isInherited() && !IncludeInherited) ||
+        !isa<TryAcquireCapabilityAttr>(A))
+      continue;
+    if (!areContradictoryTryAcquireAttrs(D, A, NewAttr, S.Context)
+             .value_or(false))
+      continue;
+    S.Diag(NewAttr->getLocation(), diag::warn_thread_attribute_conflicting_attr)
+        << NewAttr;
+    S.Diag(A->getLocation(), diag::note_previous_attribute);
+    return true;
+  }
+  return false;
+}
+
+bool Sema::checkConflictingTryAcquireRedecl(
+    const Decl *Old, Decl *New, Attr *NewAttr,
+    std::optional<ArrayRef<Attr *>> OnlyOldAttrs) {
+  if (!Old || !New || !NewAttr || !isa<TryAcquireCapabilityAttr>(NewAttr) ||
+      !Old->hasAttrs())
+    return false;
+
+  // A trylock attribute on a redeclaration must be identical to one of the
+  // trylock attributes of the previous declaration, if any.
+  const Attr *FirstOld = nullptr;
+  ArrayRef<Attr *> OldAttrs = OnlyOldAttrs ? *OnlyOldAttrs : Old->getAttrs();
+  for (const Attr *OA : OldAttrs) {
+    if ((Old == New && !OnlyOldAttrs && !OA->isInherited()) ||
+        !isa<TryAcquireCapabilityAttr>(OA))
+      continue;
+    std::optional<bool> Identical =
+        areIdenticalTryAcquireAttrs(New, OA, NewAttr, Context, Old);
+    if (!Identical || *Identical)
+      return false;
+    if (!FirstOld)
+      FirstOld = OA;
+  }
+  if (!FirstOld)
+    return false;
+  Diag(NewAttr->getLocation(), diag::warn_thread_attribute_conflicting_redecl)
+      << NewAttr;
+  Diag(FirstOld->getLocation(), diag::note_previous_attribute);
+  return true;
+}
+
+/// The declarations of the template pattern of the instantiated function
+/// \p D in the order in which they have been declared.
+static SmallVector<const FunctionDecl *, 4> getPatternRedecls(const Decl *D) {
+  SmallVector<const FunctionDecl *, 4> Redecls;
+  const auto *FD = dyn_cast<FunctionDecl>(D);
+  const FunctionDecl *Pattern =
+      FD ? FD->getTemplateInstantiationPattern(/*ForDefinition=*/true)
+         : nullptr;
+  if (!Pattern)
+    return Redecls;
+  for (const FunctionDecl *R = Pattern->getMostRecentDecl(); R;
+       R = R->getPreviousDecl())
+    Redecls.push_back(R);
+  std::reverse(Redecls.begin(), Redecls.end());
+  return Redecls;
+}
+
+/// The index in \p Redecls of the declaration on which the attribute that
+/// \p A has been instantiated from has been written, or Redecls.size() if
+/// there is none. Inherited and instantiated attributes have the source range
+/// of the attribute that they have been created from.
+static unsigned getAttrOrigin(const Attr *A,
+                              ArrayRef<const FunctionDecl *> Redecls) {
+  for (auto [I, R] : llvm::enumerate(Redecls))
+    for (const Attr *RA : R->attrs())
+      if (!RA->isInherited() && RA->getKind() == A->getKind() &&
+          RA->getRange() == A->getRange())
+        return I;
+  return Redecls.size();
+}
+
+/// Check the trylock attributes of the first declaration \p D of an
+/// instantiated function. They have been instantiated from attributes that
+/// the pattern may have inherited from different declarations of the
+/// template, which could not be compared with each other before if their
+/// values were dependent. Attributes written on the same declaration of the
+/// template must not contradict each other, and an attribute written on a
+/// later declaration must be identical to one of the attributes of the
+/// earlier declarations.
+static void checkInstantiatedTryAcquireAttrs(Sema &S, Decl *D) {
+  SmallVector<const FunctionDecl *, 4> Redecls = getPatternRedecls(D);
+  SmallVector<std::pair<unsigned, Attr *>, 4> TrylockAttrs;
+  for (Attr *A : D->getAttrs())
+    if (isa<TryAcquireCapabilityAttr>(A))
+      TrylockAttrs.emplace_back(getAttrOrigin(A, Redecls), A);
+  llvm::stable_sort(TrylockAttrs, llvm::less_first());
+  SmallVector<Attr *, 4> Accepted;
+  llvm::SmallPtrSet<const Attr *, 4> Ignored;
+  unsigned NumFromEarlierDecls = 0;
+  for (auto [I, Entry] : llvm::enumerate(TrylockAttrs)) {
+    auto [Origin, NA] = Entry;
+    if (I == 0 || Origin != TrylockAttrs[I - 1].first)
+      NumFromEarlierDecls = Accepted.size();
+    ArrayRef<Attr *> FromEarlierDecls =
+        ArrayRef(Accepted).take_front(NumFromEarlierDecls);
+    ArrayRef<Attr *> FromSameDecl =
+        ArrayRef(Accepted).drop_front(NumFromEarlierDecls);
+    if (checkContradictoryTryAcquireAttr(S, D, FromSameDecl, NA,
+                                         /*IncludeInherited=*/true) ||
+        (!FromEarlierDecls.empty() &&
+         S.checkConflictingTryAcquireRedecl(D, D, NA, FromEarlierDecls)))
+      Ignored.insert(NA);
+    else
+      Accepted.push_back(NA);
+  }
+  if (!Ignored.empty())
+    llvm::erase_if(D->getAttrs(),
+                   [&](const Attr *A) { return Ignored.contains(A); });
+}
+
+void Sema::checkConflictingTryAcquireRedecls(const Decl *Old, Decl *New) {
+  if (!Old || !New || !New->hasAttrs())
+    return;
+  // Old == New for the first declaration of an instantiated specialization.
+  if (Old == New) {
+    checkInstantiatedTryAcquireAttrs(*this, New);
+    return;
+  }
+  AttrVec &NewAttrs = New->getAttrs();
+  for (unsigned I = 0; I < NewAttrs.size();) {
+    Attr *NA = NewAttrs[I];
+    if (!isa<TryAcquireCapabilityAttr>(NA) || NA->isInherited()) {
+      ++I;
+      continue;
+    }
+    ArrayRef<Attr *> Earlier = ArrayRef<Attr *>(NewAttrs).take_front(I);
+    if (checkContradictoryTryAcquireAttr(*this, New, Earlier, NA) ||
+        checkConflictingTryAcquireRedecl(Old, New, NA)) {
+      NewAttrs.erase(NewAttrs.begin() + I);
+      continue;
+    }
+    ++I;
+  }
+}
+
 /// Whether \p D is a constructor of a scoped_lockable class. An
 /// acquire_capability attribute without arguments on such a constructor makes
 /// the analysis track the scoped object without underlying capabilities. Like
@@ -607,6 +939,11 @@ public:
 };
 } // namespace
 
+void Sema::checkInstantiatedTryAcquireRedecls(const Decl *Old, Decl *New) {
+  TrylockAttrCheckTrap Trap(*this, /*Enable=*/true);
+  checkConflictingTryAcquireRedecls(Old, New);
+}
+
 bool Sema::checkInstantiatedThreadSafetyAttrs(const Decl *D, Attr *A,
                                               const Attr *TmplAttr) {
   if (!isa<AssertCapabilityAttr, AcquireCapabilityAttr,
@@ -614,8 +951,10 @@ bool Sema::checkInstantiatedThreadSafetyAttrs(const Decl *D, Attr *A,
            RequiresCapabilityAttr, LocksExcludedAttr, LockReturnedAttr>(A))
     return true;
 
-  // The generated attribute instantiation code does not copy the Inherited
-  // flag.
+  // The instantiated attribute is created from scratch. Preserve whether it
+  // has been inherited from an earlier declaration such that it is not
+  // compared with the attributes of that declaration as if it had been
+  // written on this declaration.
   if (TmplAttr && TmplAttr->isInherited())
     if (auto *IA = dyn_cast<InheritableAttr>(A))
       IA->setInherited(true);
@@ -7076,8 +7415,15 @@ static void handleTryAcquireCapabilityAttr(Sema &S, Decl *D,
   if (!checkTryLockFunAttrCommon(S, D, AL, Args))
     return;
 
-  D->addAttr(::new (S.Context) TryAcquireCapabilityAttr(
-      S.Context, AL, AL.getArgAsExpr(0), Args.data(), Args.size()));
+  Attr *NewAttr = ::new (S.Context) TryAcquireCapabilityAttr(
+      S.Context, AL, AL.getArgAsExpr(0), Args.data(), Args.size());
+  if (D->hasAttrs() &&
+      checkContradictoryTryAcquireAttr(S, D, D->getAttrs(), NewAttr))
+    return;
+  if (const Decl *Prev = D->getPreviousDecl())
+    if (S.checkConflictingTryAcquireRedecl(Prev, D, NewAttr))
+      return;
+  D->addAttr(NewAttr);
 }
 
 static void handleReleaseCapabilityAttr(Sema &S, Decl *D,

@@ -1371,6 +1371,14 @@ public:
   sema::AnalysisBasedWarnings AnalysisWarnings;
   threadSafety::BeforeSet *ThreadSafetyDeclCache;
 
+  bool checkConflictingTryAcquireRedecl(
+      const Decl *Old, Decl *New, Attr *NewAttr,
+      std::optional<ArrayRef<Attr *>> OnlyOldAttrs = std::nullopt);
+  void checkConflictingTryAcquireRedecls(const Decl *Old, Decl *New);
+  /// Like checkConflictingTryAcquireRedecls(), for an instantiated declaration
+  /// \p New, also during template argument deduction.
+  void checkInstantiatedTryAcquireRedecls(const Decl *Old, Decl *New);
+
   /// Callback to the parser to parse templated functions when needed.
   typedef void LateTemplateParserCB(void *P, LateParsedTemplate &LPT);
   LateTemplateParserCB *LateTemplateParser;

@@ -486,6 +486,15 @@ example uses.
 argument is not a constant expression, `-Wthread-safety-attributes` warns about
 it and the attribute is ignored.
 
+A redeclaration may only repeat the `TRY_ACQUIRE` and `TRY_ACQUIRE_SHARED`
+attributes of an earlier declaration. `-Wthread-safety-attributes` warns about
+an attribute on a redeclaration that differs from all attributes of the earlier
+declaration in kind, success value, or capabilities, and that attribute is
+ignored. Likewise, it warns about an attribute that contradicts an earlier
+attribute of the same declaration for the same capability, i.e. that has the
+same access mode but a different success value, or a different access mode but
+the same success value, and that attribute is ignored.
+
 Because the analysis doesn't support conditional locking, a capability is
 treated as acquired after the first branch on the return value of a try-acquire
 function.

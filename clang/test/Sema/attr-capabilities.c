@@ -91,3 +91,10 @@ int FuncNonConst6(void) __attribute__((try_acquire_capability(NonConstGlobal++, 
 // Non-binary integer literal in try_acquire_[shared_]capability.
 int FuncNonBinary1(void) __attribute__((try_acquire_capability(2, GUI))); // expected-warning {{'try_acquire_capability' attribute success value 2 is treated as 'true'}}
 int FuncNonBinary2(void) __attribute__((try_acquire_shared_capability(-1, GUI))); // expected-warning {{'try_acquire_shared_capability' attribute success value -1 is treated as 'true'}}
+
+// Conflicting vs matching redeclarations.
+int FuncRedeclConflict1(void) __attribute__((try_acquire_capability(0, GUI))); // expected-note {{previous attribute is here}}
+int FuncRedeclConflict1(void) __attribute__((try_acquire_capability(1, GUI))); // expected-warning {{'try_acquire_capability' attribute on redeclaration conflicts with previous declaration; ignoring the attribute}}
+
+int FuncRedeclMatch(struct Mutex *m) __attribute__((try_acquire_capability(1, m)));
+int FuncRedeclMatch(struct Mutex *p) __attribute__((try_acquire_capability(1, p)));

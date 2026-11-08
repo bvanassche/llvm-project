@@ -68,3 +68,9 @@ void use_try_params() {
   try_nonbinary_param<2>(ifp); // expected-note {{while substituting explicitly-specified template arguments into function template 'try_nonbinary_param'}} \
                                // expected-note {{while substituting deduced template arguments into function template 'try_nonbinary_param' [with N = 2]}}
 }
+
+// Conflict detection after an invalid integer literal capability argument.
+bool trylock_after_invalid_lit(Mutex *m)
+    __attribute__((try_acquire_capability(false, 1))); // expected-warning {{'try_acquire_capability' attribute requires arguments whose type is annotated with 'capability' attribute; type here is 'int'}} expected-note {{previous attribute is here}}
+bool trylock_after_invalid_lit(Mutex *m)
+    __attribute__((try_acquire_capability(true, m))); // expected-warning {{'try_acquire_capability' attribute on redeclaration conflicts with previous declaration; ignoring the attribute}}

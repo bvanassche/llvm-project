@@ -1179,7 +1179,12 @@ remaining arguments specify the capabilities acquired on success (defaulting to
 `this` when omitted on a non-static member function of a capability type). Other
 non-zero values are treated as `true`, and `-Wthread-safety-attributes` warns
 about them. If the first argument is not a constant expression,
-`-Wthread-safety-attributes` warns about it and the attribute is ignored.
+`-Wthread-safety-attributes` warns about it and the attribute is ignored. An
+attribute on a redeclaration must be identical to one of the attributes of the
+earlier declaration, and two attributes of the same declaration for the same
+capability must not have the same access mode but different success values, or
+different access modes but the same success value. If they do,
+`-Wthread-safety-attributes` warns about the later attribute and it is ignored.
   }];
 }
 

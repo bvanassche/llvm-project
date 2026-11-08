@@ -1903,4 +1903,22 @@ int tac_non_binary_val() EXCLUSIVE_TRYLOCK_FUNCTION(2, mu1); // \
 int tac_shared_non_binary_val() SHARED_TRYLOCK_FUNCTION(-1, mu1); // \
   // expected-warning {{'shared_trylock_function' attribute success value -1 is treated as 'true'}}
 
+int tac_redecl_conflict(Mutex *m) EXCLUSIVE_TRYLOCK_FUNCTION(0, m); // \
+  // expected-note {{previous attribute is here}}
+int tac_redecl_conflict(Mutex *p) EXCLUSIVE_TRYLOCK_FUNCTION(1, p); // \
+  // expected-warning {{'exclusive_trylock_function' attribute on redeclaration conflicts with previous declaration; ignoring the attribute}}
+
+int tac_redecl_match(Mutex *m) EXCLUSIVE_TRYLOCK_FUNCTION(1, m);
+int tac_redecl_match(Mutex *p) EXCLUSIVE_TRYLOCK_FUNCTION(true, p);
+
+// Parameters of an enclosing function referenced in a local function pointer's
+// try_acquire attribute are distinct capabilities, not parameters of the
+// function pointer itself.
+void local_fun_ptr_enclosing_params(Mutex &m1, Mutex &m2) {
+  extern int (*local_fp_redecl)() EXCLUSIVE_TRYLOCK_FUNCTION(1, m1); // \
+    // expected-note {{previous attribute is here}}
+  extern int (*local_fp_redecl)() EXCLUSIVE_TRYLOCK_FUNCTION(1, m2); // \
+    // expected-warning {{'exclusive_trylock_function' attribute on redeclaration conflicts with previous declaration; ignoring the attribute}}
+}
+
 } // namespace TryAcquireParsing

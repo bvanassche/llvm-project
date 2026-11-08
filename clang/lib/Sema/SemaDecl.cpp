@@ -3420,6 +3420,9 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
   if (!Old->hasAttrs())
     return;
 
+  if (New->hasAttrs())
+    checkConflictingTryAcquireRedecls(Old, New);
+
   bool foundAny = New->hasAttrs();
 
   // Ensure that any moving of objects within the allocated map is done before
