@@ -617,6 +617,11 @@ When verifying `TRY_ACQUIRE` and `TRY_ACQUIRE_RANGE` function bodies under
   according to its known value range. They are not treated as valid addresses in
   branch conditions, which preserves soundness under
   `-fno-delete-null-pointer-checks`.
+- With `-Wthread-safety-pointer`, returned pointer expressions are checked
+  against the capabilities that the caller holds for every non-null return
+  value, tracing local pointer variables back to their non-null initializers
+  and direct assignments that can reach the `return` statement (modifications
+  through pointers or references are not tracked).
 - A capability that is acquired through a local pointer whose value cannot be
   resolved, e.g. because it has been loaded by inline assembly, is not assumed
   to be the expected capability, even if it might refer to the same object.

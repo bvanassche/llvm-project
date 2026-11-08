@@ -160,6 +160,8 @@ void VarMapBuilder::VisitDeclStmt(const DeclStmt *S) {
       if (T.isTrivialType(VD->getASTContext())) {
         Ctx = VMap->addDefinition(VD, E, Ctx);
         modifiedCtx = true;
+      } else if (T->isReferenceType()) {
+        VMap->recordRefVarInitContext(VD, Ctx);
       }
     }
   }
@@ -323,28 +325,66 @@ void VarMapBuilder::VisitBinaryOperator(const BinaryOperator *BO) {
   if (!BO->isAssignmentOp())
     return;
 
-  // Update the variable map and current context.
+  LocalVariableMap::Context SavedCtx = Ctx;
   if (const DeclRefExpr *DRE = unwrapDirectLValueDRE(BO->getLHS())) {
     const ValueDecl *VDec = DRE->getDecl();
-    if (Ctx.lookup(VDec)) {
+    if (const unsigned *PrevID = Ctx.lookup(VDec)) {
       if (BO->getOpcode() == BO_Assign)
         Ctx = VMap->updateDefinition(VDec, BO->getRHS(), Ctx);
+      else if (BO->getOpcode() == BO_AddAssign ||
+               BO->getOpcode() == BO_SubAssign)
+        Ctx = VMap->addPhi(VDec, {*PrevID}, Ctx);
       else
-        // FIXME -- handle compound assignment operators
         Ctx = VMap->clearDefinition(VDec, Ctx);
       VMap->saveContext(BO, Ctx);
     }
     return;
   }
 
-  if (clearModifiedLocalVars(BO->getLHS()))
+  const DeclRefExpr *UncondDRE = unwrapUnconditionalLValueDRE(BO->getLHS());
+  SmallVector<const DeclRefExpr *, 2> DREs;
+  collectModifiedLValueDREs(BO->getLHS(), DREs);
+  bool Modified = false;
+  for (const DeclRefExpr *DRE : DREs) {
+    const ValueDecl *VDec = DRE->getDecl();
+    const unsigned *PrevID = Ctx.lookup(VDec);
+    if (!PrevID)
+      continue;
+    if (BO->getOpcode() == BO_Assign) {
+      unsigned RHSID = VMap->createDefinition(VDec, BO->getRHS(), SavedCtx);
+      if (UncondDRE &&
+          UncondDRE->getDecl()->getCanonicalDecl() == VDec->getCanonicalDecl())
+        Ctx = VMap->addPhi(VDec, {RHSID}, Ctx);
+      else
+        Ctx = VMap->addPhi(VDec, {*PrevID, RHSID}, Ctx);
+    } else if (BO->getOpcode() == BO_AddAssign ||
+               BO->getOpcode() == BO_SubAssign) {
+      Ctx = VMap->addPhi(VDec, {*PrevID}, Ctx);
+    } else {
+      Ctx = VMap->clearDefinition(VDec, Ctx);
+    }
+    Modified = true;
+  }
+  if (Modified)
     VMap->saveContext(BO, Ctx);
 }
 
 // Invalidate the definitions of local variables that are incremented or
 // decremented.
 void VarMapBuilder::VisitUnaryOperator(const UnaryOperator *UO) {
-  if (UO->isIncrementDecrementOp() && clearModifiedLocalVars(UO->getSubExpr()))
+  if (!UO->isIncrementDecrementOp())
+    return;
+  SmallVector<const DeclRefExpr *, 2> DREs;
+  collectModifiedLValueDREs(UO->getSubExpr(), DREs);
+  bool Modified = false;
+  for (const DeclRefExpr *DRE : DREs) {
+    const ValueDecl *VDec = DRE->getDecl();
+    if (const unsigned *PrevID = Ctx.lookup(VDec)) {
+      Ctx = VMap->addPhi(VDec, {*PrevID}, Ctx);
+      Modified = true;
+    }
+  }
+  if (Modified)
     VMap->saveContext(UO, Ctx);
 }
 
@@ -607,11 +647,14 @@ LocalVariableMap::intersectContexts(Context C1, Context C2) {
     if (!I2) {
       // The variable doesn't exist on second path.
       Result = removeDefinition(Dec, Result);
-    } else if (getCanonicalDefinitionID(P.second) !=
-               getCanonicalDefinitionID(*I2)) {
+      continue;
+    }
+    unsigned Canon1 = getCanonicalDefinitionID(P.second);
+    unsigned Canon2 = getCanonicalDefinitionID(*I2);
+    if (P.second != *I2 && (Canon1 == 0 || Canon1 != Canon2)) {
       // If canonical definitions mismatch the underlying definitions are
-      // different, invalidate.
-      Result = clearDefinition(Dec, Result);
+      // different, record a phi node.
+      Result = addPhi(Dec, {P.second, *I2}, Result);
     } else if (!isClobbered(P.second) && isClobbered(*I2)) {
       // The variable may have been modified through an alias on the second
       // path.
@@ -649,10 +692,18 @@ void LocalVariableMap::intersectBackEdge(Context C1, Context C2) {
 
     // Compare the canonical IDs. This correctly handles chains of references
     // and determines if the variable is truly loop-invariant.
-    if (VDef->CanonicalRef != getCanonicalDefinitionID(*I2))
-      VDef->invalidateRef(); // Mark this variable as undefined
-    else if (isClobbered(*I2))
+    unsigned Canon2 = getCanonicalDefinitionID(*I2);
+    if (VDef->DirectRef != *I2 &&
+        (VDef->CanonicalRef == 0 || VDef->CanonicalRef != Canon2)) {
+      if (VDef->DirectRef != 0 &&
+          !llvm::is_contained(VDef->PhiRefs, VDef->DirectRef))
+        VDef->PhiRefs.push_back(VDef->DirectRef);
+      if (*I2 != 0 && !llvm::is_contained(VDef->PhiRefs, *I2))
+        VDef->PhiRefs.push_back(*I2);
+      VDef->invalidateRef(); // Mark this variable as a phi node
+    } else if (isClobbered(*I2)) {
       VDef->Clobbered = true; // Modified through an alias in the loop
+    }
   }
 }
 
@@ -734,10 +785,18 @@ void LocalVariableMap::traverseCFG(
     CFG *CFGraph, const PostOrderCFGView *SortedGraph,
     std::vector<CFGBlockInfo> &BlockInfo,
     const llvm::SmallPtrSetImpl<const Stmt *> &UnevaluatedStmts,
-    bool RecordModifiedVars) {
+    const NamedDecl *D) {
   PostOrderCFGView::CFGBlockSet VisitedBlocks(CFGraph);
+  const bool RecordModifiedVars = D && hasTrylockAttr(D);
   if (RecordModifiedVars)
     BlockModifiedVars.assign(CFGraph->getNumBlockIDs(), {});
+  if (const auto *FD = dyn_cast_or_null<FunctionDecl>(D)) {
+    Context &EntryCtx =
+        BlockInfo[CFGraph->getEntry().getBlockID()].EntryContext;
+    for (const ParmVarDecl *PVD : FD->parameters())
+      if (PVD->getType().isTrivialType(PVD->getASTContext()))
+        EntryCtx = ContextFactory.add(EntryCtx, PVD, 0);
+  }
 
   for (const auto *CurrBlock : *SortedGraph) {
     unsigned CurrBlockID = CurrBlock->getBlockID();
@@ -3528,8 +3587,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
   if (HasTrylockCall || hasTrylockAttr(D))
     markEscapedLocalVars(AC, EscapedVars);
-  LocalVarMap.traverseCFG(CFGraph, SortedGraph, BlockInfo, UnevaluatedStmts,
-                          /*RecordModifiedVars=*/hasTrylockAttr(D));
+  LocalVarMap.traverseCFG(CFGraph, SortedGraph, BlockInfo, UnevaluatedStmts, D);
   CurrentSortedGraph = SortedGraph;
 
   // Fill in source locations for all CFGBlocks.

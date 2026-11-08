@@ -3739,9 +3739,7 @@ void TrylockBodyVerifier::verifyExits(const FactSet &ExpectedFunctionExitSet,
       Analyzer.CurrentFunction && Analyzer.CurrentFunction->getReturnType()
                                       .getCanonicalType()
                                       ->isPointerType();
-  llvm::MapVector<const ReturnStmt *,
-                  std::pair<std::optional<FactSet>, LocalVarContext>>
-      PtReturnExpectedSets;
+  llvm::MapVector<const ReturnStmt *, PtReturnInfo> PtReturnExpectedSets;
 
   for (CFGBlock::const_pred_iterator PI = ExitBlock->pred_begin(),
                                      PE = ExitBlock->pred_end();
@@ -3818,17 +3816,18 @@ void TrylockBodyVerifier::verifyExits(const FactSet &ExpectedFunctionExitSet,
 
   // Check that the caller holds the capabilities that protect the pointee
   // of a returned pointer for every non-null value that may be returned.
-  for (const auto &[RS, ExpectedAndCtx] : PtReturnExpectedSets) {
-    const auto &[Expected, Ctx] = ExpectedAndCtx;
-    if (!Expected)
+  for (const auto &[RS, Info] : PtReturnExpectedSets) {
+    if (!Info.Expected)
       continue;
-    ThreadSafetyAnalyzer::LocalVarLookupScope Lookup(Analyzer, Ctx);
+    ThreadSafetyAnalyzer::LocalVarLookupScope Lookup(Analyzer, Info.Ctx);
     const AccessKind AK = Analyzer.CurrentFunction->getReturnType()
                                   ->getPointeeType()
                                   .isConstQualified()
                               ? AK_Read
                               : AK_Written;
-    Analyzer.checkPtAccess(*Expected, RS->getRetValue(), AK, POK_ReturnPointer);
+    ReturnedPtrWalk Walk;
+    checkReturnedPointerExpr(RS->getRetValue(), Info.Ctx, Info.Expected, AK,
+                             Walk);
   }
 }
 
@@ -3875,8 +3874,9 @@ void TrylockBodyVerifier::verifyReturn(const ExitContext &Exit,
     std::optional<FactSet> *NonNullExpectedSet = nullptr;
     if (ReturnsPointer && RetVal)
       NonNullExpectedSet =
-          &PtReturnExpectedSets.try_emplace(RS, std::nullopt, EvalCtx)
-               .first->second.first;
+          &PtReturnExpectedSets
+               .try_emplace(RS, PtReturnInfo{std::nullopt, EvalCtx})
+               .first->second.Expected;
     checkTrylockExitOutcome(ExpectedFunctionExitSet, Outcome, DiagLoc,
                             DedupHandler, NonNullExpectedSet, &MaySet);
   }
@@ -3909,4 +3909,164 @@ void TrylockBodyVerifier::verifyEdgeState(const ExitContext &Exit,
   applyScopeExitCleanups(Lockset, PredBlock,
                          /*OnlyAfterReturn=*/false);
   verifyReturn(Exit, Lockset, std::move(State));
+}
+
+/// Return the pointer \p P such that checking the address \p E with
+/// checkPtAccess() checks the pointee of \p P, or null if \p E is not the
+/// address of an object that is accessed through a pointer. E.g. return 'p'
+/// for '&*p', '&p->field', '&(*p).field', '&p[i]', 'p->arr', '&p->arr[0]' and
+/// '*p_arr' if 'p_arr' points to an array. Set \p RefVD if the access is
+/// through a local reference variable, e.g. 'r' in 'int &r = *p; &r'. This
+/// mirrors how checkPtAccess() and checkAccess() look through these
+/// expressions.
+static const Expr *getAccessedPointer(const Expr *E, const VarDecl *&RefVD) {
+  // The pointer whose pointee the lvalue LV designates, as checkAccess()
+  // determines it.
+  auto LValuePointer = [&](auto &Self, const Expr *LV) -> const Expr * {
+    LV = LV->IgnoreImplicit()->IgnoreParenCasts();
+    while (const auto *DRE = dyn_cast<DeclRefExpr>(LV)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()->getCanonicalDecl());
+      if (!VD || !VD->isLocalVarDecl() || !VD->getType()->isReferenceType())
+        break;
+      const Expr *Init = VD->getInit();
+      if (!Init || Init == LV)
+        break;
+      RefVD = VD;
+      LV = Init->IgnoreImplicit()->IgnoreParenCasts();
+    }
+    if (const auto *UO = dyn_cast<UnaryOperator>(LV))
+      return UO->getOpcode() == UO_Deref ? UO->getSubExpr() : nullptr;
+    if (const auto *BO = dyn_cast<BinaryOperator>(LV)) {
+      if (BO->getOpcode() == BO_PtrMemD)
+        return Self(Self, BO->getLHS());
+      if (BO->getOpcode() == BO_PtrMemI)
+        return BO->getLHS();
+      return nullptr;
+    }
+    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(LV)) {
+      const Expr *Base = ASE->getLHS();
+      for (const Expr *B = Base;;) {
+        if (const auto *PE = dyn_cast<ParenExpr>(B)) {
+          B = PE->getSubExpr();
+          continue;
+        }
+        if (const auto *CE = dyn_cast<CastExpr>(B)) {
+          if (CE->getCastKind() == CK_ArrayToPointerDecay)
+            return Self(Self, CE->getSubExpr());
+          B = CE->getSubExpr();
+          continue;
+        }
+        break;
+      }
+      return Base;
+    }
+    if (const auto *ME = dyn_cast<MemberExpr>(LV))
+      return ME->isArrow() ? ME->getBase() : Self(Self, ME->getBase());
+    return nullptr;
+  };
+  while (true) {
+    if (const auto *PE = dyn_cast<ParenExpr>(E)) {
+      E = PE->getSubExpr();
+      continue;
+    }
+    if (const auto *CE = dyn_cast<CastExpr>(E)) {
+      if (CE->getCastKind() == CK_ArrayToPointerDecay)
+        return LValuePointer(LValuePointer, CE->getSubExpr());
+      E = CE->getSubExpr();
+      continue;
+    }
+    break;
+  }
+  if (const auto *UO = dyn_cast<UnaryOperator>(E);
+      UO && UO->getOpcode() == UO_AddrOf)
+    return LValuePointer(LValuePointer, UO->getSubExpr());
+  return nullptr;
+}
+
+void TrylockBodyVerifier::checkReturnedPointerExpr(
+    const Expr *E, LocalVarContext CurCtx,
+    const std::optional<FactSet> &Expected, AccessKind AK,
+    ReturnedPtrWalk &Walk, bool Checked) {
+  // Checking an expression again in the same local variable context would not
+  // find anything new. Stopping there also prevents infinite recursion for
+  // definitions in loops, e.g. 'p = p + 1'. Limit the total number of steps
+  // since every definition may be reached along multiple paths.
+  if (!E || Walk.StepsLeft == 0 ||
+      !Walk.Visited.insert({E, CurCtx.getRootWithoutRetain()}).second)
+    return;
+  --Walk.StepsLeft;
+  const Expr *Stripped = E->IgnoreParenCasts();
+  if (!Checked) {
+    LocalVarLookupScope Scope(Analyzer, CurCtx);
+    Analyzer.checkPtAccess(*Expected, E, AK, POK_ReturnPointer);
+  }
+  // checkPtAccess() checks the pointee of P for '&*P', '&P->field', 'P->arr'
+  // etc. like for 'P'. Trace the definitions of P if it is a local pointer
+  // variable, without checking P itself again.
+  const VarDecl *RefVD = nullptr;
+  if (const Expr *P = getAccessedPointer(E, RefVD)) {
+    // A local reference variable is bound to the object that P points to
+    // where the reference is initialized, e.g. in 'int &r = *p;'. Check the
+    // definitions of P that reach that point rather than the definition of P
+    // in CurCtx.
+    LocalVarContext PtrCtx =
+        RefVD ? Analyzer.LocalVarMap.lookupRefVarInitContext(RefVD, CurCtx)
+              : CurCtx;
+    checkReturnedPointerExpr(P, PtrCtx, Expected, AK, Walk, /*Checked=*/true);
+    return;
+  }
+  if (const auto *BO = dyn_cast<BinaryOperator>(Stripped)) {
+    if (BO->getOpcode() == BO_Comma || BO->getOpcode() == BO_Assign) {
+      checkReturnedPointerExpr(BO->getRHS(), CurCtx, Expected, AK, Walk);
+      return;
+    }
+    if (BO->isAdditiveOp()) {
+      if (BO->getLHS()->getType()->isPointerType())
+        checkReturnedPointerExpr(BO->getLHS(), CurCtx, Expected, AK, Walk);
+      else if (BO->getRHS()->getType()->isPointerType())
+        checkReturnedPointerExpr(BO->getRHS(), CurCtx, Expected, AK, Walk);
+      return;
+    }
+    if (BO->getOpcode() == BO_AddAssign || BO->getOpcode() == BO_SubAssign) {
+      checkReturnedPointerExpr(BO->getLHS(), CurCtx, Expected, AK, Walk);
+      return;
+    }
+  }
+  if (const auto *UO = dyn_cast<UnaryOperator>(Stripped)) {
+    if (UO->isIncrementDecrementOp()) {
+      checkReturnedPointerExpr(UO->getSubExpr(), CurCtx, Expected, AK, Walk);
+      return;
+    }
+  }
+  if (const auto *CO = dyn_cast<ConditionalOperator>(Stripped)) {
+    checkReturnedPointerExpr(CO->getTrueExpr(), CurCtx, Expected, AK, Walk);
+    checkReturnedPointerExpr(CO->getFalseExpr(), CurCtx, Expected, AK, Walk);
+    return;
+  }
+  if (const auto *BCO = dyn_cast<BinaryConditionalOperator>(Stripped)) {
+    checkReturnedPointerExpr(BCO->getCommon(), CurCtx, Expected, AK, Walk);
+    checkReturnedPointerExpr(BCO->getFalseExpr(), CurCtx, Expected, AK, Walk);
+    return;
+  }
+  if (const auto *SE = dyn_cast<StmtExpr>(Stripped)) {
+    if (const CompoundStmt *CS = SE->getSubStmt(); CS && !CS->body_empty())
+      if (const auto *LastE = dyn_cast<Expr>(CS->body_back()))
+        checkReturnedPointerExpr(LastE, CurCtx, Expected, AK, Walk);
+    return;
+  }
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(Stripped)) {
+    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()->getCanonicalDecl());
+        VD && VD->hasLocalStorage() && VD->getType()->isPointerType()) {
+      LocalVarContext LookupCtx = CurCtx;
+      if (const Expr *DefE = Analyzer.LocalVarMap.lookupExpr(VD, LookupCtx)) {
+        checkReturnedPointerExpr(DefE, LookupCtx, Expected, AK, Walk);
+      } else if (Analyzer.isTrackableLocalVar(VD, EscapedVars)) {
+        SmallVector<std::pair<const Expr *, LocalVarContext>, 2> Defs;
+        Analyzer.LocalVarMap.collectDefinitions(VD, CurCtx, *Analyzer.ASTCtx,
+                                                Defs);
+        for (const auto &[DefE, DefCtx] : Defs)
+          checkReturnedPointerExpr(DefE, DefCtx, Expected, AK, Walk);
+      }
+    }
+  }
 }

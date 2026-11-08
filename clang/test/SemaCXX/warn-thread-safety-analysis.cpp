@@ -10006,6 +10006,13 @@ class BodyCheckSuite {
     return err; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
+  int *badMutablePtrFromShared(bool cond) SHARED_TRYLOCK_FUNCTION(true, mu) {
+    if (!cond)
+      return nullptr;
+    mu.ReaderLock();
+    return &a; // expected-warning {{returning pointer to variable 'a' requires holding mutex 'mu' exclusively}}
+  }
+
   // The caller only holds mu if the returned pointer is 1. For any other
   // non-null pointer, the caller may access 'a' without holding mu.
   int *badSentinelRangeReturnsGuardedAddr() // expected-note@+1 {{mutex acquired here}}
@@ -10035,7 +10042,7 @@ class BodyCheckSuite {
       TRY_ACQUIRE_RANGE(1, 1, mu) {
     int *ret = nullptr;
     if (b)
-      ret = &a;
+      ret = &a; // expected-warning {{returning pointer to variable 'a' requires holding mutex 'mu' exclusively}}
     return ret; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
@@ -10043,7 +10050,7 @@ class BodyCheckSuite {
       TRY_ACQUIRE_RANGE(1, 1, mu) {
     int *ret = nullptr;
     if (b)
-      ret = &a;
+      ret = &a; // expected-warning {{returning pointer to variable 'a' requires holding mutex 'mu' exclusively}}
     return ret + 1; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
@@ -10353,6 +10360,263 @@ struct PtrRangeTryAcquireHolder {
     p->guarded = 15; // expected-warning {{writing variable 'guarded' requires holding mutex 'h2->mu' exclusively}} \
                      // expected-note {{found near match 'h1->mu'}}
     h1->mu.Unlock();
+  }
+
+  Mutex mu2;
+  int *ptGuardedPtr PT_GUARDED_BY(mu2);
+
+  int *tryLockReturnPtGuardedViaStmtExpr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *p = ptGuardedPtr; // expected-warning {{returning pointer 'ptGuardedPtr' requires holding mutex 'mu2' exclusively}}
+    if (!p)
+      return nullptr;
+    mu.Lock();
+    return ({
+      int *q = p;
+      q;
+    });
+  }
+
+  int *tryLockReturnPtGuardedTwoHop() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *p = ptGuardedPtr; // expected-warning {{returning pointer 'ptGuardedPtr' requires holding mutex 'mu2' exclusively}}
+    if (!p)
+      return nullptr;
+    mu.Lock();
+    int *q = p;
+    return q;
+  }
+
+  int unguardedVal;
+  int guardedByMu2 GUARDED_BY(mu2);
+
+  int *tryLockOverwrittenGuardedPtrBeforeReturn(bool c)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *p = &unguardedVal;
+    if (c) {
+      mu2.Lock();
+      p = &guardedByMu2;
+      *p = 1;
+      mu2.Unlock();
+      p = &unguardedVal;
+    }
+    if (!mu.TryLock())
+      return nullptr;
+    return p;
+  }
+
+  int *tryLockGuardedPtrInEarlyReturnBranch(bool c1, bool c2)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *p = &unguardedVal;
+    if (c1) {
+      mu2.Lock();
+      p = &guardedByMu2;
+      *p = 1;
+      mu2.Unlock();
+      return nullptr;
+    }
+    if (c2)
+      p = &unguardedVal;
+    if (!mu.TryLock())
+      return nullptr;
+    return p;
+  }
+
+  int *tryLockReassignedParamPtr(int *p) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu2.Lock();
+    p = &guardedByMu2; // expected-warning {{returning pointer to variable 'guardedByMu2' requires holding mutex 'mu2' exclusively}}
+    mu2.Unlock();
+    if (!mu.TryLock())
+      return nullptr;
+    return p;
+  }
+
+  int *tryLockIncrementedLocalPtr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu2.Lock();
+    int *p = &guardedByMu2; // expected-warning {{returning pointer to variable 'guardedByMu2' requires holding mutex 'mu2' exclusively}}
+    mu2.Unlock();
+    ++p;
+    if (!mu.TryLock()) // expected-note {{mutex acquired here}}
+      return nullptr;
+    return p; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  static void overwritePtr(int **pp);
+
+  int *tryLockEscapedLocalPtr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu2.Lock();
+    int *p = &guardedByMu2;
+    mu2.Unlock();
+    overwritePtr(&p);
+    if (!mu.TryLock()) // expected-note {{mutex acquired here}}
+      return nullptr;
+    return p; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  int *tryLockSelfAssignedLocalPtr(bool c) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *p;
+    if (c)
+      p = &guardedByMu2; // expected-warning {{returning pointer to variable 'guardedByMu2' requires holding mutex 'mu2' exclusively}}
+    else
+      p = &unguardedVal;
+    p = p + 1;
+    if (!mu.TryLock()) // expected-note {{mutex acquired here}}
+      return nullptr;
+    return p; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  int *tryLockLocalPtrInLoop(int n) EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *p = &guardedByMu2; // expected-warning {{returning pointer to variable 'guardedByMu2' requires holding mutex 'mu2' exclusively}}
+    for (int i = 0; i < n; i++)
+      p = p + 1;
+    if (!mu.TryLock()) // expected-note {{mutex acquired here}}
+      return nullptr;
+    return p; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  // Each pointer may be derived from the previous one in two ways. Checking
+  // the returned pointer must not take exponential time.
+  int *tryLockPtrDerivationChain(int *p0, bool *c)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+#define DERIVE(n, m) int *p##n = c[n] ? p##m : p##m + 1;
+    DERIVE(1, 0) DERIVE(2, 1) DERIVE(3, 2) DERIVE(4, 3) DERIVE(5, 4)
+    DERIVE(6, 5) DERIVE(7, 6) DERIVE(8, 7) DERIVE(9, 8) DERIVE(10, 9)
+    DERIVE(11, 10) DERIVE(12, 11) DERIVE(13, 12) DERIVE(14, 13) DERIVE(15, 14)
+    DERIVE(16, 15) DERIVE(17, 16) DERIVE(18, 17) DERIVE(19, 18) DERIVE(20, 19)
+    DERIVE(21, 20) DERIVE(22, 21) DERIVE(23, 22) DERIVE(24, 23) DERIVE(25, 24)
+    DERIVE(26, 25) DERIVE(27, 26) DERIVE(28, 27) DERIVE(29, 28) DERIVE(30, 29)
+    DERIVE(31, 30) DERIVE(32, 31) DERIVE(33, 32) DERIVE(34, 33) DERIVE(35, 34)
+    DERIVE(36, 35) DERIVE(37, 36) DERIVE(38, 37) DERIVE(39, 38) DERIVE(40, 39)
+#undef DERIVE
+    if (!mu.TryLock()) // expected-note {{mutex acquired here}}
+      return nullptr;
+    return p40; // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  int *ptGuardedArr PT_GUARDED_BY(mu2);
+
+  // '&*p' and '&p[0]' are checked like 'p', only once.
+  // 'ptGuardedPtr' may be null.
+  int *tryLockReturnAddrOfDeref() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu.Lock(); // expected-note {{mutex acquired here}}
+    return &*ptGuardedPtr; // expected-warning {{returning pointer 'ptGuardedPtr' requires holding mutex 'mu2' exclusively}} \
+                           // expected-warning {{mutex 'mu' is still held at the end of function}}
+  }
+
+  int *tryLockReturnAddrOfSubscript() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu.Lock();
+    return &ptGuardedArr[0]; // expected-warning {{returning pointer 'ptGuardedArr' requires holding mutex 'mu2' exclusively}}
+  }
+
+  struct Inner {
+    int field;
+    int arr[4];
+  };
+  Inner *ptGuardedInner PT_GUARDED_BY(mu2);
+  Inner *ptGuardedInnerByMu PT_GUARDED_BY(mu);
+  int (*ptGuardedArrPtr)[4] PT_GUARDED_BY(mu2);
+
+  // The pointee of the local pointer 'p' is accessed for '&p->field',
+  // '&(*p).field', 'p->arr', '&p->arr[0]', '*p' and '&(*p)[0]' if 'p' points
+  // to an array, and for '&r' if 'r' is bound to '*p'.
+  int *tryLockReturnLocalArrowMemberAddr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    Inner *p = ptGuardedInner; // expected-warning {{returning pointer 'ptGuardedInner' requires holding mutex 'mu2' exclusively}}
+    if (!p || !mu.TryLock())
+      return nullptr;
+    return &p->field;
+  }
+
+  int *tryLockReturnLocalDerefMemberAddr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    Inner *p = ptGuardedInner; // expected-warning {{returning pointer 'ptGuardedInner' requires holding mutex 'mu2' exclusively}}
+    if (!p || !mu.TryLock())
+      return nullptr;
+    return &(*p).field;
+  }
+
+  int *tryLockReturnLocalArrowArrayMember() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    Inner *p = ptGuardedInner; // expected-warning {{returning pointer 'ptGuardedInner' requires holding mutex 'mu2' exclusively}}
+    if (!p || !mu.TryLock())
+      return nullptr;
+    return p->arr;
+  }
+
+  int *tryLockReturnLocalArrowArrayElemAddr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    Inner *p = ptGuardedInner; // expected-warning {{returning pointer 'ptGuardedInner' requires holding mutex 'mu2' exclusively}}
+    if (!p || !mu.TryLock())
+      return nullptr;
+    return &p->arr[0];
+  }
+
+  int *tryLockReturnLocalDerefArrayPtr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int (*p)[4] = ptGuardedArrPtr; // expected-warning {{returning pointer 'ptGuardedArrPtr' requires holding mutex 'mu2' exclusively}}
+    if (!p || !mu.TryLock())
+      return nullptr;
+    return *p;
+  }
+
+  int *tryLockReturnLocalDerefArrayElemAddr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int (*p)[4] = ptGuardedArrPtr; // expected-warning {{returning pointer 'ptGuardedArrPtr' requires holding mutex 'mu2' exclusively}}
+    if (!p || !mu.TryLock())
+      return nullptr;
+    return &(*p)[0];
+  }
+
+  int *tryLockReturnLocalRefAddr() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *p = ptGuardedPtr; // expected-warning {{returning pointer 'ptGuardedPtr' requires holding mutex 'mu2' exclusively}}
+    if (!p || !mu.TryLock())
+      return nullptr;
+    int &r = *p;
+    return &r;
+  }
+
+  // The reference is bound to the object that 'p' points to where it is
+  // initialized, not to the object that 'p' points to at the return.
+  int *tryLockReturnLocalRefAddrReassigned() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *p = ptGuardedPtr; // expected-warning {{returning pointer 'ptGuardedPtr' requires holding mutex 'mu2' exclusively}}
+    if (!p || !mu.TryLock())
+      return nullptr;
+    int &r = *p;
+    p = &unguardedVal;
+    return &r;
+  }
+
+  int *tryLockReturnLocalArrowMemberAddrOk() EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    Inner *p = ptGuardedInnerByMu;
+    if (!p || !mu.TryLock())
+      return nullptr;
+    return &p->field;
+  }
+
+  int *tryLockReassignedPtrInSecondTernaryArm(bool c)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    int *q = &unguardedVal;
+    int *p1 = q;
+    q = &guardedByMu2; // expected-warning {{returning pointer to variable 'guardedByMu2' requires holding mutex 'mu2' exclusively}}
+    int *p2 = q;
+    if (!mu.TryLock())
+      return nullptr;
+    return c ? p1 : p2;
+  }
+
+  int *tryLockCommaLValueOverwritesGuardedPtrOk(int dummy)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu2.Lock();
+    int *p = &guardedByMu2;
+    mu2.Unlock();
+    ((void)dummy, p) = &unguardedVal;
+    if (!p || !mu.TryLock())
+      return nullptr;
+    return p;
+  }
+
+  int *tryLockCondLValueAssignPreservesPriorGuardedPtrBad(bool c)
+      EXCLUSIVE_TRYLOCK_FUNCTION(true, mu) {
+    mu2.Lock();
+    int *p = &guardedByMu2; // expected-warning {{returning pointer to variable 'guardedByMu2' requires holding mutex 'mu2' exclusively}}
+    mu2.Unlock();
+    int *q = &unguardedVal;
+    (c ? p : q) = &unguardedVal;
+    if (!p || !mu.TryLock())
+      return nullptr;
+    return p;
   }
 };
 

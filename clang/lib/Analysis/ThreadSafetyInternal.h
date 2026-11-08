@@ -29,6 +29,7 @@
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ImmutableMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -417,6 +418,9 @@ public:
     // Reference to underlying canonical non-reference VarDefinition.
     unsigned CanonicalRef = 0;
 
+    // Reaching definitions at a join point, loop header, or compound update.
+    SmallVector<unsigned, 2> PhiRefs;
+
     // The map with which Exp should be interpreted.
     Context Ctx;
 
@@ -448,6 +452,9 @@ private:
   // The local variables that the statements of each CFG block declare or
   // modify directly, indexed by block ID. Only computed on request.
   std::vector<llvm::SmallPtrSet<const ValueDecl *, 4>> BlockModifiedVars;
+  // The local variable context at the initialization of each local reference
+  // variable.
+  llvm::DenseMap<const VarDecl *, Context> RefVarInitContexts;
   // Local variables that may be modified other than by a direct assignment,
   // e.g. because their address is taken; see traverseCFG().
   llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
@@ -495,6 +502,8 @@ public:
   /// NULL if the expression is not statically known.  If successful, also
   /// modifies Ctx to hold the context of the return Expr.
   const Expr *lookupExpr(const NamedDecl *D, Context &Ctx) const {
+    if (isa<ParmVarDecl>(D))
+      return nullptr;
     const unsigned *P = Ctx.lookup(D);
     if (!P)
       return nullptr;
@@ -584,9 +593,7 @@ public:
     }
   }
 
-  /// Builds the variable map. If \p RecordModifiedVars is set, also records
-  /// the local variables that each block modifies; see
-  /// getBlockModifiedVars().
+  /// Builds the variable map.
   ///
   /// Since a pointer or reference to a variable recorded by addEscapedVar()
   /// may be stored anywhere, the value of such a variable may change at
@@ -597,7 +604,7 @@ public:
   void traverseCFG(CFG *CFGraph, const PostOrderCFGView *SortedGraph,
                    std::vector<CFGBlockInfo> &BlockInfo,
                    const llvm::SmallPtrSetImpl<const Stmt *> &UnevaluatedStmts,
-                   bool RecordModifiedVars = false);
+                   const NamedDecl *D = nullptr);
 
   /// The local variables that the statements of the reachable block
   /// \p BlockID declare or modify by a direct assignment or increment or
@@ -607,6 +614,44 @@ public:
     assert(BlockID < BlockModifiedVars.size() &&
            "traverseCFG() did not record the modified variables");
     return BlockModifiedVars[BlockID];
+  }
+
+  /// Collect the non-null definitions of \p VD that can reach \p CurCtx,
+  /// together with the local variable context of each definition.
+  void collectDefinitions(
+      const VarDecl *VD, Context CurCtx, ASTContext &ASTCtx,
+      SmallVectorImpl<std::pair<const Expr *, Context>> &Defs) const {
+    const unsigned *StartID = CurCtx.lookup(VD);
+    if (!StartID || *StartID == 0)
+      return;
+    llvm::SmallDenseSet<unsigned, 8> Visited;
+    llvm::SmallPtrSet<const Expr *, 4> SeenExprs;
+    SmallVector<unsigned, 8> Worklist = {*StartID};
+    while (!Worklist.empty()) {
+      unsigned ID = Worklist.pop_back_val();
+      if (ID == 0 || !Visited.insert(ID).second)
+        continue;
+      const VarDefinition &VDef = VarDefinitions[ID];
+      if (VDef.Exp) {
+        if (!VDef.Exp->IgnoreParenCasts()->isNullPointerConstant(
+                ASTCtx, Expr::NPC_ValueDependentIsNull) &&
+            SeenExprs.insert(VDef.Exp).second)
+          Defs.emplace_back(VDef.Exp, VDef.Ctx);
+        continue;
+      }
+      if (VDef.DirectRef)
+        Worklist.push_back(VDef.DirectRef);
+      for (unsigned PhiID : VDef.PhiRefs)
+        if (PhiID)
+          Worklist.push_back(PhiID);
+    }
+  }
+
+  /// Return the local variable context at the initialization of the local
+  /// reference variable \p VD, or \p Fallback if not recorded.
+  Context lookupRefVarInitContext(const VarDecl *VD, Context Fallback) const {
+    auto It = RefVarInitContexts.find(cast<VarDecl>(VD->getCanonicalDecl()));
+    return It != RefVarInitContexts.end() ? It->second : Fallback;
   }
 
 protected:
@@ -625,6 +670,30 @@ protected:
   // Save the current context for later replay
   void saveContext(const Stmt *S, Context C) {
     SavedContexts.push_back(std::make_pair(S, C));
+  }
+
+  void recordRefVarInitContext(const VarDecl *VD, Context C) {
+    RefVarInitContexts.try_emplace(cast<VarDecl>(VD->getCanonicalDecl()), C);
+  }
+
+  unsigned createDefinition(const NamedDecl *D, const Expr *Exp, Context Ctx) {
+    unsigned NewID = VarDefinitions.size();
+    VarDefinitions.push_back(VarDefinition(D, Exp, Ctx));
+    return NewID;
+  }
+
+  Context addPhi(const NamedDecl *D, ArrayRef<unsigned> Refs, Context Ctx) {
+    if (!Ctx.contains(D))
+      return Ctx;
+    VarDefinition Phi(D, 0, 0, Ctx);
+    for (unsigned Ref : Refs)
+      if (Ref != 0 && !llvm::is_contained(Phi.PhiRefs, Ref))
+        Phi.PhiRefs.push_back(Ref);
+    if (Phi.PhiRefs.empty())
+      return clearDefinition(D, Ctx);
+    unsigned NewID = VarDefinitions.size();
+    VarDefinitions.push_back(std::move(Phi));
+    return ContextFactory.add(ContextFactory.remove(Ctx, D), D, NewID);
   }
 
   // Adds a new definition to the given context, and returns a new context.
@@ -1800,6 +1869,14 @@ public:
                    const CFGBlockInfo &Final);
 
 private:
+  /// A return statement that returns a pointer, the capabilities that the
+  /// caller holds for every non-null return value, and the local variable
+  /// context of the return statement.
+  struct PtReturnInfo {
+    std::optional<FactSet> Expected;
+    LocalVarContext Ctx;
+  };
+
   /// A predecessor of the exit block and what the verification of the lock
   /// state at that exit needs.
   struct ExitContext {
@@ -1812,9 +1889,7 @@ private:
     ThreadSafetyHandler &DedupHandler;
     const FactSet &ExpectedFunctionExitSet;
     bool ReturnsPointer;
-    llvm::MapVector<const ReturnStmt *,
-                    std::pair<std::optional<FactSet>, LocalVarContext>>
-        &PtReturnExpectedSets;
+    llvm::MapVector<const ReturnStmt *, PtReturnInfo> &PtReturnExpectedSets;
   };
 
   void getAcquiredTrylockCaps(const AcquiredTrylockKey &Key, CapExprSet &Caps);
@@ -1915,6 +1990,25 @@ private:
   /// and the value state \p State on an edge into Exit.PredBlock.
   void verifyEdgeState(const ExitContext &Exit, FactSet Lockset,
                        TrylockValueState State);
+  /// The state of a walk over the expressions that a returned pointer may
+  /// originate from.
+  struct ReturnedPtrWalk {
+    /// The maximum number of expressions that are checked per return
+    /// statement.
+    static constexpr unsigned MaxSteps = 256;
+    /// The expressions that have been checked and the roots of the local
+    /// variable contexts in which they have been checked.
+    llvm::DenseSet<std::pair<const Expr *, const void *>> Visited;
+    unsigned StepsLeft = MaxSteps;
+  };
+  /// Check that \p Expected, the capabilities that the caller holds for
+  /// every non-null return value, protect the pointee of the returned
+  /// pointer \p E. If \p Checked is set, \p E itself has already been
+  /// checked and only the expressions that it originates from are checked.
+  void checkReturnedPointerExpr(const Expr *E, LocalVarContext CurCtx,
+                                const std::optional<FactSet> &Expected,
+                                AccessKind AK, ReturnedPtrWalk &Walk,
+                                bool Checked = false);
 
   ThreadSafetyAnalyzer &Analyzer;
   CFG *CFGraph;
