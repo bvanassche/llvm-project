@@ -468,15 +468,23 @@ elision). Acquire-type attributes on other member functions are treated as
 applying to that set of associated capabilities, while `RELEASE` implies that
 a function releases all associated capabilities in whatever mode they're held.
 
-### TRY_ACQUIRE(\<bool>, ...), TRY_ACQUIRE_SHARED(\<bool>, ...)
+### TRY_ACQUIRE(\<success>, ...), TRY_ACQUIRE_SHARED(\<success>, ...)
 
 *Previously:* `EXCLUSIVE_TRYLOCK_FUNCTION`, `SHARED_TRYLOCK_FUNCTION`
 
-These are attributes on a function or method that tries to acquire the given
-capability, and returns a boolean value indicating success or failure.
-The first argument must be `true` or `false`, to specify which return value
-indicates success, and the remaining arguments are interpreted in the same way
-as `ACQUIRE`. See {ref}`mutexheader`, below, for example uses.
+These are attributes on a function, method, function pointer, or function
+reference that tries to acquire the given capability, and returns a boolean,
+integer, floating-point, complex, enumeration, pointer, or pointer-to-member
+value indicating success or failure. The first argument must be a boolean or
+integer constant expression specifying whether a non-zero return value (`true`
+or `1`) or zero (`false` or `0`) indicates success, and the remaining arguments
+are interpreted in the same way as `ACQUIRE`. See {ref}`mutexheader`, below, for
+example uses.
+
+`-Wthread-safety-attributes` warns about a first argument other than `true`,
+`false`, `1` or `0`; any other non-zero value is treated as `true`. If the first
+argument is not a constant expression, `-Wthread-safety-attributes` warns about
+it and the attribute is ignored.
 
 Because the analysis doesn't support conditional locking, a capability is
 treated as acquired after the first branch on the return value of a try-acquire

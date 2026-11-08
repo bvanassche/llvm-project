@@ -835,6 +835,19 @@ int etf_function_bad_2() EXCLUSIVE_TRYLOCK_FUNCTION("mu"); // \
 int etf_function_bad_3() EXCLUSIVE_TRYLOCK_FUNCTION(muDoublePointer); // \
   // expected-error {{'exclusive_trylock_function' attribute requires parameter 1 to be int or bool}}
 
+bool etf_nonconst;
+int etf_function_bad_nonconst() EXCLUSIVE_TRYLOCK_FUNCTION(etf_nonconst, mu1); // \
+  // expected-warning {{'exclusive_trylock_function' attribute success value is not a constant expression; ignoring the attribute}}
+
+// Evaluating the success value must neither instantiate nor odr-use functions
+// that are not constexpr.
+template <typename T> bool etf_nonconstexpr_template() { return T::nonexistent; }
+int etf_function_nonconstexpr_template() EXCLUSIVE_TRYLOCK_FUNCTION(etf_nonconstexpr_template<int>(), mu1); // \
+  // expected-warning {{'exclusive_trylock_function' attribute success value is not a constant expression; ignoring the attribute}}
+static bool etf_undefined_helper();
+int etf_function_undefined_helper() EXCLUSIVE_TRYLOCK_FUNCTION(etf_undefined_helper(), mu1); // \
+  // expected-warning {{'exclusive_trylock_function' attribute success value is not a constant expression; ignoring the attribute}}
+
 int etf_function_bad_4() EXCLUSIVE_TRYLOCK_FUNCTION(1, "mu"); // \
   // expected-warning {{ignoring 'exclusive_trylock_function' attribute because its argument is invalid}}
 int etf_function_bad_5() EXCLUSIVE_TRYLOCK_FUNCTION(1, muDoublePointer); // \
@@ -1858,3 +1871,36 @@ DependentFPFields<GoodLockFn> dependent_fp_fields_ok;
 DependentFPFields<int> dependent_fp_fields_bad; // expected-note {{in instantiation of template class 'FunctionPointers::DependentFPFields<int>' requested here}}
 
 }  // namespace FunctionPointers
+
+//-----------------------------------------//
+//  TryAcquireCapability
+//-----------------------------------------//
+
+namespace TryAcquireParsing {
+
+#if __cplusplus >= 201103
+int side_effect_fn();
+int etf_side_effect_comma() EXCLUSIVE_TRYLOCK_FUNCTION((side_effect_fn(), 1), mu1); // \
+  // expected-warning {{'exclusive_trylock_function' attribute success value is not a constant expression; ignoring the attribute}}
+
+template <int... Bs>
+int tac_pack_success() EXCLUSIVE_TRYLOCK_FUNCTION(Bs..., mu1); // \
+  // expected-error {{'exclusive_trylock_function' attribute requires parameter 1 to be int or bool}}
+
+// A scoped enumerator is not an integer, so it is not a valid success value.
+enum class TacScopedEnum { A, B };
+int tac_scoped_enum_success() EXCLUSIVE_TRYLOCK_FUNCTION(TacScopedEnum::B, mu1); // \
+  // expected-error {{'exclusive_trylock_function' attribute requires parameter 1 to be int or bool}}
+
+#if __cplusplus >= 201402L
+template <typename T> constexpr T kZeroTmpl = 0;
+bool tac_var_tmpl() EXCLUSIVE_TRYLOCK_FUNCTION(!kZeroTmpl<int>, mu1);
+#endif
+#endif
+
+int tac_non_binary_val() EXCLUSIVE_TRYLOCK_FUNCTION(2, mu1); // \
+  // expected-warning {{'exclusive_trylock_function' attribute success value 2 is treated as 'true'}}
+int tac_shared_non_binary_val() SHARED_TRYLOCK_FUNCTION(-1, mu1); // \
+  // expected-warning {{'shared_trylock_function' attribute success value -1 is treated as 'true'}}
+
+} // namespace TryAcquireParsing

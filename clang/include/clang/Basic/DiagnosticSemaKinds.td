@@ -4390,6 +4390,10 @@ def warn_thread_attribute_decl_not_lockable : Warning<
 def warn_thread_attribute_decl_not_pointer : Warning<
   "%0 only applies to pointer types; type here is %1">,
   InGroup<ThreadSafetyAttributes>, DefaultIgnore;
+def warn_thread_attribute_success_value_not_constant : Warning<
+  "%0 attribute success value is not a constant expression; ignoring "
+  "the attribute">,
+  InGroup<ThreadSafetyAttributes>, DefaultIgnore;
 def warn_thread_attribute_not_on_scoped_lockable_param : Warning<
   "%0 attribute applies to function parameters only if their type is a "
   "function pointer or a reference to a 'scoped_lockable'-annotated type">,
@@ -4405,6 +4409,9 @@ def err_attribute_argument_out_of_bounds_extra_info : Error<
   "%plural{0:no parameters to index into|"
   "1:can only be 1, since there is one parameter|"
   ":must be between 1 and %2}2">;
+def warn_thread_attribute_trylock_non_binary_value : Warning<
+  "%0 attribute success value %1 is treated as 'true'">,
+  InGroup<ThreadSafetyAttributes>, DefaultIgnore;
 
 // Thread Safety Analysis
 def warn_unlock_but_no_lock : Warning<"releasing %0 '%1' that was not held">,

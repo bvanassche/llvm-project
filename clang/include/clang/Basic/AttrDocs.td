@@ -1168,10 +1168,18 @@ def TryAcquireCapabilityDocs : Documentation {
   let Category = DocCatFunction;
   let Heading = "try_acquire_capability, try_acquire_shared_capability";
   let Content = [{
-Marks a function that attempts to acquire a capability. This function may fail to
-actually acquire the capability; they accept a Boolean value determining
-whether acquiring the capability means success (true), or failing to acquire
-the capability means success (false).
+Marks a function, function pointer, or function reference that attempts to
+acquire a capability and returns a boolean, integer, floating-point, complex,
+enumeration, pointer, or pointer-to-member value indicating whether acquisition
+succeeded (the analysis ignores these attributes on functions with other return
+types, e.g. `void`). The first argument must be a boolean or integer constant
+expression specifying whether a non-zero return value (`true` or `1`) or zero
+(`false` or `0`) indicates that the capability was successfully acquired; any
+remaining arguments specify the capabilities acquired on success (defaulting to
+`this` when omitted on a non-static member function of a capability type). Other
+non-zero values are treated as `true`, and `-Wthread-safety-attributes` warns
+about them. If the first argument is not a constant expression,
+`-Wthread-safety-attributes` warns about it and the attribute is ignored.
   }];
 }
 

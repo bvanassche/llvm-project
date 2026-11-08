@@ -19,12 +19,16 @@
 #define LLVM_CLANG_ANALYSIS_ANALYSES_THREADSAFETY_H
 
 #include "clang/Basic/SourceLocation.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include <optional>
 
 namespace clang {
 
+class ASTContext;
 class AnalysisDeclContext;
+class Expr;
 class FunctionDecl;
 class NamedDecl;
 
@@ -318,6 +322,13 @@ void threadSafetyCleanup(BeforeSet *Cache);
 /// Helper function that returns a LockKind required for the given level
 /// of access.
 LockKind getLockKindFromAccessKind(AccessKind AK);
+
+/// Evaluates \p E as an integer constant of integral or enumeration type.
+/// Returns std::nullopt if \p E is null, value- or type-dependent, or not an
+/// integer constant expression. Used by Sema to check the success values of
+/// trylock attributes and by the analysis to evaluate them.
+std::optional<llvm::APSInt>
+getIntegralOrEnumConstantExpr(const Expr *E, const ASTContext &Ctx);
 
 } // namespace threadSafety
 } // namespace clang

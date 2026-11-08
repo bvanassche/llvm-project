@@ -1,4 +1,5 @@
 // RUN: %clang_cc1 -fsyntax-only -Wthread-safety -verify %s
+// RUN: not %clang_cc1 -fsyntax-only %s 2>&1 | FileCheck --check-prefix=DEFAULT %s
 
 typedef int __attribute__((capability("role"))) ThreadRole;
 struct __attribute__((shared_capability("mutex"))) Mutex {};
@@ -59,6 +60,11 @@ void Func22(void) __attribute__((try_acquire_shared_capability(1))) {} // expect
 
 void Func23(void) __attribute__((try_acquire_capability(1, GUI))) {}
 void Func24(void) __attribute__((try_acquire_shared_capability(1, GUI))) {}
+void Func23Void(void) __attribute__((try_acquire_capability(1, GUI)));
+float Func24Float(void) __attribute__((try_acquire_shared_capability(1, GUI)));
+struct NotACapability Func23Struct(void) __attribute__((try_acquire_capability(1, GUI)));
+enum IncompleteEnum;
+enum IncompleteEnum Func23IncEnum(void) __attribute__((try_acquire_capability(1, GUI)));
 
 void Func25(void) __attribute__((try_acquire_capability())) {} // expected-error {{'try_acquire_capability' attribute takes at least 1 argument}}
 void Func26(void) __attribute__((try_acquire_shared_capability())) {} // expected-error {{'try_acquire_shared_capability' attribute takes at least 1 argument}}
@@ -71,3 +77,17 @@ void Func30(void) __attribute__((requires_capability((Worker || Worker) && !GUI)
 
 int AlsoNotACapability;
 void Func31(void) __attribute__((requires_capability(GUI && AlsoNotACapability))); // expected-warning {{'requires_capability' attribute requires arguments whose type is annotated with 'capability' attribute; type here is 'int'}}
+
+// Non-constant and UB constant expressions in C. The thread safety attribute
+// warnings, including those about success values, are disabled by default.
+// DEFAULT-NOT: warning:
+int NonConstGlobal = 1;
+const int ConstVarInC = 1;
+int FuncNonConst1(void) __attribute__((try_acquire_capability(NonConstGlobal, GUI))); // expected-warning {{'try_acquire_capability' attribute success value is not a constant expression; ignoring the attribute}}
+int FuncNonConst2(void) __attribute__((try_acquire_capability(ConstVarInC, GUI))); // expected-warning {{'try_acquire_capability' attribute success value is not a constant expression; ignoring the attribute}}
+int FuncNonConst4(void) __attribute__((try_acquire_capability(2147483647 + 1, GUI))); // expected-warning {{'try_acquire_capability' attribute success value is not a constant expression; ignoring the attribute}}
+int FuncNonConst6(void) __attribute__((try_acquire_capability(NonConstGlobal++, GUI))); // expected-warning {{'try_acquire_capability' attribute success value is not a constant expression; ignoring the attribute}}
+
+// Non-binary integer literal in try_acquire_[shared_]capability.
+int FuncNonBinary1(void) __attribute__((try_acquire_capability(2, GUI))); // expected-warning {{'try_acquire_capability' attribute success value 2 is treated as 'true'}}
+int FuncNonBinary2(void) __attribute__((try_acquire_shared_capability(-1, GUI))); // expected-warning {{'try_acquire_shared_capability' attribute success value -1 is treated as 'true'}}

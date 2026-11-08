@@ -63,6 +63,16 @@ void testEmptyVariadicCapabilities(EmptyVariadicCapabilities &h) {
 
 namespace TryAcquireTemplateTests {
 
+class __attribute__((capability("mutex"))) CapMutex {
+public:
+  void Lock() __attribute__((acquire_capability()));
+  void ReaderLock() __attribute__((acquire_shared_capability()));
+  void Unlock() __attribute__((release_capability()));
+  void ReaderUnlock() __attribute__((release_shared_capability()));
+  bool TryLock() __attribute__((try_acquire_capability(true)));
+  bool ReaderTryLock() __attribute__((try_acquire_shared_capability(true)));
+};
+
 struct VariadicHelper {
   template <typename... Mus>
   bool lockAllBool(Mus &...mus)

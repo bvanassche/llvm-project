@@ -25,6 +25,7 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/Type.h"
+#include "clang/Analysis/Analyses/ThreadSafety.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/Cuda.h"
 #include "clang/Basic/DarwinSDKInfo.h"
@@ -37,6 +38,7 @@
 #include "clang/Sema/Attr.h"
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/DelayedDiagnostic.h"
+#include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/ParsedAttr.h"
@@ -62,6 +64,7 @@
 #include "clang/Sema/SemaSwift.h"
 #include "clang/Sema/SemaWasm.h"
 #include "clang/Sema/SemaX86.h"
+#include "clang/Sema/TemplateDeduction.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
@@ -167,9 +170,29 @@ bool Sema::checkStringLiteralArgumentAttr(const ParsedAttr &AL, unsigned ArgNum,
 }
 
 /// Check if the passed-in expression is of type int or bool.
-static bool isIntOrBool(Expr *Exp) {
+static bool isIntOrBool(const Expr *Exp) {
+  if (Exp->isTypeDependent())
+    return true;
   QualType QT = Exp->getType();
   return QT->isBooleanType() || QT->isIntegerType();
+}
+
+/// Attribute arguments are parsed in an unevaluated context. Hence, constexpr
+/// functions and variable template specializations referenced by a thread
+/// safety attribute argument that must be a constant have not been
+/// instantiated yet. Mark the declarations referenced by the potentially
+/// evaluated subexpressions of the argument such that it can be evaluated. Do
+/// this in a PotentiallyEvaluatedIfUsed context, in which these declarations
+/// are only formally odr-used: constexpr functions and variables that are
+/// needed for constant evaluation are instantiated, but other function
+/// templates are not instantiated, no 'used but not defined' diagnostics are
+/// triggered and lambdas and blocks do not capture local variables.
+static void markThreadSafetyConstantArgReferenced(Sema &S, Expr *Arg) {
+  if (Arg->isTypeDependent() || Arg->isValueDependent())
+    return;
+  EnterExpressionEvaluationContext Context(
+      S, Sema::ExpressionEvaluationContext::PotentiallyEvaluatedIfUsed);
+  S.MarkDeclarationsReferencedInExpr(Arg, /*SkipLocalVariables=*/true);
 }
 
 // Check to see if the type is a smart pointer of some kind.  We assume
@@ -489,6 +512,35 @@ static bool checkThreadSafetyAttrSubject(Sema &S, Decl *D, const ParsedAttr &AL,
   return checkThreadSafetyValueDeclIsFunPtr(S, VD, AL);
 }
 
+/// Check the success value of a try_acquire_capability or
+/// try_acquire_shared_capability attribute. The return type of the function
+/// is not checked because these attributes have always been accepted on
+/// functions with any return type.
+static bool checkTryAcquireCapabilitySuccessValue(Sema &S,
+                                                  const AttributeCommonInfo &AL,
+                                                  Expr *Arg) {
+  if (!Arg)
+    return false;
+  if (!isIntOrBool(Arg)) {
+    S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
+        << AL << 1 << AANT_ArgumentIntOrBool << Arg->getSourceRange();
+    return false;
+  }
+  if (Arg->isTypeDependent() || Arg->isValueDependent())
+    return true;
+
+  markThreadSafetyConstantArgReferenced(S, Arg);
+  if (auto Val = threadSafety::getIntegralOrEnumConstantExpr(Arg, S.Context)) {
+    if (!Arg->getType()->isBooleanType() && *Val != 0 && *Val != 1)
+      S.Diag(AL.getLoc(), diag::warn_thread_attribute_trylock_non_binary_value)
+          << AL << toString(*Val, 10) << Arg->getSourceRange();
+    return true;
+  }
+  S.Diag(AL.getLoc(), diag::warn_thread_attribute_success_value_not_constant)
+      << AL << Arg->getSourceRange();
+  return false;
+}
+
 /// Whether \p D is a constructor of a scoped_lockable class. An
 /// acquire_capability attribute without arguments on such a constructor makes
 /// the analysis track the scoped object without underlying capabilities. Like
@@ -509,6 +561,51 @@ static bool hasEmptyExpandedCapPack(const Attr *A, const Attr *TmplAttr) {
   const auto *TmplA = dyn_cast_or_null<AttrT>(TmplAttr);
   return InstA && TmplA && TmplA->args_size() != 0 && InstA->args_size() == 0;
 }
+
+namespace {
+/// During template argument deduction, check trylock attributes, whose checks
+/// may report errors, in a nested trap: an invalid attribute is dropped
+/// without a substitution failure and without an error. Since the declarations
+/// created during deduction are those of the specialization, the warnings of
+/// the nested trap are not discarded but added to the suppressed diagnostics
+/// of the enclosing deduction, which are reported if the specialization is
+/// used. The parameters of a function template may be substituted more than
+/// once during deduction, e.g. with the explicitly specified template
+/// arguments first, hence each diagnostic is added once.
+class TrylockAttrCheckTrap {
+  sema::TemplateDeductionInfo *OuterInfo = nullptr;
+  std::optional<sema::TemplateDeductionInfo> LocalInfo;
+  std::optional<Sema::SFINAETrap> Trap;
+
+public:
+  TrylockAttrCheckTrap(Sema &S, bool Enable) {
+    Sema::SFINAETrap *Outer = S.getSFINAEContext();
+    if (!Enable || !Outer)
+      return;
+    OuterInfo = Outer->getDeductionInfo();
+    LocalInfo.emplace(SourceLocation());
+    Trap.emplace(S, *LocalInfo);
+  }
+  TrylockAttrCheckTrap(const TrylockAttrCheckTrap &) = delete;
+  TrylockAttrCheckTrap &operator=(const TrylockAttrCheckTrap &) = delete;
+
+  ~TrylockAttrCheckTrap() {
+    Trap.reset();
+    if (!OuterInfo || !LocalInfo || LocalInfo->hasSFINAEDiagnostic())
+      return;
+    for (const PartialDiagnosticAt &PD :
+         llvm::make_range(LocalInfo->diag_begin(), LocalInfo->diag_end())) {
+      if (llvm::none_of(
+              llvm::make_range(OuterInfo->diag_begin(), OuterInfo->diag_end()),
+              [&](const PartialDiagnosticAt &Prev) {
+                return Prev.first == PD.first &&
+                       Prev.second.getDiagID() == PD.second.getDiagID();
+              }))
+        OuterInfo->addSuppressedDiagnostic(PD.first, PD.second);
+    }
+  }
+};
+} // namespace
 
 bool Sema::checkInstantiatedThreadSafetyAttrs(const Decl *D, Attr *A,
                                               const Attr *TmplAttr) {
@@ -537,6 +634,16 @@ bool Sema::checkInstantiatedThreadSafetyAttrs(const Decl *D, Attr *A,
        hasEmptyExpandedCapPack<LocksExcludedAttr>(A, TmplAttr)) &&
       !isScopedLockableConstructor(D))
     return false;
+
+  // An invalid trylock attribute must not make template argument deduction
+  // fail, since annotations must not affect overload resolution.
+  TrylockAttrCheckTrap Trap(*this, isa<TryAcquireCapabilityAttr>(A));
+
+  if (const auto *TAC = dyn_cast<TryAcquireCapabilityAttr>(A)) {
+    if (!checkTryAcquireCapabilitySuccessValue(*this, *TAC,
+                                               TAC->getSuccessValue()))
+      return false;
+  }
 
   if (const auto *VD = dyn_cast<ValueDecl>(D)) {
     // Parameters of template functions need to be re-checked during
@@ -714,11 +821,8 @@ static bool checkTryLockFunAttrCommon(Sema &S, Decl *D, const ParsedAttr &AL,
   if (!AL.checkAtLeastNumArgs(S, 1))
     return false;
 
-  if (!isIntOrBool(AL.getArgAsExpr(0))) {
-    S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
-        << AL << 1 << AANT_ArgumentIntOrBool;
+  if (!checkTryAcquireCapabilitySuccessValue(S, AL, AL.getArgAsExpr(0)))
     return false;
-  }
 
   // check that all arguments are lockable objects
   checkAttrArgsAreCapabilityObjs(S, D, AL, Args, 1);

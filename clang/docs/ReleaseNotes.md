@@ -515,6 +515,17 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   in these operands are no longer diagnosed, and assignments in them no longer
   affect the analysis.
 
+- The success value of `try_acquire_capability` and
+  `try_acquire_shared_capability` may now be any integer or boolean constant
+  expression, including a call of a `constexpr` function, with any non-zero
+  value meaning `true` and zero meaning `false`. The new
+  `-Wthread-safety-attributes` warnings (enabled by `-Wthread-safety`) diagnose
+  success values other than `true`, `false`, `1` and `0`, and success values
+  that are not constant expressions. The analysis now ignores attributes whose
+  success value is not a constant expression instead of treating the success
+  value as `false`. A type-dependent success value such as `T::value` is now
+  accepted and checked when the template is instantiated.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed a false-positive `-Wimplicit-fallthrough` warning when

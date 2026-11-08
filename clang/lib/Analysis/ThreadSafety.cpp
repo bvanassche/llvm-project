@@ -16,6 +16,7 @@
 
 #include "clang/Analysis/Analyses/ThreadSafety.h"
 #include "ThreadSafetyInternal.h"
+#include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -1173,6 +1174,29 @@ void ThreadSafetyAnalyzer::getMutexIDs(CapExprSet &Mtxs, AttrType *Attr,
   }
 }
 
+std::optional<llvm::APSInt>
+threadSafety::getIntegralOrEnumConstantExpr(const Expr *E,
+                                            const ASTContext &Ctx) {
+  if (!E || E->isValueDependent() || E->isTypeDependent() ||
+      !E->getType()->isIntegralOrEnumerationType())
+    return std::nullopt;
+  if (!Ctx.getLangOpts().CPlusPlus11 && !E->isIntegerConstantExpr(Ctx))
+    return std::nullopt;
+  // Attribute arguments are parsed in an unevaluated context without an
+  // enclosing ExprWithCleanups, which makes isCXX11ConstantExpr() reject
+  // temporaries with constexpr destructors. Evaluate as an integer constant
+  // while rejecting any notes or UB, matching
+  // Sema::VerifyIntegerConstantExpression().
+  Expr::EvalResult EvalResult;
+  SmallVector<PartialDiagnosticAt, 4> Notes;
+  EvalResult.Diag = &Notes;
+  if (E->EvaluateAsInt(EvalResult, Ctx, Expr::SE_NoSideEffects,
+                       /*InConstantContext=*/true) &&
+      !EvalResult.HasUndefinedBehavior && Notes.empty())
+    return EvalResult.Val.getInt();
+  return std::nullopt;
+}
+
 /// Extract the list of mutexIDs from a trylock attribute.  If the
 /// trylock applies to the given edge, then push them onto Mtxs, discarding
 /// any duplicates.
@@ -1182,12 +1206,12 @@ void ThreadSafetyAnalyzer::getMutexIDs(CapExprSet &Mtxs, AttrType *Attr,
                                        const CFGBlock *PredBlock,
                                        const CFGBlock *CurrBlock,
                                        Expr *BrE, bool Neg) {
-  // Find out which branch has the lock
-  bool branch = false;
-  if (const auto *BLE = dyn_cast_or_null<CXXBoolLiteralExpr>(BrE))
-    branch = BLE->getValue();
-  else if (const auto *ILE = dyn_cast_or_null<IntegerLiteral>(BrE))
-    branch = ILE->getValue().getBoolValue();
+  // Find out which branch has the lock. Ignore the attribute if its success
+  // value cannot be evaluated. Sema warns about such attributes.
+  auto SuccessVal = getIntegralOrEnumConstantExpr(BrE, *ASTCtx);
+  if (!SuccessVal)
+    return;
+  bool branch = SuccessVal->getBoolValue();
 
   int branchnum = branch ? 0 : 1;
   if (Neg)

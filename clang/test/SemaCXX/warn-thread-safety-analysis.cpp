@@ -2225,6 +2225,50 @@ struct TestTryLock {
 
 } // end namespace TrylockTest
 
+namespace TrylockConstantSuccessValue {
+
+enum { kSuccess = 1 };
+enum { kFailure = 0 };
+constexpr bool kTrue = true;
+template <typename T> constexpr T one() { return T(1); }
+
+class Foo {
+  Mutex mu;
+  int a GUARDED_BY(mu);
+
+  bool tryLockEnum() EXCLUSIVE_TRYLOCK_FUNCTION(kSuccess, mu);
+  bool tryLockFalseEnum() EXCLUSIVE_TRYLOCK_FUNCTION(kFailure, mu);
+  bool tryLockConstexpr() EXCLUSIVE_TRYLOCK_FUNCTION(kTrue, mu);
+  bool tryLockParen() EXCLUSIVE_TRYLOCK_FUNCTION((true), mu);
+  // The function template must be instantiated to evaluate the success value.
+  bool tryLockTemplate() EXCLUSIVE_TRYLOCK_FUNCTION(one<bool>(), mu);
+
+  void test() {
+    if (!tryLockFalseEnum()) {
+      a = 0;
+      mu.Unlock();
+    }
+    if (tryLockTemplate()) {
+      a = 4;
+      mu.Unlock();
+    }
+    if (tryLockEnum()) {
+      a = 1;
+      mu.Unlock();
+    }
+    if (tryLockConstexpr()) {
+      a = 2;
+      mu.Unlock();
+    }
+    if (tryLockParen()) {
+      a = 3;
+      mu.Unlock();
+    }
+  }
+};
+
+} // end namespace TrylockConstantSuccessValue
+
 
 namespace TestTemplateAttributeInstantiation {
 
