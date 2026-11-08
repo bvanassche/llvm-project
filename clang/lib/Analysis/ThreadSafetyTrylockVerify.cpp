@@ -193,25 +193,6 @@ bool threadSafety::isDiscardedValue(
   return true;
 }
 
-/// Whether the body of the try-acquire function that is being analyzed
-/// contains a construct that its verification does not support yet, i.e. a
-/// cycle in the CFG \p SortedGraph.
-bool ThreadSafetyAnalyzer::hasUnsupportedTrylockBody(
-    AnalysisDeclContext &AC, const PostOrderCFGView *SortedGraph) {
-  // The position of each reachable block in reverse postorder. An edge that
-  // does not lead to a later block closes a cycle.
-  std::vector<unsigned> RPOIdx(AC.getCFG()->getNumBlockIDs(), UINT_MAX);
-  unsigned CurRPO = 0;
-  for (const CFGBlock *B : *SortedGraph)
-    RPOIdx[B->getBlockID()] = CurRPO++;
-  for (const CFGBlock *B : *SortedGraph)
-    for (const CFGBlock *Pred : B->preds())
-      if (Pred && RPOIdx[Pred->getBlockID()] != UINT_MAX &&
-          RPOIdx[Pred->getBlockID()] >= RPOIdx[B->getBlockID()])
-        return true;
-  return false;
-}
-
 static bool hasModifiedLocalPointerRef(const Stmt *S,
                                        const LocalVariableMap &VMap,
                                        LocalVarContext Ctx) {
@@ -1391,9 +1372,12 @@ public:
             ForkList &Forks, unsigned Depth = 0);
 
   /// Fork \p Forks on the pending trylock definition \p DefE in \p DefCtx,
-  /// constrained to \p Allowed if non-null.
+  /// constrained to \p Allowed if non-null. If \p ClearBindings is set, clear
+  /// the bindings of each fork afterwards so that later evaluations of the
+  /// same AST node (e.g. from a later loop iteration) fork fresh outcomes.
   void forkPendingDef(const Expr *DefE, LocalVarContext DefCtx, QualType Ty,
-                      const IntRangeSet *Allowed, ForkList &Forks);
+                      const IntRangeSet *Allowed, ForkList &Forks,
+                      bool ClearBindings = false);
 
   /// The values of \p E in \p F, or std::nullopt if these are unknown.
   std::optional<IntRangeSet> eval(const Expr *E, const Fork &F,
@@ -1841,7 +1825,7 @@ void ReturnValueForker::forkDeclRef(const DeclRefExpr *DRE, LocalVarContext Ctx,
 
 void ReturnValueForker::forkPendingDef(const Expr *DefE, LocalVarContext DefCtx,
                                        QualType Ty, const IntRangeSet *Allowed,
-                                       ForkList &Forks) {
+                                       ForkList &Forks, bool ClearBindings) {
   if (!DefE || Forks.empty() || Verifier.ReturnEvalExhausted)
     return;
   auto Dom = Analyzer.getScalarDomain(Ty);
@@ -1898,6 +1882,14 @@ void ReturnValueForker::forkPendingDef(const Expr *DefE, LocalVarContext DefCtx,
       Next.push_back(std::move(F));
   }
   llvm::append_range(DoneForks, std::move(Next));
+  if (ClearBindings) {
+    BindLog.clear();
+    Logged.clear();
+    Dead.clear();
+    Shadowed.clear();
+    for (Fork &F : DoneForks)
+      F.Bindings.clear();
+  }
   Forks = std::move(DoneForks);
   checkForkCount(Forks);
 }
@@ -2117,11 +2109,23 @@ void TrylockBodyVerifier::evaluateReturnWithPendingTrylocks(
   ReturnValueForker Forker(*this, State);
   ReturnValueForker::ForkList Forks = {{InLockset, {}, {}}};
 
+  // The result of an earlier loop iteration is independent of the result of
+  // the same definition in the final iteration that the return value refers
+  // to. Fork on earlier-iteration results first and clear their AST bindings.
   for (const OverwrittenTrylockDef &Def : State.OverwrittenTrylockDefs) {
     if (ReturnEvalExhausted)
       break;
-    Forker.forkPendingDef(Def.DefE, Def.Ctx, Def.Ty,
-                          Def.Allowed ? &*Def.Allowed : nullptr, Forks);
+    if (Def.FromEarlierIteration)
+      Forker.forkPendingDef(Def.DefE, Def.Ctx, Def.Ty,
+                            Def.Allowed ? &*Def.Allowed : nullptr, Forks,
+                            /*ClearBindings=*/true);
+  }
+  for (const OverwrittenTrylockDef &Def : State.OverwrittenTrylockDefs) {
+    if (ReturnEvalExhausted)
+      break;
+    if (!Def.FromEarlierIteration)
+      Forker.forkPendingDef(Def.DefE, Def.Ctx, Def.Ty,
+                            Def.Allowed ? &*Def.Allowed : nullptr, Forks);
   }
   for (const auto &[VD, DefPair] : Defs) {
     if (ReturnEvalExhausted)
@@ -2846,7 +2850,8 @@ bool TrylockBodyVerifier::sameOverwrittenDefs(const TrylockValueState &A,
   return A.OverwrittenTrylockDefs.size() == B.OverwrittenTrylockDefs.size() &&
          llvm::all_of(A.OverwrittenTrylockDefs, [&](const auto &ADef) {
            return llvm::any_of(B.OverwrittenTrylockDefs, [&](const auto &BDef) {
-             return ADef.DefE == BDef.DefE;
+             return ADef.DefE == BDef.DefE &&
+                    ADef.FromEarlierIteration == BDef.FromEarlierIteration;
            });
          });
 }
@@ -3002,6 +3007,7 @@ void TrylockBodyVerifier::beginBlock(const CFGBlock *B) {
   CurrValState = TrylockValueState();
   if (CurrBlock != &CFGraph->getEntry())
     CurrValState.Infeasible = true;
+  UnvisitedBackPreds.clear();
   PurePredLocksets.clear();
 }
 
@@ -3091,6 +3097,8 @@ void TrylockBodyVerifier::enterBlock(CFGBlockInfo *CurrBlockInfo) {
   } else {
     pruneOutOfScopeVars(CurrValState, CurrBlock);
   }
+  if (!UnvisitedBackPreds.empty())
+    enterLoopHeader();
   if (IsPureBlock && !BundleOverflow[CurrBlockID] &&
       !PureBlockBundles[CurrBlockID].empty()) {
     FactSet BundleEntrySet = PureBlockBundles[CurrBlockID].front().Lockset;
@@ -3101,6 +3109,361 @@ void TrylockBodyVerifier::enterBlock(CFGBlockInfo *CurrBlockInfo) {
   }
   ValCtxIdx = CurrBlockInfo->EntryIndex;
   ValStmtCtx = CurrBlockInfo->EntryContext;
+}
+
+void TrylockBodyVerifier::enterLoopHeader() {
+  const CFGBlock *EntryBlock = &CFGraph->getEntry();
+  llvm::SmallPtrSet<const CFGBlock *, 16> LoopBlocks;
+  SmallVector<const CFGBlock *, 16> Worklist;
+  LoopBlocks.insert(CurrBlock);
+  for (const CFGBlock *BP : UnvisitedBackPreds)
+    if (LoopBlocks.insert(BP).second)
+      Worklist.push_back(BP);
+
+  bool IrreducibleLoop = false;
+  while (!Worklist.empty()) {
+    const CFGBlock *LB = Worklist.pop_back_val();
+    if (LB == EntryBlock) {
+      IrreducibleLoop = true;
+      break;
+    }
+    for (auto LPI = LB->pred_begin(), LPE = LB->pred_end(); LPI != LPE; ++LPI) {
+      const CFGBlock *Pred = *LPI;
+      if (!Pred || RPOIdx[Pred->getBlockID()] == UINT_MAX)
+        continue;
+      if (LoopBlocks.insert(Pred).second)
+        Worklist.push_back(Pred);
+    }
+  }
+
+  if (IrreducibleLoop)
+    enterIrreducibleCycle();
+  else
+    enterNaturalLoop(LoopBlocks);
+  CurrValState.ExprRanges.clear();
+  CurrValState.ShortCircuitedOps.clear();
+}
+
+void TrylockBodyVerifier::eraseModifiedVar(const ValueDecl *VD) {
+  retireVarDef(CurrValState, VD, /*NewRHS=*/nullptr);
+  CurrValState.VarRanges.erase(VD);
+}
+
+// A block of an irreducible cycle may be entered from outside the
+// cycle through another block of the cycle. Hence, it is reachable
+// even if all its forward predecessor edges are infeasible. Since
+// its state is not known, start from an empty state. Keep the trylock
+// calls whose capabilities may have been acquired before entering
+// the cycle.
+void TrylockBodyVerifier::enterIrreducibleCycle() {
+  // The blocks of the cycle, i.e. the blocks that can reach CurrBlock
+  // and that CurrBlock can reach.
+  llvm::SmallPtrSet<const CFGBlock *, 16> CanReach, Cycle;
+  SmallVector<const CFGBlock *, 16> Work{CurrBlock};
+  CanReach.insert(CurrBlock);
+  while (!Work.empty())
+    for (const CFGBlock *Pred : Work.pop_back_val()->preds())
+      if (Pred && RPOIdx[Pred->getBlockID()] != UINT_MAX &&
+          CanReach.insert(Pred).second)
+        Work.push_back(Pred);
+  Work.push_back(CurrBlock);
+  Cycle.insert(CurrBlock);
+  while (!Work.empty())
+    for (const CFGBlock *Succ : Work.pop_back_val()->succs())
+      if (Succ && CanReach.contains(Succ) && Cycle.insert(Succ).second)
+        Work.push_back(Succ);
+  if (CurrValState.Infeasible) {
+    CurrValState = TrylockValueState();
+    SmallVector<const CFGBlock *, 16> SortedCycle(Cycle.begin(), Cycle.end());
+    llvm::sort(SortedCycle, [this](const CFGBlock *A, const CFGBlock *B) {
+      return RPOIdx[A->getBlockID()] < RPOIdx[B->getBlockID()];
+    });
+    for (const CFGBlock *B : SortedCycle) {
+      for (const CFGBlock *Pred : B->preds()) {
+        if (!Pred || Cycle.contains(Pred) || !VisitedBlocks.alreadySet(Pred) ||
+            neverReturns(Pred) ||
+            !Analyzer.BlockInfo[Pred->getBlockID()].Reachable)
+          continue;
+        const TrylockValueState &PS = BlockExitValState[Pred->getBlockID()];
+        if (PS.Infeasible)
+          continue;
+        CurrValState.DiscardedTrylockCalls.insert(
+            PS.DiscardedTrylockCalls.begin(), PS.DiscardedTrylockCalls.end());
+        for (const OverwrittenTrylockDef &Def : PS.OverwrittenTrylockDefs)
+          addOverwrittenTrylockDef(CurrValState, Def);
+        // Sort the variables by source location for deterministic
+        // diagnostics.
+        SmallVector<std::pair<const ValueDecl *,
+                              std::pair<const Expr *, LocalVarContext>>,
+                    4>
+            Defs(PS.UnmaterializedVarDefs.begin(),
+                 PS.UnmaterializedVarDefs.end());
+        llvm::sort(Defs, [](const auto &A, const auto &B) {
+          return A.first->getLocation().getRawEncoding() <
+                 B.first->getLocation().getRawEncoding();
+        });
+        for (const auto &[VD, Def] : Defs)
+          addOverwrittenTrylockDef(
+              CurrValState, makeOverwrittenTrylockDef(VD, Def, std::nullopt));
+      }
+    }
+  }
+  for (const CFGBlock *B : Cycle)
+    for (const ValueDecl *VD :
+         Analyzer.LocalVarMap.getBlockModifiedVars(B->getBlockID()))
+      eraseModifiedVar(VD);
+}
+
+// Forget the values of all variables that the loop modifies, then recover
+// the ranges of modified variables whose pre-loop range and back-edge range
+// are both known, e.g. for a retry loop that initializes a result variable to
+// a failure value and breaks out of the loop when the trylock succeeds.
+void TrylockBodyVerifier::enterNaturalLoop(
+    const llvm::SmallPtrSetImpl<const CFGBlock *> &LoopBlocks) {
+  llvm::SmallDenseMap<const ValueDecl *, IntRangeSet, 4> PreLoopRanges;
+  for (const CFGBlock *LB : LoopBlocks) {
+    for (const ValueDecl *VD :
+         Analyzer.LocalVarMap.getBlockModifiedVars(LB->getBlockID())) {
+      if (!CurrValState.UnmaterializedVarDefs.contains(VD))
+        if (auto It = CurrValState.VarRanges.find(VD);
+            It != CurrValState.VarRanges.end())
+          PreLoopRanges.try_emplace(VD, It->second);
+      eraseModifiedVar(VD);
+    }
+  }
+  addLoopPendingTrylocks(LoopBlocks);
+  CurrValState.ExprRanges.clear();
+  CurrValState.ShortCircuitedOps.clear();
+
+  if (CurrValState.Infeasible || PreLoopRanges.empty())
+    return;
+
+  for (const CFGBlock *LB : LoopBlocks) {
+    if (LB == CurrBlock)
+      continue;
+    for (const CFGBlock *Pred : LB->preds())
+      if (Pred && LoopBlocks.contains(Pred) &&
+          RPOIdx[Pred->getBlockID()] >= RPOIdx[LB->getBlockID()])
+        return;
+  }
+
+  SmallVector<const CFGBlock *, 16> SortedLoopBlocks(LoopBlocks.begin(),
+                                                     LoopBlocks.end());
+  llvm::sort(SortedLoopBlocks, [this](const CFGBlock *A, const CFGBlock *B) {
+    return RPOIdx[A->getBlockID()] < RPOIdx[B->getBlockID()];
+  });
+  llvm::SmallDenseMap<const CFGBlock *, TrylockValueState, 16> SimExitStates;
+  for (const CFGBlock *LB : SortedLoopBlocks) {
+    TrylockValueState BState;
+    if (LB == CurrBlock) {
+      BState = CurrValState;
+    } else {
+      BState.Infeasible = true;
+      for (const CFGBlock *Pred : LB->preds()) {
+        if (!Pred || !LoopBlocks.contains(Pred) || neverReturns(Pred))
+          continue;
+        auto It = SimExitStates.find(Pred);
+        if (It == SimExitStates.end() || It->second.Infeasible)
+          continue;
+        TrylockValueState EdgeState = It->second;
+        constrainValueStateOnEdge(EdgeState, Pred, LB);
+        unionIntoValueState(BState, EdgeState, *Analyzer.ASTCtx);
+      }
+      pruneOutOfScopeVars(BState, LB);
+    }
+    if (!BState.Infeasible) {
+      LocalVarContext Ctx = Analyzer.BlockInfo[LB->getBlockID()].EntryContext;
+      unsigned CtxIdx = Analyzer.BlockInfo[LB->getBlockID()].EntryIndex;
+      for (const CFGElement &BI : *LB) {
+        if (std::optional<CFGStmt> CS = BI.getAs<CFGStmt>()) {
+          const Stmt *S = CS->getStmt();
+          recordStmtMetadata(S, Ctx);
+          updateValueStateForStmt(BState, S, Ctx);
+          Ctx = Analyzer.LocalVarMap.getNextContext(CtxIdx, S, Ctx);
+        }
+      }
+    }
+    SimExitStates.try_emplace(LB, std::move(BState));
+  }
+
+  TrylockValueState BackState;
+  BackState.Infeasible = true;
+  for (const CFGBlock *BP : UnvisitedBackPreds) {
+    if (neverReturns(BP))
+      continue;
+    auto It = SimExitStates.find(BP);
+    if (It == SimExitStates.end() || It->second.Infeasible)
+      continue;
+    TrylockValueState EdgeState = It->second;
+    constrainValueStateOnEdge(EdgeState, BP, CurrBlock);
+    unionIntoValueState(BackState, EdgeState, *Analyzer.ASTCtx);
+  }
+
+  for (const auto &[VD, EntryR] : PreLoopRanges) {
+    if (BackState.Infeasible) {
+      CurrValState.VarRanges[VD] = EntryR;
+    } else if (auto It = BackState.VarRanges.find(VD);
+               It != BackState.VarRanges.end()) {
+      IntRangeSet Joined = EntryR.unionWith(It->second);
+      Joined.widen(MaxStateRangeIntervals);
+      auto Dom = Analyzer.getScalarDomain(VD->getType());
+      if (Dom && !IntRangeSet::full(*Dom).subsetOfSet(Joined))
+        CurrValState.VarRanges[VD] = std::move(Joined);
+    }
+  }
+}
+
+// The state of the header does not include the back edges, which have not
+// been visited yet. Hence, the edges that leave the loop at the header would
+// miss the trylock calls of the loop body whose results are discarded or
+// overwritten before they are tested, e.g. 'while (cond()) trylock(&mu);'.
+// Assume that each of these calls may have been executed and may have
+// acquired its capabilities.
+void TrylockBodyVerifier::addLoopPendingTrylocks(
+    const llvm::SmallPtrSetImpl<const CFGBlock *> &LoopBlocks) {
+  if (CurrValState.Infeasible)
+    return;
+
+  // The trylock results that a branch condition in the loop tests, and the
+  // blocks whose terminators test these. The main pass adds the capabilities
+  // of such a result to the lockset on the edges where the result implies
+  // success, such that the lockset checks at joins and at the end of loop
+  // iterations report capabilities that are not released. Hence, do not add
+  // these results if every path from their definition back to the loop
+  // header passes such a test.
+  llvm::SmallDenseMap<const Expr *, llvm::SmallPtrSet<const CFGBlock *, 2>, 4>
+      TestBlocks;
+  for (const CFGBlock *B : LoopBlocks) {
+    ThreadSafetyAnalyzer::TrylockRangeCondResult CondRes;
+    const ThreadSafetyAnalyzer::SwitchCaseTable *Table = nullptr;
+    SmallVector<const CastExpr *, 2> SwitchCasts;
+    if (!Analyzer.getTerminatorTrylockCond(B, CondRes, Table, SwitchCasts))
+      continue;
+    SmallVector<IntRangeSet, 4> BranchSets;
+    if (Table) {
+      for (const auto &[CS, CaseSet] : Table->CaseSets)
+        BranchSets.push_back(mapRangeBackwardThroughBijectiveCasts(
+            CaseSet, SwitchCasts, CondRes.Dom, *Analyzer.ASTCtx));
+      BranchSets.push_back(mapRangeBackwardThroughBijectiveCasts(
+          Table->DefaultSet, SwitchCasts, CondRes.Dom, *Analyzer.ASTCtx));
+    } else {
+      BranchSets.push_back(CondRes.TrueSet);
+      BranchSets.push_back(CondRes.FalseSet);
+    }
+    bool AcquiresOnSomeBranch = false;
+    for (const Attr *A : trylockAttrs(CondRes.Callee)) {
+      if (!trylockAttrAppliesTo(A, CondRes.Call->getType()))
+        continue;
+      auto SuccSet = Analyzer.getCombinedTrylockSuccessSet(
+          A, CondRes.Call, CondRes.Callee, CondRes.Dom);
+      if (!SuccSet)
+        continue;
+      bool HasSuccessEdge = llvm::any_of(BranchSets, [&](const IntRangeSet &S) {
+        return !S.empty() && S.subsetOfSet(*SuccSet);
+      });
+      bool CleanPartition = llvm::all_of(BranchSets, [&](const IntRangeSet &S) {
+        return S.empty() || S.subsetOfSet(*SuccSet) ||
+               !S.intersectsSet(*SuccSet);
+      });
+      if (HasSuccessEdge && CleanPartition) {
+        AcquiresOnSomeBranch = true;
+        break;
+      }
+    }
+    if (AcquiresOnSomeBranch)
+      TestBlocks[stripNoOpExprWrappers(CondRes.Call)].insert(B);
+  }
+
+  // Whether every path from the end of DefBlock back to the loop header
+  // passes a block in Tests. A path that leaves the loop does not matter: the
+  // main pass visits its blocks with the trylock result in the value state.
+  auto TestedOnAllBackEdgePaths =
+      [&](const CFGBlock *DefBlock,
+          const llvm::SmallPtrSetImpl<const CFGBlock *> &Tests) {
+        if (Tests.contains(DefBlock))
+          return true;
+        llvm::SmallPtrSet<const CFGBlock *, 16> Seen;
+        SmallVector<const CFGBlock *, 8> Work{DefBlock};
+        while (!Work.empty()) {
+          for (const CFGBlock *Succ : Work.pop_back_val()->succs()) {
+            if (!Succ || !LoopBlocks.contains(Succ))
+              continue;
+            if (Succ == CurrBlock)
+              return false;
+            if (!Tests.contains(Succ) && Seen.insert(Succ).second)
+              Work.push_back(Succ);
+          }
+        }
+        return true;
+      };
+  // Whether every trylock call in the definition RHS, e.g. 'trylock()' in
+  // 'bool ok = trylock() == 0;', is tested on all paths back to the header.
+  auto IsTestedDef = [&](const CFGBlock *DefBlock, const Expr *RHS,
+                         LocalVarContext Ctx) {
+    llvm::SmallPtrSet<const CallExpr *, 4> DefCalls;
+    // DefCalls may be incomplete if the scan exceeds its budget.
+    const bool SavedExhausted = ReturnEvalExhausted;
+    ReturnEvalExhausted = false;
+    exprHasUnmaterializedTrylock(RHS, Ctx, CurrValState,
+                                 /*UseStateDefs=*/false,
+                                 /*IncludeMaterialized=*/true, &DefCalls);
+    const bool Exhausted = ReturnEvalExhausted;
+    ReturnEvalExhausted = SavedExhausted;
+    return !Exhausted && !DefCalls.empty() &&
+           llvm::all_of(DefCalls, [&](const CallExpr *CE) {
+             auto It = TestBlocks.find(stripNoOpExprWrappers(CE));
+             return It != TestBlocks.end() &&
+                    TestedOnAllBackEdgePaths(DefBlock, It->second);
+           });
+  };
+
+  for (const CFGBlock *B : LoopBlocks) {
+    LocalVarContext Ctx = Analyzer.BlockInfo[B->getBlockID()].EntryContext;
+    unsigned CtxIdx = Analyzer.BlockInfo[B->getBlockID()].EntryIndex;
+    for (const CFGElement &BI : *B) {
+      std::optional<CFGStmt> CS = BI.getAs<CFGStmt>();
+      if (!CS)
+        continue;
+      const Stmt *S = CS->getStmt();
+      if (!Analyzer.UnevaluatedStmts.contains(S)) {
+        auto CheckAssignedRHS = [&](const ValueDecl *VD, const Expr *RHS) {
+          if (VD && RHS && Analyzer.isTrackableLocalVar(VD, EscapedVars) &&
+              !IsTestedDef(B, RHS, Ctx) &&
+              exprHasUnmaterializedTrylock(RHS, Ctx, CurrValState,
+                                           /*UseStateDefs=*/false)) {
+            OverwrittenTrylockDef Def = makeOverwrittenTrylockDef(
+                cast<ValueDecl>(VD->getCanonicalDecl()), {RHS, Ctx},
+                std::nullopt);
+            Def.FromEarlierIteration = true;
+            addOverwrittenTrylockDef(CurrValState, std::move(Def));
+          }
+        };
+        if (const auto *CE = dyn_cast<CallExpr>(S);
+            CE && DiscardedCalls.contains(CE)) {
+          CurrValState.DiscardedTrylockCalls.insert(CE);
+          DiscardedCallCtx.try_emplace(CE, Ctx);
+        } else if (const auto *BO = dyn_cast<BinaryOperator>(S);
+                   BO && BO->getOpcode() == BO_Assign) {
+          if (const DeclRefExpr *DRE = unwrapDirectLValueDRE(BO->getLHS()))
+            CheckAssignedRHS(DRE->getDecl(), BO->getRHS());
+        } else if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+          forEachEvaluatedDeclVLAStmt(
+              DS, *Analyzer.ASTCtx, /*IncludeTopLevelVLA=*/false,
+              [&](const Stmt *SubS) {
+                if (const auto *CE = dyn_cast<CallExpr>(SubS);
+                    CE && DiscardedCalls.contains(CE)) {
+                  CurrValState.DiscardedTrylockCalls.insert(CE);
+                  DiscardedCallCtx.try_emplace(CE, Ctx);
+                }
+              });
+          for (const Decl *D : DS->decls())
+            if (const auto *Var = dyn_cast<VarDecl>(D))
+              CheckAssignedRHS(Var, Var->getInit());
+        }
+      }
+      Ctx = Analyzer.LocalVarMap.getNextContext(CtxIdx, S, Ctx);
+    }
+  }
 }
 
 void TrylockBodyVerifier::handleStatement(const Stmt *S, const FactSet &FSet) {

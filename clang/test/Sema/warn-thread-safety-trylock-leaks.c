@@ -16,6 +16,134 @@ int g;
 
 #define TRY1 __attribute__((try_acquire_capability(1, mu)))
 
+// Trylock calls in a loop whose results are discarded or overwritten before
+// they are tested must not be forgotten on the edges that leave the loop at
+// its header.
+int loop_discarded(void) TRY1 {
+  while (cond())
+    trylock(&mu); // expected-note{{mutex acquired here}}
+  return 0; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int loop_overwritten(void) TRY1 {
+  int r = 0;
+  for (int i = 0; i < 3; i++)
+    r = trylock(&mu2); // expected-note{{mutex acquired here}}
+  return trylock(&mu); // expected-warning{{mutex 'mu2' is still held at the end of function}}
+}
+
+int loop_global(void) TRY1 {
+  while (cond())
+    g = trylock(&mu2); // expected-note{{mutex acquired here}}
+  return trylock(&mu); // expected-warning{{mutex 'mu2' is still held at the end of function}}
+}
+
+int loop_scoped_local(void) TRY1 {
+  while (cond()) {
+    int t = trylock(&mu2); // expected-note{{mutex acquired here}}
+    (void)t;
+  }
+  return trylock(&mu); // expected-warning{{mutex 'mu2' is still held at the end of function}}
+}
+
+int do_while_discarded(void) TRY1 {
+  do
+    trylock(&mu); // expected-note{{mutex acquired here}}
+  while (cond());
+  return 0; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+// The capabilities of a trylock call whose result is tested in a loop are
+// tracked in the lockset. Releasing them in the loop is correct.
+int loop_released_scoped(void) TRY1 {
+  while (cond()) {
+    int t = trylock(&mu2);
+    if (t)
+      unlock(&mu2);
+  }
+  return trylock(&mu);
+}
+
+int loop_released(void) TRY1 {
+  int r;
+  while (cond()) {
+    r = trylock(&mu2);
+    if (r)
+      unlock(&mu2);
+  }
+  return trylock(&mu);
+}
+
+int loop_released_direct(void) TRY1 {
+  while (cond())
+    if (trylock(&mu2))
+      unlock(&mu2);
+  return trylock(&mu);
+}
+
+int loop_return_on_success(void) TRY1 {
+  for (int i = 0; i < 3; i++)
+    if (trylock(&mu))
+      return 1;
+  return 0;
+}
+
+// A result that is only tested on some of the paths back to the loop header
+// may leak into the next iteration and out of the loop.
+int loop_tested_conditionally(int c1, int c2) TRY1 {
+  while (c1) {
+    int r = trylock(&mu); // expected-note{{mutex acquired here}}
+    if (c2) {
+      if (r)
+        return 1;
+    }
+  }
+  return 0; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int loop_continue_before_test(int c1, int c2) TRY1 {
+  while (c1) {
+    int r = trylock(&mu); // expected-note{{mutex acquired here}}
+    if (c2)
+      continue;
+    if (r)
+      return 1;
+  }
+  return 0; // expected-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int infinite_loop_continue_before_test(int c1, int c2) TRY1 {
+  while (1) {
+    int r = trylock(&mu); // expected-note{{mutex acquired here}}
+    if (c1)
+      continue;
+    if (r)
+      return 1;
+    if (c2)
+      return 0; // expected-warning{{mutex 'mu' is still held at the end of function}}
+  }
+}
+
+int infinite_loop_tested(int c2) TRY1 {
+  while (1) {
+    int r = trylock(&mu);
+    if (r)
+      return 1;
+    if (c2)
+      return 0;
+  }
+}
+
+int loop_continue_after_test(int c1) TRY1 {
+  while (c1) {
+    int r = trylock(&mu);
+    if (!r)
+      continue;
+    return 1;
+  }
+  return 0;
+}
+
 // An edge on which a direct trylock call may return both success and
 // failure values may carry the capabilities of the call.
 int mixed_eq(void) TRY1 {

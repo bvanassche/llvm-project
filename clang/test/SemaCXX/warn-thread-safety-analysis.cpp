@@ -9774,6 +9774,15 @@ class BodyCheckSuite {
     }
   }
 
+  int validRetryLoop() TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int fail = -16;
+    for (int i = 0; i < 3; ++i) {
+      if (mu.TryLock())
+        return 0;
+    }
+    return fail;
+  }
+
   struct LogMsg {
     LogMsg(const char *);
     ~LogMsg();
@@ -9988,6 +9997,15 @@ class BodyCheckSuite {
     return y; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
   }
 
+  int badLoopMutation(int n) // expected-note@+1 {{mutex acquired here}}
+      TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int err = -16;
+    for (int i = 0; i < n; ++i) {
+      err = 0;
+    }
+    return err; // expected-warning {{expecting mutex 'mu' to be held at the end of function}}
+  }
+
   // The caller only holds mu if the returned pointer is 1. For any other
   // non-null pointer, the caller may access 'a' without holding mu.
   int *badSentinelRangeReturnsGuardedAddr() // expected-note@+1 {{mutex acquired here}}
@@ -10177,6 +10195,23 @@ int RedeclReentrantHolder::tryLockRangeOnce(bool cond)
   rmu.ReaderLock();
   return 0;
 }
+
+struct LoopExitAndDerefTryAcquireHolder {
+  Mutex mu;
+  void waitStep();
+
+  int validLoopUnmodifiedVar(bool fail) TRY_ACQUIRE_RANGE(0, 0, mu) {
+    int ret = 0;
+    mu.Lock();
+    for (int i = 0; i < 2; ++i)
+      waitStep();
+    if (fail) {
+      mu.Unlock();
+      ret = -16;
+    }
+    return ret;
+  }
+};
 
 struct PtrRangeTryAcquireHolder {
   Mutex mu;

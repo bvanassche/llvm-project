@@ -656,6 +656,43 @@ void LocalVariableMap::intersectBackEdge(Context C1, Context C2) {
   }
 }
 
+/// Add to \p ModifiedVars the local variables that the CFG statement \p S
+/// declares or modifies directly. The thread safety analysis builds its CFG
+/// with all statements added as separate CFG elements (setAllAlwaysAdd()).
+/// Hence, examining each element without its subexpressions finds every
+/// modification while visiting each AST node only once.
+static void
+recordModifiedVars(const Stmt *S,
+                   llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars) {
+  auto AddModifiedLValue = [&](const Expr *LV) {
+    SmallVector<const DeclRefExpr *, 2> DREs;
+    collectModifiedLValueDREs(LV, DREs);
+    for (const DeclRefExpr *DRE : DREs)
+      ModifiedVars.insert(cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+  };
+  if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+    forEachDeclVLAExpr(DS, /*IncludeTopLevelVLA=*/false, [&](const Expr *Sz) {
+      scanModifiedVars(Sz, (*DS->decl_begin())->getASTContext(), ModifiedVars);
+    });
+    for (const Decl *D : DS->decls())
+      if (const auto *VD = dyn_cast<VarDecl>(D); VD && VD->hasLocalStorage())
+        ModifiedVars.insert(cast<ValueDecl>(VD->getCanonicalDecl()));
+  } else if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
+    if (BO->isAssignmentOp())
+      AddModifiedLValue(BO->getLHS());
+  } else if (const auto *UO = dyn_cast<UnaryOperator>(S)) {
+    if (UO->isIncrementDecrementOp())
+      AddModifiedLValue(UO->getSubExpr());
+  } else if (const auto *AS = dyn_cast<AsmStmt>(S)) {
+    for (unsigned I = 0, N = AS->getNumOutputs(); I < N; ++I)
+      AddModifiedLValue(AS->getOutputExpr(I)->IgnoreParenCasts());
+  } else if (isa<CallExpr, CXXConstructExpr>(S)) {
+    forEachInvalidatedCallOrCtorArgDRE(S, [&](const DeclRefExpr *DRE) {
+      ModifiedVars.insert(cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl()));
+    });
+  }
+}
+
 // Traverse the CFG in topological order, so all predecessors of a block
 // (excluding back-edges) are visited before the block itself.  At
 // each point in the code, we calculate a Context, which holds the set of
@@ -696,8 +733,11 @@ void LocalVariableMap::intersectBackEdge(Context C1, Context C2) {
 void LocalVariableMap::traverseCFG(
     CFG *CFGraph, const PostOrderCFGView *SortedGraph,
     std::vector<CFGBlockInfo> &BlockInfo,
-    const llvm::SmallPtrSetImpl<const Stmt *> &UnevaluatedStmts) {
+    const llvm::SmallPtrSetImpl<const Stmt *> &UnevaluatedStmts,
+    bool RecordModifiedVars) {
   PostOrderCFGView::CFGBlockSet VisitedBlocks(CFGraph);
+  if (RecordModifiedVars)
+    BlockModifiedVars.assign(CFGraph->getNumBlockIDs(), {});
 
   for (const auto *CurrBlock : *SortedGraph) {
     unsigned CurrBlockID = CurrBlock->getBlockID();
@@ -757,6 +797,8 @@ void LocalVariableMap::traverseCFG(
             saveContext(S, VMapBuilder.Ctx);
           VMapBuilder.PendingSave = false;
         }
+        if (RecordModifiedVars)
+          recordModifiedVars(S, BlockModifiedVars[CurrBlockID]);
         break;
       }
       case CFGElement::AutomaticObjectDtor:
@@ -3081,10 +3123,9 @@ void ThreadSafetyAnalyzer::updatePendingTrylockRanges(
 /// \p D must not be analyzed, e.g. because \p D is a primitive lock or unlock
 /// function.
 bool ThreadSafetyAnalyzer::computeEntryLockset(
-    AnalysisDeclContext &AC, const NamedDecl *D, const CFG &CFGraph,
-    const PostOrderCFGView &SortedGraph, CFGBlockInfo &Initial,
-    CapExprSet &ExclusiveLocksAcquired, CapExprSet &SharedLocksAcquired,
-    CapExprSet &LocksReleased,
+    const NamedDecl *D, const CFG &CFGraph, const PostOrderCFGView &SortedGraph,
+    CFGBlockInfo &Initial, CapExprSet &ExclusiveLocksAcquired,
+    CapExprSet &SharedLocksAcquired, CapExprSet &LocksReleased,
     SmallVectorImpl<TrylockExitSpec> &TrylockExitSpecs,
     IntDomain &TrylockRetDom, bool &UnmodeledTryAcquireAttr) {
   // Add locks from exclusive_locks_required and shared_locks_required
@@ -3124,11 +3165,6 @@ bool ThreadSafetyAnalyzer::computeEntryLockset(
         // call. Only verify these with -Wthread-safety-beta and skip their
         // bodies otherwise, like before.
         if (!trylockAttrHasArgs(Attr) || !Handler.issueBetaWarnings()) {
-          return false;
-        }
-        // FIXME: Also verify the bodies that contain loops. Skip these for
-        // now, like before.
-        if (hasUnsupportedTrylockBody(AC, &SortedGraph)) {
           return false;
         }
         if (!addTrylockExitSpecs(Attr, D, TrylockExitSpecs, TrylockRetDom))
@@ -3275,8 +3311,11 @@ void ThreadSafetyAnalyzer::joinPredecessors(
         (CheckingTrylockBody && !Verifier->inSortedGraph(*PI)))
       continue;
     // if *PI -> CurrBlock is a back edge
-    if (!VisitedBlocks.alreadySet(*PI))
+    if (!VisitedBlocks.alreadySet(*PI)) {
+      if (CheckingTrylockBody)
+        Verifier->addBackEdgePred(*PI);
       continue;
+    }
 
     unsigned PrevBlockID = (*PI)->getBlockID();
     CFGBlockInfo *PrevBlockInfo = &BlockInfo[PrevBlockID];
@@ -3489,7 +3528,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
   if (HasTrylockCall || hasTrylockAttr(D))
     markEscapedLocalVars(AC, EscapedVars);
-  LocalVarMap.traverseCFG(CFGraph, SortedGraph, BlockInfo, UnevaluatedStmts);
+  LocalVarMap.traverseCFG(CFGraph, SortedGraph, BlockInfo, UnevaluatedStmts,
+                          /*RecordModifiedVars=*/hasTrylockAttr(D));
   CurrentSortedGraph = SortedGraph;
 
   // Fill in source locations for all CFGBlocks.
@@ -3507,7 +3547,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   bool UnmodeledTryAcquireAttr = false;
 
   if (!SortedGraph->empty() &&
-      !computeEntryLockset(AC, D, *CFGraph, *SortedGraph, Initial,
+      !computeEntryLockset(D, *CFGraph, *SortedGraph, Initial,
                            ExclusiveLocksAcquired, SharedLocksAcquired,
                            LocksReleased, TrylockExitSpecs, TrylockRetDom,
                            UnmodeledTryAcquireAttr))

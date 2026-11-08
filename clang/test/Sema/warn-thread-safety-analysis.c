@@ -1112,6 +1112,28 @@ int c_trylock_restart_syscall_valid(void)
   return c_restart_syscall_helper();
 }
 
+int c_trylock_is_err_ptr_err_valid(int retry_busy)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret;
+  mutex_exclusive_lock(&mu1);
+  for (int i = 0; i < 2; ++i)
+    do_some_work();
+  void *obj = c_lookup_obj();
+  if (c_is_err(obj)) {
+    ret = c_ptr_err(obj);
+    goto fail_unlock;
+  }
+  if (retry_busy) {
+    ret = c_restart_syscall_helper();
+    goto fail_unlock;
+  }
+  return 0;
+
+fail_unlock:
+  TEST_UNLOCK_DOWHILE0(&mu1);
+  return ret;
+}
+
 int c_trylock_ptr_err_or_zero_valid(void)
     __attribute__((try_acquire_capability_range(0, 0, mu1))) {
   void *obj = c_lookup_obj();
@@ -1192,6 +1214,63 @@ int c_redecl_reentrant_trylock_bad(void)
 int c_redecl_reentrant_trylock_bad(void) // expected-note@-1 {{mutex acquired here}}
     __attribute__((try_acquire_shared_capability_range(0, 0, crmu))) {
   return 0; // expected-warning{{expecting mutex 'crmu' to be held at the end of function}}
+}
+
+// A block of an irreducible cycle may be entered through another block of the
+// cycle even if all its forward predecessor edges are infeasible.
+int c_irreducible_infeasible_entry(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret = 0;
+  int k = 1;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  if (k != 0)
+    goto y;
+x:
+  if (do_some_work_cond())
+    ret = -16;
+y:
+  do_some_work();
+  if (do_some_work_cond())
+    goto x;
+  return ret; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+// Preserving ranges of variables not modified inside a natural loop, even when
+// modified later in the same function.
+int c_loop_unmodified_var_valid(int fail)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret = 0;
+  mutex_exclusive_lock(&mu1);
+  for (int i = 0; i < 2; ++i)
+    do_some_work();
+  if (fail) {
+    mutex_unlock(&mu1);
+    ret = -16;
+  }
+  return ret;
+}
+
+// A loop with multiple break paths that each acquire the capability (one via a
+// local trylock variable and one via a direct trylock condition), followed by
+// a call that requires the capability before returning.
+void require_mu1_held(void) __attribute__((requires_capability(mu1)));
+
+int c_loop_multi_break_var_and_direct_trylock_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  if (mutex_exclusive_trylock(&mu1))
+    return 0;
+  for (;;) {
+    int opt_acquired;
+    if (mutex_exclusive_trylock(&mu1))
+      break;
+    if (do_some_work_cond())
+      return -4;
+    opt_acquired = mutex_exclusive_trylock(&mu1);
+    if (opt_acquired)
+      break;
+  }
+  require_mu1_held();
+  return 0;
 }
 
 // Pointer return types on try_acquire_[shared_]capability_range.
@@ -2494,6 +2573,15 @@ int c_vla_ptr_trylock_leaks_bad(void)
     __attribute__((try_acquire_capability(1, mu1))) {
   int (*p)[mutex_exclusive_trylock(&mu1)] = 0; // expected-note{{mutex acquired here}}
   (void)p;
+  return 0; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int c_vla_ptr_trylock_in_loop_leaks_bad(int n)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  while (n-- > 0) {
+    int (*p)[mutex_exclusive_trylock(&mu1)] = 0; // expected-note{{mutex acquired here}}
+    (void)p;
+  }
   return 0; // expected-warning{{mutex 'mu1' is still held at the end of function}}
 }
 

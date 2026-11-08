@@ -445,6 +445,9 @@ private:
   Context::Factory ContextFactory;
   std::vector<VarDefinition> VarDefinitions;
   std::vector<std::pair<const Stmt *, Context>> SavedContexts;
+  // The local variables that the statements of each CFG block declare or
+  // modify directly, indexed by block ID. Only computed on request.
+  std::vector<llvm::SmallPtrSet<const ValueDecl *, 4>> BlockModifiedVars;
   // Local variables that may be modified other than by a direct assignment,
   // e.g. because their address is taken; see traverseCFG().
   llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
@@ -581,7 +584,9 @@ public:
     }
   }
 
-  /// Builds the variable map.
+  /// Builds the variable map. If \p RecordModifiedVars is set, also records
+  /// the local variables that each block modifies; see
+  /// getBlockModifiedVars().
   ///
   /// Since a pointer or reference to a variable recorded by addEscapedVar()
   /// may be stored anywhere, the value of such a variable may change at
@@ -591,7 +596,18 @@ public:
   /// value directly; lookupValueExpr() fails for clobbered definitions.
   void traverseCFG(CFG *CFGraph, const PostOrderCFGView *SortedGraph,
                    std::vector<CFGBlockInfo> &BlockInfo,
-                   const llvm::SmallPtrSetImpl<const Stmt *> &UnevaluatedStmts);
+                   const llvm::SmallPtrSetImpl<const Stmt *> &UnevaluatedStmts,
+                   bool RecordModifiedVars = false);
+
+  /// The local variables that the statements of the reachable block
+  /// \p BlockID declare or modify by a direct assignment or increment or
+  /// decrement. Only available if traverseCFG() was asked to record these.
+  const llvm::SmallPtrSetImpl<const ValueDecl *> &
+  getBlockModifiedVars(unsigned BlockID) const {
+    assert(BlockID < BlockModifiedVars.size() &&
+           "traverseCFG() did not record the modified variables");
+    return BlockModifiedVars[BlockID];
+  }
 
 protected:
   friend class VarMapBuilder;
@@ -1060,6 +1076,10 @@ public:
     // The values that the variable may have had when it was overwritten, or
     // std::nullopt if unknown.
     std::optional<IntRangeSet> Allowed;
+    // Whether the definition may have been executed in an earlier iteration
+    // of a loop. Its result then is another result than the one that the
+    // same definition yields in the current iteration.
+    bool FromEarlierIteration = false;
   };
 
   struct TrylockValueState {
@@ -1504,19 +1524,18 @@ public:
   void updatePendingTrylockRanges(PendingTrylockRanges &EntryPending,
                                   const CFGBlock *CurrBlock,
                                   const CFGBlockInfo *CurrBlockInfo);
-  bool hasUnsupportedTrylockBody(AnalysisDeclContext &AC,
-                                 const PostOrderCFGView *SortedGraph);
   bool addTrylockExitSpecs(const Attr *Attr, const NamedDecl *D,
                            SmallVectorImpl<TrylockExitSpec> &ExitSpecs,
                            IntDomain &RetDom);
-  bool
-  computeEntryLockset(AnalysisDeclContext &AC, const NamedDecl *D,
-                      const CFG &CFGraph, const PostOrderCFGView &SortedGraph,
-                      CFGBlockInfo &Initial, CapExprSet &ExclusiveLocksAcquired,
-                      CapExprSet &SharedLocksAcquired,
-                      CapExprSet &LocksReleased,
-                      SmallVectorImpl<TrylockExitSpec> &TrylockExitSpecs,
-                      IntDomain &TrylockRetDom, bool &UnmodeledTryAcquireAttr);
+  bool computeEntryLockset(const NamedDecl *D, const CFG &CFGraph,
+                           const PostOrderCFGView &SortedGraph,
+                           CFGBlockInfo &Initial,
+                           CapExprSet &ExclusiveLocksAcquired,
+                           CapExprSet &SharedLocksAcquired,
+                           CapExprSet &LocksReleased,
+                           SmallVectorImpl<TrylockExitSpec> &TrylockExitSpecs,
+                           IntDomain &TrylockRetDom,
+                           bool &UnmodeledTryAcquireAttr);
   FactSet computeExpectedExitSet(const NamedDecl *D, const FactSet &EntrySet,
                                  const CapExprSet &ExclusiveLocksAcquired,
                                  const CapExprSet &SharedLocksAcquired,
@@ -1730,6 +1749,10 @@ public:
   /// Whether the current block is on a path to the exit that does not modify
   /// the lock state, i.e. whether its states are tracked per path.
   bool isPureBlock() const { return IsPureBlock; }
+  /// Record that the edge from \p Pred to the current block is a back edge.
+  void addBackEdgePred(const CFGBlock *Pred) {
+    UnvisitedBackPreds.push_back(Pred);
+  }
   /// Join the state on the edge from the visited block \p Pred into the
   /// state of the current block and compute the lockset on the edge in
   /// \p PrevLockset.
@@ -1846,6 +1869,22 @@ private:
   void forEachEdgeBundle(const CFGBlock *Pred, const CFGBlock *Succ,
                          llvm::function_ref<void(TrylockEdgeBundle)> F);
 
+  /// Compute the state at the entry of the current block, which is the
+  /// header of a loop whose back edges have not been visited yet.
+  void enterLoopHeader();
+  /// Forget the value of \p VD, which a loop modifies.
+  void eraseModifiedVar(const ValueDecl *VD);
+  void enterIrreducibleCycle();
+  /// Compute the state at the entry of the header of a natural loop that
+  /// consists of \p LoopBlocks.
+  void
+  enterNaturalLoop(const llvm::SmallPtrSetImpl<const CFGBlock *> &LoopBlocks);
+  /// Add to CurrValState the trylock calls of the loop that consists of
+  /// \p LoopBlocks whose results may be discarded or overwritten before they
+  /// are tested.
+  void addLoopPendingTrylocks(
+      const llvm::SmallPtrSetImpl<const CFGBlock *> &LoopBlocks);
+
   void verifyReturn(const ExitContext &Exit, const FactSet &Lockset,
                     TrylockValueState State);
   /// Verify the lock state at the exit \p Exit for the lockset \p Lockset
@@ -1901,6 +1940,7 @@ private:
   unsigned CurrBlockID = 0;
   bool IsPureBlock = false;
   TrylockValueState CurrValState;
+  SmallVector<const CFGBlock *, 2> UnvisitedBackPreds;
   // The locksets on the edges into a pure block.
   SmallVector<FactSet, 2> PurePredLocksets;
   // The local variable context of the next statement of the block.

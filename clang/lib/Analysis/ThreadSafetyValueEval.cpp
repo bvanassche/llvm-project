@@ -1963,6 +1963,7 @@ void threadSafety::addOverwrittenTrylockDef(
   for (auto &Existing : State.OverwrittenTrylockDefs) {
     if (Existing.DefE != Def.DefE)
       continue;
+    Existing.FromEarlierIteration |= Def.FromEarlierIteration;
     if (!Existing.Allowed || !Def.Allowed || Existing.Ty != Def.Ty)
       Existing.Allowed = std::nullopt;
     else

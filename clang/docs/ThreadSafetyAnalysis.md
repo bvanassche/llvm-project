@@ -618,7 +618,16 @@ When verifying `TRY_ACQUIRE` and `TRY_ACQUIRE_RANGE` function bodies under
   function. If a narrower return type truncates a success value of a trylock
   call to a failure value, e.g. `char f() { return trylock(&mu); }` where
   `trylock()` may return 256, the acquired capability is reported as leaked.
-- The bodies of functions that contain loops are not checked yet.
+- Loop bodies are not simulated across iterations. The values of variables
+  that a loop modifies are widened to the union of their pre-loop range and
+  their single-pass back-edge range, and a trylock call in the loop whose
+  result is not tested by a branch condition in the loop is assumed to have
+  acquired its capabilities when the loop exits. Hence, a retry loop that
+  stores the result in a variable and tests that variable in the loop
+  condition, e.g. `while (!r && cond()) r = trylock(&mu); return r;`, is
+  reported. Test the result of the trylock call in the loop body instead, e.g.
+  `while (cond()) { r = trylock(&mu); if (r) break; } return r;` or
+  `for (...) if (trylock(&mu)) return 1; return 0;`.
 
 ### ASSERT_CAPABILITY(...) and ASSERT_SHARED_CAPABILITY(...)
 

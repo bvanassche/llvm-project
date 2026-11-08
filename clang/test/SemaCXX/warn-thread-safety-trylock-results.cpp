@@ -247,6 +247,14 @@ int overwritten_before_call(int c) TRY1 {
   return ok; // beta-warning{{mutex 'mu' is still held at the end of function}}
 }
 
+// The loop invalidates what is known about the value of ok.
+int overwritten_in_loop() TRY1 { // beta-note{{mutex acquired here}}
+  int ok = trylock(&mu); // beta-note{{mutex acquired here}}
+  while (cond())
+    ok = 0;
+  return ok; // beta-warning{{mutex 'mu' is still held at the end of function}} beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
 int overwritten_by_trylock() TRY1 {
   int ok;
   ok = trylock(&mu); // beta-note 2{{mutex acquired here}}
@@ -812,6 +820,45 @@ int many_deref_paths_leak(int c, int *p0, int *p1, int *p2, int *p3, int *p4,
 }
 
 //===----------------------------------------------------------------------===//
+// Irreducible cycles.
+//===----------------------------------------------------------------------===//
+
+int irreducible_inner_cycle(int n, int c) TRY1 { // beta-note{{mutex acquired here}}
+  int ok = 1, z = 0;
+  while (n-- > 0) {
+    if (z == 0)
+      goto L2;
+    else {
+    L1:
+      ok = 0;
+      if (c)
+        goto done;
+    L2:
+      goto L1;
+    }
+  done:;
+  }
+  if (!ok)
+    return 1; // beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+  lock(&mu);
+  return 1;
+}
+
+int irreducible_keeps_pending(int c) TRY1 {
+  int z = 0;
+  (void)trylock1(); // beta-note{{mutex acquired here}}
+  if (z == 0)
+    goto B2;
+  else {
+  B1:
+    if (c)
+      return 0; // beta-warning{{mutex 'mu1' is still held at the end of function}}
+  B2:
+    goto B1;
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // More trylock calls than can be tracked separately, overlapping exclusive
 // and shared ranges, and the context in which capabilities are resolved.
 //===----------------------------------------------------------------------===//
@@ -875,12 +922,65 @@ int AddrS::*try_memptr_impl(bool ok)
 }
 
 //===----------------------------------------------------------------------===//
-// GNU ?: and non-local assignments.
+// Retry loops, irreducible cycles, GNU ?: and non-local assignments.
 //===----------------------------------------------------------------------===//
 
 #define TRY0 __attribute__((try_acquire_capability_range(0, 0, mu)))
 #define TRY_RANGE(lo, hi) __attribute__((try_acquire_capability_range(lo, hi, mu)))
 int tr_1_2() TRY_RANGE(1, 2);
+
+// Loop bodies are not simulated: the values of the variables that a loop
+// modifies are not known at the loop header. Hence, the result of a trylock
+// call that is retried in a loop is not correlated with the loop exit
+// condition, which causes false positives.
+int retry_while_not_r() TRY1 { // beta-note{{mutex acquired here}}
+  int r = 0;
+  while (!r && cond())
+    r = trylock(&mu); // beta-note{{mutex acquired here}}
+  return r; // beta-warning{{mutex 'mu' is still held at the end of function}} beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+int retry_do_while() TRY1 {
+  int r;
+  int n = 0;
+  do {
+    r = trylock(&mu); // beta-note{{mutex acquired here}}
+  } while (!r && ++n < 3); // beta-warning{{mutex 'mu' is not held on every path through here}}
+  return r;
+}
+
+// Retrying a trylock call whose result is tested directly is supported.
+int retry_tested_in_loop() TRY1 {
+  for (int n = 0; n < 3; ++n)
+    if (trylock(&mu))
+      return 1;
+  return 0;
+}
+
+// A trylock result that a later iteration overwrites before it is tested may
+// still be held when the loop exits.
+int overwritten_in_loop_body() TRY1 {
+  int r = 0;
+  while (cond())
+    r = trylock(&mu); // beta-note{{mutex acquired here}}
+  return 0; // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int irreducible_cycle_preserves_unmodified() TRY0 {
+  int r = try0();
+  if (r != 0)
+    return r;
+  int n = 0;
+  if (cond())
+    goto b;
+a:
+  if (++n > 3)
+    return r;
+b:
+  if (cond())
+    goto a;
+  return r;
+}
 
 int gnu_binary_conditional_callee() TRY1 {
   return trylock(&mu) ?: 0;
@@ -1050,6 +1150,27 @@ int leak_comma_assign_in_return() TRY0 {
   return (r = trylock_zero(), -1); // beta-note{{mutex acquired here}} beta-warning{{mutex 'mu' is still held at the end of function}}
 }
 
+// Overwritten trylock definitions in a loop whose terminator does not
+// partition the success set must still be diagnosed as leaked.
+int unknown_loop_pred(int);
+int test_loop_unknown_pred_leak(int n) TRY1 {
+  while (n-- > 0) {
+    int r = trylock(&mu); // beta-note{{mutex acquired here}}
+    if (unknown_loop_pred(r)) {
+    }
+  }
+  return 0; // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int test_loop_partial_range_leak(int n) TRY0 {
+  while (n-- > 0) {
+    int r = trylock_zero(); // beta-note{{mutex acquired here}}
+    if (r > 0) {
+    }
+  }
+  return 1; // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
 // CXXOperatorCallExpr (lambda/functor) that loads a local pointer and
 // StmtExpr with inline assembly.
 int test_alias_lambda_overwrite_bad(AliasReq *req, AliasReq *other)
@@ -1171,6 +1292,236 @@ void test_reassigned_cap_ptr_after_trylock() {
     unlock(&mu); // nonbeta-warning{{releasing mutex 'mu' that was not held}}
   }
 } // nonbeta-warning{{mutex 'q' is not held on every path through here}}
+
+// Retry loops that test the stored trylock result in the loop body preserve
+// the failure range across back edges when exiting via the loop condition.
+int retry_body_break_while_ok() TRY1 {
+  int r = 0;
+  while (cond()) {
+    r = trylock(&mu);
+    if (r)
+      break;
+  }
+  return r;
+}
+
+int retry_body_break_for_ok() TRY1 {
+  int r = 0;
+  for (int i = 0; i < 3; ++i) {
+    r = trylock(&mu);
+    if (r)
+      break;
+  }
+  return r;
+}
+
+int retry_body_break_range_ok() TRY0 {
+  int err = -1;
+  for (int i = 0; i < 3; ++i) {
+    err = trylock_zero();
+    if (err == 0)
+      break;
+  }
+  return err;
+}
+
+int retry_body_break_wrong_init_bad() TRY0 { // beta-note{{mutex acquired here}}
+  int err = 0;
+  while (cond()) {
+    err = trylock_zero();
+    if (err == 0)
+      break;
+  }
+  return err; // beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+int loop_multi_decl_untested_trylock_bad() TRY1 {
+  for (int i = 0; i < 2; ++i) {
+    int dummy = 0, r = trylock(&mu); // beta-note{{mutex acquired here}}
+    (void)dummy;
+    (void)r;
+  }
+  return 0; // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+// The variable holds a comparison or the negation of the trylock result,
+// which is tested on every path back to the loop header.
+int retry_cmp_def_tested() TRY0 {
+  for (int i = 0; i < 3; ++i) {
+    bool ok = (trylock_zero() == 0);
+    if (ok)
+      return 0;
+  }
+  return -1;
+}
+
+int retry_not_def_tested() TRY0 {
+  for (int i = 0; i < 3; ++i) {
+    bool ok = !trylock_zero();
+    if (ok)
+      return 0;
+  }
+  return -1;
+}
+
+int retry_cmp_def_untested_bad() TRY0 {
+  for (int i = 0; i < 3; ++i) {
+    bool ok = (trylock_zero() == 0); // beta-note{{mutex acquired here}}
+    (void)ok;
+  }
+  return -1; // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int stmtexpr_modifies_outer_var_in_cmp_bad() TRY1 {
+  int ok = trylock(&mu); // beta-note{{mutex acquired here}}
+  if (({ ok = 0; ok; }) == 0)
+    return 0; // beta-warning{{mutex 'mu' is still held at the end of function}}
+  return ok;
+}
+
+int stmtexpr_modifies_local_var_in_cmp_bad() TRY1 {
+  int ok = trylock(&mu); // beta-note{{mutex acquired here}}
+  if (({ int r = ok; r = 0; r; }) == 0)
+    return 0; // beta-warning{{mutex 'mu' is still held at the end of function}}
+  return ok;
+}
+
+int stmtexpr_return_modifies_outer_var_bad() TRY1 {
+  int r = trylock(&mu); // beta-note{{mutex acquired here}}
+  return ({ r = 0; r; }); // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+struct __attribute__((scoped_lockable)) ScopedMuGuard {
+  ScopedMuGuard(struct Mutex *m) __attribute__((acquire_capability(m)));
+  ~ScopedMuGuard() __attribute__((release_capability()));
+};
+
+int temp_scoped_guard_in_return_bad() TRY1 { // beta-note{{mutex acquired here}}
+  return (ScopedMuGuard(&mu), 1); // beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+struct AutoUnlockMu {
+  ~AutoUnlockMu() __attribute__((release_capability(mu)));
+};
+
+int join_block_dtor_releases_target_bad(int c) TRY1 { // beta-note{{mutex acquired here}}
+  AutoUnlockMu u;
+  int ok = 0;
+  if (c) {
+    lock(&mu);
+    ok = 1;
+  } else {
+    lock(&mu);
+  }
+  return ok; // beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+struct ExcludesMuDtor {
+  ~ExcludesMuDtor() __attribute__((locks_excluded(mu)));
+};
+
+int dtor_excludes_lock_acquired_in_return_bad() TRY1 {
+  ExcludesMuDtor d;
+  return trylock(&mu); // beta-warning{{cannot call function '~ExcludesMuDtor' while mutex 'mu' is held}}
+}
+
+int dtor_excludes_lock_dedup_across_outcomes_bad()
+    __attribute__((try_acquire_capability_range(1, 2, mu))) {
+  ExcludesMuDtor d;
+  return tr_1_2(); // beta-warning{{cannot call function '~ExcludesMuDtor' while mutex 'mu' is held}}
+}
+
+void inspect_const_ref(const int &v);
+
+int lvalue_conditional_and_const_ref_preserve_range_ok(bool c) TRY1 {
+  int x = 1;
+  int y = 1;
+  inspect_const_ref(x);
+  int z = (c ? x : y);
+  lock(&mu);
+  return x & z;
+}
+
+int deref_lhs_modified_on_rhs_not_nonnull_bad(int *p) TRY1 { // beta-note{{mutex acquired here}}
+  *p = (p = nullptr, 0);
+  if (p) {
+    lock(&mu);
+    return 1;
+  }
+  return 1; // beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+int if_ternary_trylock_cond_ok() TRY1 {
+  if (trylock(&mu) ? 1 : 0)
+    return 1;
+  return 0;
+}
+
+int asm_conditional_lvalue_output_invalidates_alias_bad(AliasReq *req,
+                                                        AliasReq *other,
+                                                        bool c)
+    __attribute__((try_acquire_capability(1, req->head->lock))) { // beta-note{{mutex acquired here}}
+  AliasNode *h = req->head;
+  AliasNode *q = other->head;
+  asm("" : "=r"(c ? h : q));
+  return trylock(&h->lock); // beta-note{{mutex acquired here}} beta-warning{{mutex 'h->lock' is still held at the end of function}} beta-warning{{expecting mutex 'req->head->lock' to be held at the end of function}}
+}
+
+int narrowing_cast_in_branch_cond_leaks_bad() TRY1 { // beta-note{{mutex acquired here}}
+  if ((char)trylock(&mu)) // beta-note{{mutex acquired here}}
+    return 1; // beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+  return 0; // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+int switch_on_logical_not_leaks_bad() TRY1 { // beta-note{{mutex acquired here}}
+  switch ((int)!trylock(&mu)) { // beta-note{{mutex acquired here}}
+  case 0:
+    return 1; // beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+  default:
+    return 0; // beta-warning{{mutex 'mu' is still held at the end of function}}
+  }
+}
+
+int consume_int(int x);
+
+int unmodeled_call_with_trylock_arg_bad() TRY1 { // beta-note{{mutex acquired here}}
+  return consume_int(trylock(&mu)); // beta-note{{mutex acquired here}} beta-warning{{mutex 'mu' is still held at the end of function}} beta-warning{{expecting mutex 'mu' to be held at the end of function}}
+}
+
+int comma_modifies_var_in_pure_return_bad() TRY1 {
+  int x = 1;
+  lock(&mu); // beta-note{{mutex acquired here}}
+  return (x = 0, x); // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
+
+struct __attribute__((scoped_lockable)) ScopedTryTestLock {
+  ScopedTryTestLock(Mutex *m) __attribute__((acquire_capability(m)));
+  ~ScopedTryTestLock() __attribute__((release_capability()));
+};
+
+int sizeof_raii_lock_unevaluated_ok() TRY1 {
+  (void)sizeof(({ ScopedTryTestLock l(&mu); 0; }));
+  lock(&mu);
+  return 1;
+}
+
+struct AliasHolderBox {
+  Mutex *m;
+  void reset();
+};
+
+void nonconst_member_call_invalidates_local_struct_alias(Mutex *m1) {
+  AliasHolderBox box = {m1};
+  box.reset();
+  lock(box.m); // expected-note{{mutex acquired here}}
+  unlock(m1); // expected-warning{{releasing mutex 'm1' that was not held}}
+} // expected-warning{{mutex 'box.m' is still held at the end of function}}
+
+int binary_cond_and_lhs_mod_in_pure_return_bad() TRY1 {
+  int x = 1;
+  lock(&mu); // beta-note{{mutex acquired here}}
+  return ((x ?: 0) && ((x = 0) == 0 && x != 0)) ? 1 : 0; // beta-warning{{mutex 'mu' is still held at the end of function}}
+}
 
 // The values of the conditions that the return value forks on are the values
 // that these had when they were evaluated. An operand that modifies 's'
