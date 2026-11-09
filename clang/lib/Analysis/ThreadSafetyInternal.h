@@ -179,7 +179,7 @@ public:
   bool isEmpty() const { return FactIDs.size() == 0; }
 
   // Return true if the set contains only negative facts
-  bool isEmpty(FactManager &FactMan) const {
+  bool isEmpty(const FactManager &FactMan) const {
     for (const auto FID : *this) {
       if (!FactMan[FID].negative())
         return false;
@@ -233,20 +233,21 @@ public:
                          [&](FactID ID) { return FM[ID].matches(CapE); });
   }
 
-  const FactEntry *findLock(FactManager &FM, const CapabilityExpr &CapE) const {
+  const FactEntry *findLock(const FactManager &FM,
+                            const CapabilityExpr &CapE) const {
     auto I =
         llvm::find_if(*this, [&](FactID ID) { return FM[ID].matches(CapE); });
     return I != end() ? &FM[*I] : nullptr;
   }
 
-  const FactEntry *findLockUniv(FactManager &FM,
+  const FactEntry *findLockUniv(const FactManager &FM,
                                 const CapabilityExpr &CapE) const {
     auto I = llvm::find_if(
         *this, [&](FactID ID) -> bool { return FM[ID].matchesUniv(CapE); });
     return I != end() ? &FM[*I] : nullptr;
   }
 
-  const FactEntry *findPartialMatch(FactManager &FM,
+  const FactEntry *findPartialMatch(const FactManager &FM,
                                     const CapabilityExpr &CapE) const {
     auto I = llvm::find_if(*this, [&](FactID ID) -> bool {
       return FM[ID].partiallyMatches(CapE);
@@ -254,13 +255,14 @@ public:
     return I != end() ? &FM[*I] : nullptr;
   }
 
-  bool containsMutexDecl(FactManager &FM, const ValueDecl *Vd) const {
+  bool containsMutexDecl(const FactManager &FM, const ValueDecl *Vd) const {
     auto I = llvm::find_if(
         *this, [&](FactID ID) -> bool { return FM[ID].valueDecl() == Vd; });
     return I != end();
   }
 };
 
+class BuildLockset;
 class ThreadSafetyAnalyzer;
 
 /// The body of a trivial inline or constexpr function whose return value can
@@ -1014,6 +1016,23 @@ public:
   void getMutexIDs(CapExprSet &Mtxs, AttrType *Attr, const Expr *Exp,
                    const NamedDecl *D, til::SExpr *Self = nullptr);
 
+  /// The capabilities that a call acquires and releases.
+  struct CallLockEffects {
+    CapExprSet ExclusiveLocksToAdd, SharedLocksToAdd;
+    CapExprSet ExclusiveLocksToRemove, SharedLocksToRemove,
+        GenericLocksToRemove;
+  };
+  bool collectLockEffects(const Attr *At, const Expr *Exp, const NamedDecl *D,
+                          til::SExpr *Self, CallLockEffects &Effects);
+
+  /// An implicit call at the end of the scope of a variable.
+  struct ScopeExitCall {
+    const NamedDecl *Callee;
+    til::SExpr *Self;
+    SourceLocation Loc;
+  };
+  std::optional<ScopeExitCall> getScopeExitCall(const CFGElement &BI);
+
   using IntDomain = threadSafety::IntDomain;
   using IntRangeSet = threadSafety::IntRangeSet;
 
@@ -1375,10 +1394,10 @@ public:
   bool join(const FactEntry &A, const FactEntry &B, SourceLocation JoinLoc,
             LockErrorKind EntryLEK);
 
-  void intersectAndWarn(FactSet &EntrySet, const FactSet &ExitSet,
-                        SourceLocation JoinLoc, LockErrorKind EntryLEK,
-                        LockErrorKind ExitLEK,
-                        const CapExprSet *TrylockRebranchCaps = nullptr);
+  void intersectAndWarn(
+      FactSet &EntrySet, const FactSet &ExitSet, SourceLocation JoinLoc,
+      LockErrorKind EntryLEK, LockErrorKind ExitLEK,
+      llvm::function_ref<bool(const FactEntry &)> IsIgnored = nullptr);
 
   void intersectAndWarn(FactSet &EntrySet, const FactSet &ExitSet,
                         SourceLocation JoinLoc, LockErrorKind LEK) {
@@ -1394,6 +1413,26 @@ public:
   void updatePendingTrylockRanges(PendingTrylockRanges &EntryPending,
                                   const CFGBlock *CurrBlock,
                                   const CFGBlockInfo *CurrBlockInfo);
+  bool computeEntryLockset(const NamedDecl *D, const CFG &CFGraph,
+                           const PostOrderCFGView &SortedGraph,
+                           CFGBlockInfo &Initial,
+                           CapExprSet &ExclusiveLocksAcquired,
+                           CapExprSet &SharedLocksAcquired,
+                           CapExprSet &LocksReleased);
+  FactSet computeExpectedExitSet(const NamedDecl *D, const FactSet &EntrySet,
+                                 const CapExprSet &ExclusiveLocksAcquired,
+                                 const CapExprSet &SharedLocksAcquired,
+                                 const CapExprSet &LocksReleased);
+  void
+  joinPredecessors(const CFGBlock *CurrBlock, CFGBlockInfo *CurrBlockInfo,
+                   PostOrderCFGView::CFGBlockSet &VisitedBlocks,
+                   const std::vector<PendingTrylockRanges> &BlockExitPending,
+                   PendingTrylockRanges &EntryPending);
+  void visitBlockElements(const CFGBlock *CurrBlock,
+                          BuildLockset &LocksetBuilder,
+                          AnalysisDeclContext &AC);
+  void checkBackEdgeLocksets(const CFGBlock *CurrBlock,
+                             PostOrderCFGView::CFGBlockSet &VisitedBlocks);
   void runAnalysis(AnalysisDeclContext &AC);
 
   void warnIfMutexNotHeld(const FactSet &FSet, const NamedDecl *D,
@@ -1451,10 +1490,10 @@ LLVM_LIBRARY_VISIBILITY const NamedDecl *
 getTrylockCallee(const CallExpr *CallExp);
 LLVM_LIBRARY_VISIBILITY bool
 isEvaluatedUnaryExprOrTypeTrait(const UnaryExprOrTypeTraitExpr *TE);
-
-// Defined in ThreadSafetyValueEval.cpp.
 LLVM_LIBRARY_VISIBILITY bool neverReturns(const CFGBlock *B);
 LLVM_LIBRARY_VISIBILITY const Expr *unpackConstruction(const Expr *E);
+
+// Defined in ThreadSafetyValueEval.cpp.
 LLVM_LIBRARY_VISIBILITY bool isConversionFunctionCast(const CastExpr *CE);
 LLVM_LIBRARY_VISIBILITY bool isValuePreservingCast(const CastExpr *CE,
                                                    const ASTContext &Ctx);
