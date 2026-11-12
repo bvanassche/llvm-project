@@ -4267,6 +4267,24 @@ def TryAcquireCapability : InheritableAttr {
   let Documentation = [TryAcquireCapabilityDocs];
 }
 
+def TryAcquireCapabilityRange : InheritableAttr {
+  let Spellings = [Clang<"try_acquire_capability_range", 0>,
+                   Clang<"try_acquire_shared_capability_range", 0>];
+  let Subjects = SubjectList<[Function, Var, Field]>;
+  let LateParsed = LateAttrParseExperimentalExt;
+  let TemplateDependent = 1;
+  let ParseArgumentsAsUnevaluated = 1;
+  let InheritEvenIfAlreadyPresent = 1;
+  let ParseArgsInFunctionScope = 1;
+  let Args = [ExprArgument<"FirstSuccessValue">,
+              ExprArgument<"LastSuccessValue">,
+              VariadicExprArgument<"Args">];
+  let AcceptsExprPack = 1;
+  let Accessors = [Accessor<"isShared",
+                    [Clang<"try_acquire_shared_capability_range", 0>]>];
+  let Documentation = [TryAcquireCapabilityRangeDocs];
+}
+
 def ReleaseCapability : InheritableAttr {
   let Spellings = [Clang<"release_capability", 0>,
                    Clang<"release_shared_capability", 0>,

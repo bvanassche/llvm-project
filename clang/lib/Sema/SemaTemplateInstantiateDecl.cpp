@@ -1153,9 +1153,9 @@ void Sema::instantiateRedeclThreadSafetyAttrs(FunctionDecl *New,
   for (const Attr *A : NewAttrs)
     if (!A->isInherited() &&
         isa<AssertCapabilityAttr, AcquireCapabilityAttr,
-            TryAcquireCapabilityAttr, ReleaseCapabilityAttr,
-            RequiresCapabilityAttr, LocksExcludedAttr, LockReturnedAttr,
-            NoThreadSafetyAnalysisAttr>(A))
+            TryAcquireCapabilityAttr, TryAcquireCapabilityRangeAttr,
+            ReleaseCapabilityAttr, RequiresCapabilityAttr, LocksExcludedAttr,
+            LockReturnedAttr, NoThreadSafetyAnalysisAttr>(A))
       Attrs.push_back(A);
   if (Attrs.empty())
     return;

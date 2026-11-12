@@ -23,6 +23,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include <optional>
+#include <utility>
 
 namespace clang {
 
@@ -31,6 +32,8 @@ class AnalysisDeclContext;
 class Expr;
 class FunctionDecl;
 class NamedDecl;
+class QualType;
+class TryAcquireCapabilityRangeAttr;
 
 namespace threadSafety {
 
@@ -329,6 +332,17 @@ LockKind getLockKindFromAccessKind(AccessKind AK);
 /// trylock attributes and by the analysis to evaluate them.
 std::optional<llvm::APSInt>
 getIntegralOrEnumConstantExpr(const Expr *E, const ASTContext &Ctx);
+
+/// Returns the first and last success value of the try_acquire_capability_range
+/// attribute \p A, or std::nullopt if either is not an integer constant of
+/// integral or unscoped enumeration type.
+std::optional<std::pair<llvm::APSInt, llvm::APSInt>>
+getTrylockSuccessRange(const TryAcquireCapabilityRangeAttr *A,
+                       const ASTContext &Ctx);
+
+/// Whether try_acquire_capability_range applies to functions that return
+/// \p Ty: a non-boolean integer, unscoped enumeration or pointer type.
+bool isRangeTrylockReturnType(QualType Ty);
 
 } // namespace threadSafety
 } // namespace clang

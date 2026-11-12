@@ -1371,6 +1371,9 @@ public:
   sema::AnalysisBasedWarnings AnalysisWarnings;
   threadSafety::BeforeSet *ThreadSafetyDeclCache;
 
+  /// Check the thread safety attributes of the redeclarations of \p D whose
+  /// checks depend on its type after that type has been deduced.
+  void checkDeducedFunctionThreadSafetyAttrs(Decl *D);
   bool checkConflictingTryAcquireRedecl(
       const Decl *Old, Decl *New, Attr *NewAttr,
       std::optional<ArrayRef<Attr *>> OnlyOldAttrs = std::nullopt);

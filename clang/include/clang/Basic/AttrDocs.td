@@ -1188,6 +1188,30 @@ different access modes but the same success value. If they do,
   }];
 }
 
+def TryAcquireCapabilityRangeDocs : Documentation {
+  let Category = DocCatFunction;
+  let Heading = "try_acquire_capability_range, try_acquire_shared_capability_range";
+  let Content = [{
+Marks a function, function pointer, or function reference that attempts to
+acquire a capability and returns a non-boolean integer, unscoped enumeration, or
+pointer value indicating whether acquisition succeeded. The first two arguments
+must be integer constant expressions that specify the inclusive range
+`[low, high]` of return values that indicate that the capability was
+successfully acquired (pointer return values are compared as unsigned integers
+of type `uintptr_t`); any remaining arguments specify the capabilities acquired
+on success (defaulting to `this` when omitted on a non-static member function of
+a capability type).
+
+Several attributes for the same capability and access mode describe the union
+of their ranges. If `low > high`, an error is diagnosed. If the return type is
+not one of these types, if the range does not contain any value of the return
+type, if an attribute on a redeclaration conflicts with an earlier declaration,
+or if the range overlaps with the success values of an earlier attribute of the
+same declaration that acquires the same capability in the other access mode,
+`-Wthread-safety-attributes` warns about the attribute and it is ignored.
+  }];
+}
+
 def ReleaseCapabilityDocs : Documentation {
   let Category = DocCatFunction;
   let Heading = "release_capability, release_shared_capability";

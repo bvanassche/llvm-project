@@ -515,6 +515,32 @@ void foo() {
 }
 ```
 
+### TRY_ACQUIRE_RANGE(\<low>, \<high>, ...), TRY_ACQUIRE_SHARED_RANGE(\<low>, \<high>, ...)
+
+These are attributes on a function, method, function pointer, or function
+reference that tries to acquire the given capability and returns a non-boolean
+integer, unscoped enumeration, or pointer value indicating success or failure.
+The first two arguments must be integer constant expressions specifying the
+inclusive range `[low, high]` (with `low <= high`) of return values that
+indicate success, and the remaining arguments are interpreted in the same way
+as `ACQUIRE`. Pointer return values are compared as unsigned integers of type
+`uintptr_t`; because `low` and `high` must satisfy `low <= high` when evaluated
+as constant expressions, ranges that exclude negative errno sentinel pointers
+use unsigned bounds such as `TRY_ACQUIRE_RANGE(1, (uintptr_t)-4096 - 1, mu)`.
+
+If the return type is not a non-boolean integer, unscoped enumeration, or
+pointer type, if the range does not contain any value of the return type, or if
+an attribute on a redeclaration differs from all attributes of the earlier
+declaration, `-Wthread-safety-attributes` warns about the attribute and it is
+ignored. For templates, this is checked for each instantiation, and for
+functions with a deduced return type, after the return type has been deduced.
+
+Several `TRY_ACQUIRE_RANGE` or several `TRY_ACQUIRE_SHARED_RANGE` attributes for
+the same capability describe the union of their ranges. If a success value of
+an attribute is also a success value of an earlier attribute of the same
+declaration that acquires the same capability in the other access mode,
+`-Wthread-safety-attributes` warns about the attribute and it is ignored.
+
 ### ASSERT_CAPABILITY(...) and ASSERT_SHARED_CAPABILITY(...)
 
 *Previously:* `ASSERT_EXCLUSIVE_LOCK`, `ASSERT_SHARED_LOCK`
@@ -923,6 +949,12 @@ implementation.
 
 #define TRY_ACQUIRE_SHARED(...) \
   THREAD_ANNOTATION_ATTRIBUTE__(try_acquire_shared_capability(__VA_ARGS__))
+
+#define TRY_ACQUIRE_RANGE(...) \
+  THREAD_ANNOTATION_ATTRIBUTE__(try_acquire_capability_range(__VA_ARGS__))
+
+#define TRY_ACQUIRE_SHARED_RANGE(...) \
+  THREAD_ANNOTATION_ATTRIBUTE__(try_acquire_shared_capability_range(__VA_ARGS__))
 
 #define EXCLUDES(...) \
   THREAD_ANNOTATION_ATTRIBUTE__(locks_excluded(__VA_ARGS__))

@@ -536,6 +536,15 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   but a different success value, or a different access mode but the same success
   value.
 
+- Added the `try_acquire_capability_range` and
+  `try_acquire_shared_capability_range` thread safety attributes, whose first
+  two arguments specify the inclusive range `[low, high]` of non-boolean
+  integer, unscoped enumeration, or pointer return values (with pointers
+  compared as `uintptr_t`) indicating that the capability was successfully
+  acquired. Attributes on functions whose return type is not one of these types
+  or cannot represent any value of the range are ignored, and new
+  `-Wthread-safety-attributes` warnings diagnose them.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed a false-positive `-Wimplicit-fallthrough` warning when

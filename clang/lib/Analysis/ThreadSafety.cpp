@@ -1197,6 +1197,30 @@ threadSafety::getIntegralOrEnumConstantExpr(const Expr *E,
   return std::nullopt;
 }
 
+std::optional<std::pair<llvm::APSInt, llvm::APSInt>>
+threadSafety::getTrylockSuccessRange(const TryAcquireCapabilityRangeAttr *A,
+                                     const ASTContext &Ctx) {
+  const Expr *FirstE = A->getFirstSuccessValue();
+  const Expr *LastE = A->getLastSuccessValue();
+  if (!FirstE || !LastE || FirstE->isTypeDependent() ||
+      LastE->isTypeDependent() || FirstE->getType()->isBooleanType() ||
+      LastE->getType()->isBooleanType() ||
+      !FirstE->getType()->isIntegralOrUnscopedEnumerationType() ||
+      !LastE->getType()->isIntegralOrUnscopedEnumerationType())
+    return std::nullopt;
+  auto First = getIntegralOrEnumConstantExpr(FirstE, Ctx);
+  auto Last = getIntegralOrEnumConstantExpr(LastE, Ctx);
+  if (!First || !Last)
+    return std::nullopt;
+  return std::make_pair(std::move(*First), std::move(*Last));
+}
+
+bool threadSafety::isRangeTrylockReturnType(QualType Ty) {
+  return !Ty.isNull() && !Ty->isDependentType() &&
+         ((!Ty->isBooleanType() && Ty->isIntegralOrUnscopedEnumerationType()) ||
+          Ty->isAnyPointerType());
+}
+
 /// Extract the list of mutexIDs from a trylock attribute.  If the
 /// trylock applies to the given edge, then push them onto Mtxs, discarding
 /// any duplicates.
@@ -3095,7 +3119,8 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
         getMutexIDs(A->isShared() ? SharedLocksAcquired
                                   : ExclusiveLocksAcquired,
                     A, nullptr, D);
-      } else if (isa<TryAcquireCapabilityAttr>(Attr)) {
+      } else if (isa<TryAcquireCapabilityAttr, TryAcquireCapabilityRangeAttr>(
+                     Attr)) {
         // Don't try to check trylock functions for now.
         return;
       }

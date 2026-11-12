@@ -59,6 +59,13 @@ int TestExpr __attribute__((guarded_by(mu1)));
 // CHECK-NEXT:   GuardedByAttr
 // CHECK-NEXT:     DeclRefExpr{{.*}}mu1
 
+int TestTryAcquireRange(void) __attribute__((try_acquire_capability_range(0, 1, mu1)));
+// CHECK:      FunctionDecl{{.*}}TestTryAcquireRange
+// CHECK:        TryAcquireCapabilityRangeAttr
+// CHECK-NEXT:     IntegerLiteral{{.*}}'int' 0
+// CHECK-NEXT:     IntegerLiteral{{.*}}'int' 1
+// CHECK-NEXT:     DeclRefExpr{{.*}}mu1
+
 class Mutex TestVariadicExpr __attribute__((acquired_after(mu1, mu2)));
 // CHECK:      VarDecl{{.*}}TestVariadicExpr
 // CHECK:        AcquiredAfterAttr

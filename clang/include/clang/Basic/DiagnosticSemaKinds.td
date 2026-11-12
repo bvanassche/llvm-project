@@ -4409,8 +4409,21 @@ def err_attribute_argument_out_of_bounds_extra_info : Error<
   "%plural{0:no parameters to index into|"
   "1:can only be 1, since there is one parameter|"
   ":must be between 1 and %2}2">;
+def err_thread_attribute_empty_range : Error<
+  "%0 attribute range [%1, %2] is empty">;
+def warn_thread_attribute_range_return_type : Warning<
+  "%0 attribute only applies to functions and function pointers or references "
+  "that return a non-boolean integer, unscoped enumeration, or pointer type; "
+  "type here is %1; ignoring the attribute">,
+  InGroup<ThreadSafetyAttributes>, DefaultIgnore;
+def warn_thread_attribute_range_outside_return_type : Warning<
+  "%0 attribute range [%1, %2] does not contain any value of return type %3; "
+  "ignoring the attribute">,
+  InGroup<ThreadSafetyAttributes>, DefaultIgnore;
 def warn_thread_attribute_trylock_non_binary_value : Warning<
-  "%0 attribute success value %1 is treated as 'true'">,
+  "%0 attribute success value %1 is treated as 'true'; specify 'true' or use "
+  "%select{'try_acquire_capability_range'|"
+  "'try_acquire_shared_capability_range'}2 to match a specific return value">,
   InGroup<ThreadSafetyAttributes>, DefaultIgnore;
 def warn_thread_attribute_conflicting_redecl : Warning<
   "%0 attribute on redeclaration conflicts with previous declaration; "

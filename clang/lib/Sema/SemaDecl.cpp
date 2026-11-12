@@ -13731,6 +13731,9 @@ bool Sema::DeduceVariableDeclarationType(VarDecl *VDecl, bool DirectInit,
 
   // Check the deduced type is valid for a variable declaration.
   CheckVariableDeclarationType(VDecl);
+  if (!VDecl->isInvalidDecl() && !VDecl->getType()->isDependentType() &&
+      VDecl->hasAttrs())
+    checkDeducedFunctionThreadSafetyAttrs(VDecl);
   return VDecl->isInvalidDecl();
 }
 
@@ -17081,6 +17084,14 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body, bool IsInstantiation,
                                               Proto->getExtProtoInfo()));
         }
       }
+
+      // Check the thread safety attributes whose checks depend on the return
+      // type, which could not be checked before it was deduced.
+      if (getLangOpts().CPlusPlus && !FD->isInvalidDecl() &&
+          !FD->isDependentContext() &&
+          (FD->getDeclaredReturnType()->getContainedDeducedType() ||
+           (isLambdaCallOperator(FD) && getCurLambda()->HasImplicitReturnType)))
+        checkDeducedFunctionThreadSafetyAttrs(FD);
 
       // If the function implicitly returns zero (like 'main') or is naked,
       // don't complain about missing return statements.
