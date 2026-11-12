@@ -1,9 +1,11 @@
 // Test this without pch.
 // RUN: %clang_cc1 -include %s -fsyntax-only -verify -Wthread-safety -std=c++11 %s
+// RUN: %clang_cc1 -include %s -fsyntax-only -verify=expected,beta -Wthread-safety -Wthread-safety-beta -std=c++11 %s
 
 // Test with pch.
 // RUN: %clang_cc1 -emit-pch -o %t %s -Wthread-safety -std=c++11
 // RUN: %clang_cc1 -include-pch %t -fsyntax-only -verify -Wthread-safety -std=c++11 %s
+// RUN: %clang_cc1 -include-pch %t -fsyntax-only -verify=expected,beta -Wthread-safety -Wthread-safety-beta -std=c++11 %s
 
 #ifndef HEADER
 #define HEADER
@@ -367,6 +369,13 @@ void sls_inline_helper_from_pch() {
     return;
   }
   sls_mu.Unlock();
+}
+
+int sls_trylock_impl_with_pch_helper(int r)
+    __attribute__((try_acquire_capability_range(0, 0, sls_mu))) { // beta-note{{mutex acquired here}}
+  if (sls_is_zero(r))
+    return 0; // beta-warning{{expecting mutex 'sls_mu' to be held at the end of function}}
+  return 1;
 }
 
 #endif

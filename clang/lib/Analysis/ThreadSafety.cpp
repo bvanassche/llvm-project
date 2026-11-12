@@ -25,6 +25,7 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/IgnoreExpr.h"
 #include "clang/AST/OperationKinds.h"
+#include "clang/AST/ParentMap.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/StmtVisitor.h"
@@ -41,10 +42,14 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/Specifiers.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/ImmutableMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SetOperations.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -135,6 +140,16 @@ public:
 // Add new local variables to the variable map
 void VarMapBuilder::VisitDeclStmt(const DeclStmt *S) {
   bool modifiedCtx = false;
+  forEachDeclVLAExpr(S, /*IncludeTopLevelVLA=*/false, [&](const Expr *Sz) {
+    llvm::SmallPtrSet<const ValueDecl *, 4> ModVars;
+    scanModifiedVars(Sz, (*S->decl_begin())->getASTContext(), ModVars);
+    for (const ValueDecl *ModVD : ModVars) {
+      if (Ctx.lookup(ModVD)) {
+        Ctx = VMap->clearDefinition(ModVD, Ctx);
+        modifiedCtx = true;
+      }
+    }
+  });
   const DeclGroupRef DGrp = S->getDeclGroup();
   for (const auto *D : DGrp) {
     if (const auto *VD = dyn_cast_or_null<VarDecl>(D)) {
@@ -761,14 +776,15 @@ void LocalVariableMap::traverseCFG(
 
     // Mark variables on back edges as "unknown" if they've been changed.
     for (CFGBlock::const_succ_iterator SI = CurrBlock->succ_begin(),
-         SE  = CurrBlock->succ_end(); SI != SE; ++SI) {
+                                       SE = CurrBlock->succ_end();
+         SI != SE; ++SI) {
       // if CurrBlock -> *SI is *not* a back edge
       if (*SI == nullptr || !VisitedBlocks.alreadySet(*SI))
         continue;
 
       CFGBlock *FirstLoopBlock = *SI;
       Context LoopBegin = BlockInfo[FirstLoopBlock->getBlockID()].EntryContext;
-      Context LoopEnd   = CurrBlockInfo->ExitContext;
+      Context LoopEnd = CurrBlockInfo->ExitContext;
       intersectBackEdge(LoopBegin, LoopEnd);
     }
   }
@@ -896,10 +912,12 @@ BeforeSet::getBeforeInfoForDecl(const ValueDecl *Vd,
 }
 
 /// Return true if any mutexes in FSet are in the acquired_before set of Vd.
-void BeforeSet::checkBeforeAfter(const ValueDecl* StartVd,
-                                 const FactSet& FSet,
-                                 ThreadSafetyAnalyzer& Analyzer,
-                                 SourceLocation Loc, StringRef CapKind) {
+void BeforeSet::checkBeforeAfter(const ValueDecl *StartVd, const FactSet &FSet,
+                                 ThreadSafetyAnalyzer &Analyzer,
+                                 SourceLocation Loc, StringRef CapKind,
+                                 ThreadSafetyHandler *DiagHandler) {
+  ThreadSafetyHandler &OutHandler =
+      DiagHandler ? *DiagHandler : Analyzer.Handler;
   SmallVector<BeforeInfo*, 8> InfoVect;
 
   // Do a depth-first traversal of Vd.
@@ -926,13 +944,13 @@ void BeforeSet::checkBeforeAfter(const ValueDecl* StartVd,
       if (FSet.containsMutexDecl(Analyzer.FactMan, Vdb)) {
         StringRef L1 = StartVd->getName();
         StringRef L2 = Vdb->getName();
-        Analyzer.Handler.handleLockAcquiredBefore(CapKind, L1, L2, Loc);
+        OutHandler.handleLockAcquiredBefore(CapKind, L1, L2, Loc);
       }
       // Transitively search other before sets, and warn on cycles.
       if (traverse(Vdb)) {
         if (CycMap.try_emplace(Vd, true).second) {
           StringRef L1 = Vd->getName();
-          Analyzer.Handler.handleBeforeAfterCycle(L1, Vd->getLocation());
+          OutHandler.handleBeforeAfterCycle(L1, Vd->getLocation());
         }
       }
     }
@@ -1010,8 +1028,8 @@ bool ThreadSafetyAnalyzer::collectLockEffects(const Attr *At, const Expr *Exp,
   return false;
 }
 
-/// Returns the call of the destructor with attributes of an automatic object
-/// or of the cleanup function that \p BI represents.
+/// Returns the call of a destructor with attributes or of a cleanup function
+/// that \p BI represents.
 std::optional<ThreadSafetyAnalyzer::ScopeExitCall>
 ThreadSafetyAnalyzer::getScopeExitCall(const CFGElement &BI) {
   if (std::optional<CFGAutomaticObjDtor> AD = BI.getAs<CFGAutomaticObjDtor>()) {
@@ -1036,15 +1054,32 @@ ThreadSafetyAnalyzer::getScopeExitCall(const CFGElement &BI) {
                          SxBuilder.translateVariable(CF->getVarDecl(), nullptr),
                          CF->getVarDecl()->getLocation()};
   }
+  if (std::optional<CFGTemporaryDtor> TD = BI.getAs<CFGTemporaryDtor>()) {
+    if (UnevaluatedStmts.contains(TD->getBindTemporaryExpr()))
+      return std::nullopt;
+    const auto *DD = TD->getDestructorDecl(*ASTCtx);
+    if (!DD || !DD->hasAttrs())
+      return std::nullopt;
+    if (auto Object =
+            ConstructedObjects.find(TD->getBindTemporaryExpr()->getSubExpr());
+        Object != ConstructedObjects.end())
+      return ScopeExitCall{DD, Object->second,
+                           TD->getBindTemporaryExpr()->getEndLoc()};
+  }
   return std::nullopt;
 }
 
 /// Add a new lock to the lockset, warning if the lock is already there.
 /// \param ReqAttr -- true if this is part of an initial Requires attribute.
+/// \param DiagHandler -- the handler that reports diagnostics, or nullptr to
+/// use \c Handler.
 void ThreadSafetyAnalyzer::addLock(FactSet &FSet, const FactEntry *Entry,
-                                   bool ReqAttr) {
+                                   bool ReqAttr,
+                                   ThreadSafetyHandler *DiagHandler) {
   if (Entry->shouldIgnore())
     return;
+
+  ThreadSafetyHandler &H = DiagHandler ? *DiagHandler : Handler;
 
   if (!ReqAttr && !Entry->negative()) {
     // look for the negative capability, and remove it from the fact set.
@@ -1054,20 +1089,21 @@ void ThreadSafetyAnalyzer::addLock(FactSet &FSet, const FactEntry *Entry,
       FSet.removeLock(FactMan, NegC);
     } else {
       if (inCurrentScope(*Entry) && !Entry->asserted() && !Entry->reentrant())
-        Handler.handleNegativeNotHeld(Entry->getKind(), Entry->toString(),
-                                      NegC.toString(), Entry->loc());
+        H.handleNegativeNotHeld(Entry->getKind(), Entry->toString(),
+                                NegC.toString(), Entry->loc());
     }
   }
 
   // Check before/after constraints
   if (!Entry->asserted() && !Entry->declared()) {
     GlobalCache->BSet.checkBeforeAfter(Entry->valueDecl(), FSet, *this,
-                                       Entry->loc(), Entry->getKind());
+                                       Entry->loc(), Entry->getKind(),
+                                       DiagHandler);
   }
 
   if (const FactEntry *Cp = FSet.findLock(FactMan, *Entry)) {
     if (!Entry->asserted())
-      Cp->handleLock(FSet, FactMan, *Entry, Handler);
+      Cp->handleLock(FSet, FactMan, *Entry, H);
   } else {
     FSet.addLock(FactMan, Entry);
   }
@@ -1261,6 +1297,11 @@ bool threadSafety::isSharedTrylockAttr(const Attr *A) {
   return visitTrylockAttr(A, [](const auto *TA) { return TA->isShared(); });
 }
 
+static bool trylockAttrHasArgs(const Attr *A) {
+  return visitTrylockAttr(A,
+                          [](const auto *TA) { return TA->args_size() != 0; });
+}
+
 void ThreadSafetyAnalyzer::getTrylockMutexIDs(CapExprSet &Mtxs, const Attr *A,
                                               const Expr *Exp,
                                               const NamedDecl *D) {
@@ -1421,11 +1462,13 @@ ThreadSafetyAnalyzer::getTrylockCallDomain(const CallExpr *CallExp) const {
 /// call may return on the edge indicates success. If \p Pending is non-null,
 /// narrow the return values of the call using any entry for it in \p Pending
 /// and update \p Pending with the return values and attributes on the edge.
-void ThreadSafetyAnalyzer::getEdgeLockset(FactSet &Result,
-                                          const FactSet &ExitSet,
-                                          const CFGBlock *PredBlock,
-                                          const CFGBlock *CurrBlock,
-                                          PendingTrylockRanges *Pending) {
+void ThreadSafetyAnalyzer::getEdgeLockset(
+    FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
+    const CFGBlock *CurrBlock,
+    llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs,
+    const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs,
+    SmallVectorImpl<OverwrittenTrylockDef> *MixedEdgeCalls,
+    PendingTrylockRanges *Pending) {
   Result = ExitSet;
 
   TrylockRangeCondResult Cond;
@@ -1489,17 +1532,26 @@ void ThreadSafetyAnalyzer::getEdgeLockset(FactSet &Result,
   }
   const bool KeepPending =
       Pending && LastTrylockCondBlock.lookup(Cond.Call) != PredBlock;
+  bool Mixed = false;
   if (!EdgeSet.empty()) {
     LocalVarLookupScope Lookup(*this, Cond.CallCtx);
     CapExprSet ExclusiveLocksToAdd, SharedLocksToAdd;
     for (const Attr *A : trylockAttrs(Cond.Callee)) {
-      if (!trylockAttrAppliesTo(A, Cond.Call->getType()) ||
-          PendingAcquired.contains(A) || PendingConsumed.contains(A))
+      if (!trylockAttrAppliesTo(A, Cond.Call->getType()))
         continue;
       auto SuccSet =
           getCombinedTrylockSuccessSet(A, Cond.Call, Cond.Callee, Cond.Dom);
-      if (!SuccSet || !EdgeSet.subsetOfSet(*SuccSet))
+      if (!SuccSet)
         continue;
+      if ((ConsumedAttrs && ConsumedAttrs->contains({Cond.Call, A})) ||
+          PendingAcquired.contains(A) || PendingConsumed.contains(A))
+        continue;
+      if (!EdgeSet.subsetOfSet(*SuccSet)) {
+        // The call may or may not have acquired the capabilities on this edge.
+        if (!EdgeSet.intersect(*SuccSet).empty())
+          Mixed = true;
+        continue;
+      }
       // If the left-hand side of a logical operator may short-circuit to the
       // successor of this edge whether or not the call succeeded, e.g. if
       // 'other' is false in 'if (p && other && is_err(p))', the capabilities
@@ -1511,8 +1563,14 @@ void ThreadSafetyAnalyzer::getEdgeLockset(FactSet &Result,
           !Cond.ShortCircuitSet.subsetOfSet(*SuccSet))
         continue;
       if (collectTrylockCaps(A, Cond.Call, Cond.Callee, ExclusiveLocksToAdd,
-                             SharedLocksToAdd))
+                             SharedLocksToAdd)) {
+        if (AcquiredAttrs) {
+          AcquiredAttrs->insert({Cond.Call, A});
+          if (CurrentVerifier)
+            CurrentVerifier->recordCallCtx(Cond.Call, Cond.CallCtx);
+        }
         PendingAcquired[A] = EdgeSet;
+      }
     }
     addTrylockFacts(Result, ExclusiveLocksToAdd, SharedLocksToAdd,
                     Cond.Call->getExprLoc());
@@ -1525,6 +1583,16 @@ void ThreadSafetyAnalyzer::getEdgeLockset(FactSet &Result,
     Pending->push_back({Cond.Call, Cond.CallCtx, Cond.Dom, std::move(Narrowed),
                         std::move(PendingAcquired),
                         std::move(PendingConsumed)});
+  if (Mixed && MixedEdgeCalls) {
+    // Restrict the values of the call to those of the edge if the condition
+    // is evaluated in the domain of the call.
+    std::optional<IntRangeSet> Allowed;
+    if (auto CallDom = getScalarDomain(Cond.Call->getType());
+        CallDom && *CallDom == Cond.Dom)
+      Allowed = EdgeSet;
+    MixedEdgeCalls->push_back(
+        {Cond.Call, Cond.CallCtx, Cond.Call->getType(), std::move(Allowed)});
+  }
 }
 
 /// If the terminator of \p Block branches on the result of a try-lock call
@@ -2504,6 +2572,11 @@ void BuildLockset::VisitReturnStmt(const ReturnStmt *S) {
         ReturnType->getPointeeType().isConstQualified() ? AK_Read : AK_Written,
         POK_ReturnByRef);
   } else if (ReturnType->isPointerType()) {
+    // The capabilities that the caller of a try-acquire function holds
+    // depend on the return value. runAnalysis() checks returned pointers
+    // per return value instead.
+    if (Analyzer->CurrentVerifier)
+      return;
     Analyzer->checkPtAccess(
         FunctionExitFSet, RetVal,
         ReturnType->getPointeeType().isConstQualified() ? AK_Read : AK_Written,
@@ -2514,19 +2587,29 @@ void BuildLockset::VisitReturnStmt(const ReturnStmt *S) {
 /// Given two facts merging on a join point, possibly warn and decide whether to
 /// keep or replace.
 ///
+/// \param ReportMissingAcquire Whether to report a reentrancy depth of \p B
+/// that is lower than that of \p A as a missing acquire, i.e. at the location
+/// of \p A with \p ExitLEK instead of at the location of \p B with
+/// \p EntryLEK.
+/// \param H The handler that reports diagnostics.
 /// \return  false if we should keep \p A, true if we should take \p B.
 bool ThreadSafetyAnalyzer::join(const FactEntry &A, const FactEntry &B,
-                                SourceLocation JoinLoc,
-                                LockErrorKind EntryLEK) {
+                                SourceLocation JoinLoc, LockErrorKind EntryLEK,
+                                LockErrorKind ExitLEK,
+                                bool ReportMissingAcquire,
+                                ThreadSafetyHandler &H) {
   // Whether we can replace \p A by \p B.
   const bool CanModify = EntryLEK != LEK_LockedSomeLoopIterations;
   unsigned int ReentrancyDepthA = getFactReentrancyDepth(A);
   unsigned int ReentrancyDepthB = getFactReentrancyDepth(B);
 
   if (ReentrancyDepthA != ReentrancyDepthB) {
-    Handler.handleMutexHeldEndOfScope(B.getKind(), B.toString(), B.loc(),
-                                      JoinLoc, EntryLEK,
-                                      /*ReentrancyMismatch=*/true);
+    const bool MissingAcquire =
+        ReportMissingAcquire && ReentrancyDepthB < ReentrancyDepthA;
+    H.handleMutexHeldEndOfScope(B.getKind(), B.toString(),
+                                MissingAcquire ? A.loc() : B.loc(), JoinLoc,
+                                MissingAcquire ? ExitLEK : EntryLEK,
+                                /*ReentrancyMismatch=*/true);
     // Pick the FactEntry with the greater reentrancy depth as the "good"
     // fact to reduce potential later warnings.
     return CanModify && ReentrancyDepthA < ReentrancyDepthB;
@@ -2539,8 +2622,7 @@ bool ThreadSafetyAnalyzer::join(const FactEntry &A, const FactEntry &B,
       if (CanModify || !ShouldTakeB)
         return ShouldTakeB;
     }
-    Handler.handleExclusiveAndShared(B.getKind(), B.toString(), B.loc(),
-                                     A.loc());
+    H.handleExclusiveAndShared(B.getKind(), B.toString(), B.loc(), A.loc());
     // Take the exclusive capability to reduce further warnings.
     return CanModify && B.kind() == LK_Exclusive;
   } else {
@@ -2568,11 +2650,21 @@ bool ThreadSafetyAnalyzer::join(const FactEntry &A, const FactEntry &B,
 /// joining block's terminator branches on: the paths re-diverge at the
 /// terminator (but these facts are still removed from the intersection, and
 /// conditionally re-added on the outgoing edges by getEdgeLockset()).
+/// \param RebranchIgnoresDepth Whether a reentrancy depth difference of an
+/// ignored fact is not diagnosed either. Only set at the exit blocks of a
+/// try-acquire function, where the lock state is verified per path.
+/// \param ReportMissingAcquires See the ReportMissingAcquire parameter of
+/// join().
+/// \param DiagHandler The handler that reports diagnostics, or nullptr to use
+/// \c Handler.
 void ThreadSafetyAnalyzer::intersectAndWarn(
     FactSet &EntrySet, const FactSet &ExitSet, SourceLocation JoinLoc,
     LockErrorKind EntryLEK, LockErrorKind ExitLEK,
-    llvm::function_ref<bool(const FactEntry &)> IsIgnored) {
+    llvm::function_ref<bool(const FactEntry &)> IsIgnored,
+    bool RebranchIgnoresDepth, bool ReportMissingAcquires,
+    ThreadSafetyHandler *DiagHandler) {
   FactSet EntrySetOrig = EntrySet;
+  ThreadSafetyHandler &H = DiagHandler ? *DiagHandler : Handler;
 
   auto IsIgnoredFact = [IsIgnored](const FactEntry &FE) {
     return IsIgnored && IsIgnored(FE);
@@ -2588,8 +2680,8 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
       if (IsIgnoredFact(ExitFact) && EntryLEK == LEK_LockedSomePredecessors &&
           EntryFact.loc() == ExitFact.loc() && !EntryFact.managed() &&
           !ExitFact.managed() &&
-          getFactReentrancyDepth(EntryFact) ==
-              getFactReentrancyDepth(ExitFact)) {
+          (RebranchIgnoresDepth || getFactReentrancyDepth(EntryFact) ==
+                                       getFactReentrancyDepth(ExitFact))) {
         // Both facts have been created by the same trylock call, whose result
         // is checked again by the terminator of this block. The lock kind may
         // differ if the trylock function has range attributes for different
@@ -2597,13 +2689,14 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
         // refine the lock kind.
         if (preferJoinedFact(EntryFact, ExitFact))
           *EntryIt = Fact;
-      } else if (join(EntryFact, ExitFact, JoinLoc, EntryLEK)) {
+      } else if (join(EntryFact, ExitFact, JoinLoc, EntryLEK, ExitLEK,
+                      ReportMissingAcquires, H)) {
         *EntryIt = Fact;
       }
     } else if ((!ExitFact.managed() || EntryLEK == LEK_LockedAtEndOfFunction) &&
                !IsIgnoredFact(ExitFact)) {
       ExitFact.handleRemovalFromIntersection(ExitSet, FactMan, JoinLoc,
-                                             EntryLEK, Handler);
+                                             EntryLEK, H);
     }
   }
 
@@ -2617,7 +2710,7 @@ void ThreadSafetyAnalyzer::intersectAndWarn(
            ExitLEK == LEK_NotLockedAtEndOfFunction) &&
           !IsIgnoredFact(*EntryFact))
         EntryFact->handleRemovalFromIntersection(EntrySetOrig, FactMan, JoinLoc,
-                                                 ExitLEK, Handler);
+                                                 ExitLEK, H);
       if (ExitLEK == LEK_LockedSomePredecessors)
         EntrySet.removeLock(FactMan, *EntryFact);
     }
@@ -2836,8 +2929,9 @@ void ThreadSafetyAnalyzer::collectUnevaluatedStmts(CFG *CFGraph) {
 
 /// Record the local variables that may be modified through an alias in
 /// LocalVarMap.
-void ThreadSafetyAnalyzer::markEscapedLocalVars(AnalysisDeclContext &AC) {
-  llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
+void ThreadSafetyAnalyzer::markEscapedLocalVars(
+    AnalysisDeclContext &AC,
+    llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) {
   llvm::SmallPtrSet<const ValueDecl *, 8> ModifiedVars;
   scanTrylockVars(AC.getBody(), *ASTCtx, EscapedVars, ModifiedVars);
   for (const ValueDecl *VD : EscapedVars)
@@ -2987,9 +3081,12 @@ void ThreadSafetyAnalyzer::updatePendingTrylockRanges(
 /// \p D must not be analyzed, e.g. because \p D is a primitive lock or unlock
 /// function.
 bool ThreadSafetyAnalyzer::computeEntryLockset(
-    const NamedDecl *D, const CFG &CFGraph, const PostOrderCFGView &SortedGraph,
-    CFGBlockInfo &Initial, CapExprSet &ExclusiveLocksAcquired,
-    CapExprSet &SharedLocksAcquired, CapExprSet &LocksReleased) {
+    AnalysisDeclContext &AC, const NamedDecl *D, const CFG &CFGraph,
+    const PostOrderCFGView &SortedGraph, CFGBlockInfo &Initial,
+    CapExprSet &ExclusiveLocksAcquired, CapExprSet &SharedLocksAcquired,
+    CapExprSet &LocksReleased,
+    SmallVectorImpl<TrylockExitSpec> &TrylockExitSpecs,
+    IntDomain &TrylockRetDom, bool &UnmodeledTryAcquireAttr) {
   // Add locks from exclusive_locks_required and shared_locks_required
   // to initial lockset. Also turn off checking for underlying lock and unlock
   // primitives that take zero capability arguments.
@@ -3022,10 +3119,25 @@ bool ThreadSafetyAnalyzer::computeEntryLockset(
                                   : ExclusiveLocksAcquired,
                     A, nullptr, D);
       } else if (isTrylockAttr(Attr)) {
-        // Don't try to check trylock functions for now.
-        return false;
+        // Verifying the implementations of trylock functions is new and may
+        // still report false positives, e.g. for loops that retry a trylock
+        // call. Only verify these with -Wthread-safety-beta and skip their
+        // bodies otherwise, like before.
+        if (!trylockAttrHasArgs(Attr) || !Handler.issueBetaWarnings()) {
+          return false;
+        }
+        // FIXME: Also verify the bodies that contain loops. Skip these for
+        // now, like before.
+        if (hasUnsupportedTrylockBody(AC, &SortedGraph)) {
+          return false;
+        }
+        if (!addTrylockExitSpecs(Attr, D, TrylockExitSpecs, TrylockRetDom))
+          UnmodeledTryAcquireAttr = true;
       }
     }
+    if (UnmodeledTryAcquireAttr)
+      TrylockExitSpecs.clear();
+
     ArrayRef<ParmVarDecl *> Params;
     if (CurrentFunction)
       Params = CurrentFunction->getCanonicalDecl()->parameters();
@@ -3113,14 +3225,18 @@ FactSet ThreadSafetyAnalyzer::computeExpectedExitSet(
 }
 
 /// Join the locksets on the edges from the visited predecessors of
-/// \p CurrBlock into the lockset at the entry of \p CurrBlock, warn about
-/// differences, and join the pending trylock ranges at the exit of the
-/// predecessors, \p BlockExitPending, into \p EntryPending.
+/// \p CurrBlock into the lockset at the entry of \p CurrBlock and warn about
+/// differences. \p Verifier is the verifier of the trylock function that is
+/// being analyzed, if any. Otherwise, join the pending trylock ranges at the
+/// exit of the predecessors, \p BlockExitPending, into \p EntryPending.
 void ThreadSafetyAnalyzer::joinPredecessors(
     const CFGBlock *CurrBlock, CFGBlockInfo *CurrBlockInfo,
-    PostOrderCFGView::CFGBlockSet &VisitedBlocks,
+    PostOrderCFGView::CFGBlockSet &VisitedBlocks, TrylockBodyVerifier *Verifier,
     const std::vector<PendingTrylockRanges> &BlockExitPending,
     PendingTrylockRanges &EntryPending) {
+  const bool CheckingTrylockBody = Verifier != nullptr;
+  const bool IsPureBlock = CheckingTrylockBody && Verifier->isPureBlock();
+
   // Iterate through the predecessor blocks and warn if the lockset for all
   // predecessors is not the same. We take the entry lockset of the current
   // block to be the intersection of all previous locksets.
@@ -3146,15 +3262,20 @@ void ThreadSafetyAnalyzer::joinPredecessors(
   };
   const bool HasUnvisitedPred =
       llvm::any_of(CurrBlock->preds(), [&](const CFGBlock *Pred) {
-        return Pred && !VisitedBlocks.alreadySet(Pred);
+        return Pred &&
+               (!CheckingTrylockBody || Verifier->inSortedGraph(Pred)) &&
+               !VisitedBlocks.alreadySet(Pred);
       });
   SmallVector<std::pair<const CFGBlock *, FactSet>, 4> PredEdgeLocksets;
   SmallVector<PendingTrylockRanges, 4> PredEdgePendings;
   for (CFGBlock::const_pred_iterator PI = CurrBlock->pred_begin(),
                                      PE = CurrBlock->pred_end();
        PI != PE; ++PI) {
+    if (*PI == nullptr ||
+        (CheckingTrylockBody && !Verifier->inSortedGraph(*PI)))
+      continue;
     // if *PI -> CurrBlock is a back edge
-    if (*PI == nullptr || !VisitedBlocks.alreadySet(*PI))
+    if (!VisitedBlocks.alreadySet(*PI))
       continue;
 
     unsigned PrevBlockID = (*PI)->getBlockID();
@@ -3168,14 +3289,19 @@ void ThreadSafetyAnalyzer::joinPredecessors(
     CurrBlockInfo->Reachable = true;
 
     FactSet PrevLockset;
-    PendingTrylockRanges EdgePending = BlockExitPending[PrevBlockID];
-    getEdgeLockset(PrevLockset, PrevBlockInfo->ExitSet, *PI, CurrBlock,
-                   &EdgePending);
-    PredEdgePendings.push_back(std::move(EdgePending));
+    if (CheckingTrylockBody) {
+      Verifier->joinPredecessor(*PI, PrevLockset);
+    } else {
+      PendingTrylockRanges EdgePending = BlockExitPending[PrevBlockID];
+      getEdgeLockset(PrevLockset, PrevBlockInfo->ExitSet, *PI, CurrBlock,
+                     /*AcquiredAttrs=*/nullptr, /*ConsumedAttrs=*/nullptr,
+                     /*MixedEdgeCalls=*/nullptr, &EdgePending);
+      PredEdgePendings.push_back(std::move(EdgePending));
+    }
     PredEdgeLocksets.emplace_back(*PI, std::move(PrevLockset));
   }
 
-  if (!PredEdgePendings.empty())
+  if (!CheckingTrylockBody && !PredEdgePendings.empty())
     joinPendingTrylockRanges(PredEdgePendings, HasUnvisitedPred, EntryPending);
 
   for (auto &[PredBlock, PrevLockset] : PredEdgeLocksets) {
@@ -3196,25 +3322,40 @@ void ThreadSafetyAnalyzer::joinPredecessors(
         // re-branches on the try-lock result.
         if (!TerminatorTrylockCapsComputed) {
           // Compute once; the result depends only on CurrBlock, not on *PI.
-          getTerminatorTrylockCaps(CurrBlock, TerminatorTrylockCaps,
-                                   &EntryPending);
+          if (IsPureBlock) {
+            for (const auto &Cap : Verifier->exitCaps())
+              TerminatorTrylockCaps.push_back_nodup(Cap);
+          } else {
+            getTerminatorTrylockCaps(CurrBlock, TerminatorTrylockCaps,
+                                     &EntryPending);
+          }
           TerminatorTrylockCapsComputed = true;
         }
         intersectAndWarn(CurrBlockInfo->EntrySet, PrevLockset,
                          CurrBlockInfo->EntryLoc, LEK_LockedSomePredecessors,
-                         LEK_LockedSomePredecessors, IsTrylockRebranched);
+                         LEK_LockedSomePredecessors, IsTrylockRebranched,
+                         /*RebranchIgnoresDepth=*/IsPureBlock);
       }
     }
+    if (IsPureBlock)
+      Verifier->addPurePredLockset(std::move(PrevLockset));
   }
 
-  if (!EntryPending.empty() && PredEdgeLocksets.size() > 1)
+  if (!CheckingTrylockBody && !EntryPending.empty() &&
+      PredEdgeLocksets.size() > 1)
     dropUnheldPendingAcquires(EntryPending, CurrBlockInfo);
+
+  if (CheckingTrylockBody)
+    Verifier->reportOverflowedJoin(CurrBlockInfo);
 }
 
 /// Update the lockset of \p LocksetBuilder for the elements of \p CurrBlock.
 void ThreadSafetyAnalyzer::visitBlockElements(const CFGBlock *CurrBlock,
                                               BuildLockset &LocksetBuilder,
-                                              AnalysisDeclContext &AC) {
+                                              AnalysisDeclContext &AC,
+                                              TrylockBodyVerifier *Verifier) {
+  // The return statement of CurrBlock if it has been visited.
+  const ReturnStmt *VisitedReturn = nullptr;
   // Visit all the statements in the basic block.
   for (const auto &BI : *CurrBlock) {
     switch (BI.getKind()) {
@@ -3223,34 +3364,40 @@ void ThreadSafetyAnalyzer::visitBlockElements(const CFGBlock *CurrBlock,
       const Stmt *S = CS.getStmt();
       if (UnevaluatedStmts.contains(S))
         break;
+      if (Verifier)
+        Verifier->handleStatement(S, LocksetBuilder.FSet);
       LocksetBuilder.Visit(S);
+      if (const auto *RS = dyn_cast<ReturnStmt>(S))
+        VisitedReturn = RS;
       break;
     }
     // Ignore BaseDtor and MemberDtor for now.
     case CFGElement::AutomaticObjectDtor:
     case CFGElement::CleanupFunction:
-      if (std::optional<ScopeExitCall> Call = getScopeExitCall(BI))
+    case CFGElement::TemporaryDtor:
+      if (std::optional<ScopeExitCall> Call = getScopeExitCall(BI)) {
+        // The trylock calls in the return value of a trylock function have
+        // not been added to the lockset. Verifier checks the lock state after
+        // the destructors and cleanup functions that run after the return
+        // statement for each return value. Assume here that these trylock
+        // calls succeeded to avoid reporting that a capability that they
+        // acquired is released while not held.
+        if (Verifier && VisitedReturn)
+          Verifier->addReturnedTrylockCaps(VisitedReturn, *Call,
+                                           LocksetBuilder.FSet);
         LocksetBuilder.handleCall(/*Exp=*/nullptr, Call->Callee, Call->Self,
                                   Call->Loc);
-      break;
-
-    case CFGElement::TemporaryDtor: {
-      auto TD = BI.castAs<CFGTemporaryDtor>();
-
-      // Clean up constructed object even if there are no attributes to
-      // keep the number of objects in limbo as small as possible.
-      if (auto Object =
-              ConstructedObjects.find(TD.getBindTemporaryExpr()->getSubExpr());
-          Object != ConstructedObjects.end()) {
-        const auto *DD = TD.getDestructorDecl(AC.getASTContext());
-        if (DD->hasAttrs())
-          // TODO: the location here isn't quite correct.
-          LocksetBuilder.handleCall(nullptr, DD, Object->second,
-                                    TD.getBindTemporaryExpr()->getEndLoc());
-        ConstructedObjects.erase(Object);
       }
+      // Clean up constructed object even if there are no attributes to
+      // keep the number of objects in limbo as small as possible. Keep it
+      // while verifying a try_acquire function since Verifier walks the
+      // destructors of exit paths again for each return value. The entries
+      // are freed with the analyzer at the end of the function.
+      if (!Verifier)
+        if (auto TD = BI.getAs<CFGTemporaryDtor>())
+          ConstructedObjects.erase(TD->getBindTemporaryExpr()->getSubExpr());
       break;
-    }
+
     default:
       break;
     }
@@ -3339,8 +3486,9 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   // Compute SSA names for local variables. When trylocks are involved, record
   // which variables may be modified through an alias, since the analysis would
   // not see the update.
-  if (HasTrylockCall)
-    markEscapedLocalVars(AC);
+  llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
+  if (HasTrylockCall || hasTrylockAttr(D))
+    markEscapedLocalVars(AC, EscapedVars);
   LocalVarMap.traverseCFG(CFGraph, SortedGraph, BlockInfo, UnevaluatedStmts);
   CurrentSortedGraph = SortedGraph;
 
@@ -3350,18 +3498,34 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   CapExprSet ExclusiveLocksAcquired;
   CapExprSet SharedLocksAcquired;
   CapExprSet LocksReleased;
+  SmallVector<TrylockExitSpec, 2> TrylockExitSpecs;
+  IntDomain TrylockRetDom;
+
+  // Whether the function has a trylock attribute with explicit capability
+  // arguments whose effect on the return value cannot be modeled. The body
+  // of such a function is still checked, but not the lock state at its exit.
+  bool UnmodeledTryAcquireAttr = false;
 
   if (!SortedGraph->empty() &&
-      !computeEntryLockset(D, *CFGraph, *SortedGraph, Initial,
+      !computeEntryLockset(AC, D, *CFGraph, *SortedGraph, Initial,
                            ExclusiveLocksAcquired, SharedLocksAcquired,
-                           LocksReleased))
+                           LocksReleased, TrylockExitSpecs, TrylockRetDom,
+                           UnmodeledTryAcquireAttr))
     return;
 
   FactSet ExpectedFunctionExitSet =
       computeExpectedExitSet(D, Initial.EntrySet, ExclusiveLocksAcquired,
                              SharedLocksAcquired, LocksReleased);
 
-  if (HasTrylockCall) {
+  const bool CheckingTrylockBody = !TrylockExitSpecs.empty();
+  std::optional<TrylockBodyVerifier> Verifier;
+  if (CheckingTrylockBody) {
+    Verifier.emplace(*this, CFGraph, SortedGraph, VisitedBlocks, EscapedVars,
+                     std::move(TrylockExitSpecs), std::move(TrylockRetDom));
+    Verifier->begin(AC);
+  }
+
+  if (HasTrylockCall && !CheckingTrylockBody) {
     for (const CFGBlock *B : *SortedGraph) {
       InlineExpansionCount = 0;
       TrylockRangeCondResult Cond;
@@ -3372,8 +3536,11 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     }
   }
 
-  // The pending trylock ranges at the exit of each block.
-  std::vector<PendingTrylockRanges> BlockExitPending(CFGraph->getNumBlockIDs());
+  // The pending trylock ranges at the exit of each block. Only used outside
+  // trylock implementations; the verification of trylock implementations
+  // tracks the values of local variables instead.
+  std::vector<PendingTrylockRanges> BlockExitPending(
+      CheckingTrylockBody ? 0 : CFGraph->getNumBlockIDs());
 
   for (const auto *CurrBlock : *SortedGraph) {
     unsigned CurrBlockID = CurrBlock->getBlockID();
@@ -3388,21 +3555,42 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     // Use the default initial lockset in case there are no predecessors.
     VisitedBlocks.insert(CurrBlock);
 
-    joinPredecessors(CurrBlock, CurrBlockInfo, VisitedBlocks, BlockExitPending,
-                     EntryPending);
+    if (CheckingTrylockBody && CurrBlock == &CFGraph->getExit()) {
+      Verifier->visitExitBlock(CurrBlockInfo);
+      continue;
+    }
+
+    // The lock state at the exit of a trylock function depends on its return
+    // value. If that dependency cannot be modeled, do not compare the locksets
+    // of the paths that leave the function either.
+    if (UnmodeledTryAcquireAttr && CurrBlock == &CFGraph->getExit())
+      continue;
+
+    if (CheckingTrylockBody)
+      Verifier->beginBlock(CurrBlock);
+
+    joinPredecessors(CurrBlock, CurrBlockInfo, VisitedBlocks,
+                     CheckingTrylockBody ? &*Verifier : nullptr,
+                     BlockExitPending, EntryPending);
 
     // Skip rest of block if it's not reachable.
     if (!CurrBlockInfo->Reachable)
       continue;
 
+    if (CheckingTrylockBody)
+      Verifier->enterBlock(CurrBlockInfo);
+
     BuildLockset LocksetBuilder(this, *CurrBlockInfo, ExpectedFunctionExitSet);
 
-    visitBlockElements(CurrBlock, LocksetBuilder, AC);
+    visitBlockElements(CurrBlock, LocksetBuilder, AC,
+                       CheckingTrylockBody ? &*Verifier : nullptr);
     CurrBlockInfo->ExitSet = LocksetBuilder.FSet;
-    if (!EntryPending.empty()) {
+    if (!CheckingTrylockBody && !EntryPending.empty()) {
       updatePendingTrylockRanges(EntryPending, CurrBlock, CurrBlockInfo);
       BlockExitPending[CurrBlockID] = std::move(EntryPending);
     }
+    if (CheckingTrylockBody)
+      Verifier->exitBlock(CurrBlockInfo);
 
     checkBackEdgeLocksets(CurrBlock, VisitedBlocks);
   }
@@ -3411,9 +3599,15 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
   if (!Final.Reachable)
     return;
 
+  if (CheckingTrylockBody) {
+    Verifier->verifyExits(ExpectedFunctionExitSet, Final);
+    return;
+  }
+
   // FIXME: Should we call this function for all blocks which exit the function?
-  intersectAndWarn(ExpectedFunctionExitSet, Final.ExitSet, Final.ExitLoc,
-                   LEK_LockedAtEndOfFunction, LEK_NotLockedAtEndOfFunction);
+  if (!UnmodeledTryAcquireAttr)
+    intersectAndWarn(ExpectedFunctionExitSet, Final.ExitSet, Final.ExitLoc,
+                     LEK_LockedAtEndOfFunction, LEK_NotLockedAtEndOfFunction);
 }
 
 /// Check a function's CFG for thread-safety violations.

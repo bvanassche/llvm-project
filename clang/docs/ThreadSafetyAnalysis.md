@@ -481,6 +481,13 @@ or `1`) or zero (`false` or `0`) indicates success, and the remaining arguments
 are interpreted in the same way as `ACQUIRE`. See {ref}`mutexheader`, below, for
 example uses.
 
+When capability arguments are explicitly provided and `-Wthread-safety-beta` is
+enabled, the analysis checks the definition of the function to verify that the
+capabilities are held on return paths indicating success and are not held on
+return paths indicating failure. Otherwise, e.g. if no capability argument is
+passed, in which case the capability is assumed to be `this`, the analysis will
+not check the body of the function.
+
 `-Wthread-safety-attributes` warns about a first argument other than `true`,
 `false`, `1` or `0`; any other non-zero value is treated as `true`. If the first
 argument is not a constant expression, `-Wthread-safety-attributes` warns about
@@ -533,6 +540,13 @@ as `ACQUIRE`. Pointer return values are compared as unsigned integers of type
 `uintptr_t`; because `low` and `high` must satisfy `low <= high` when evaluated
 as constant expressions, ranges that exclude negative errno sentinel pointers
 use unsigned bounds such as `TRY_ACQUIRE_RANGE(1, (uintptr_t)-4096 - 1, mu)`.
+
+As with `TRY_ACQUIRE`, when capability arguments are explicitly provided and
+`-Wthread-safety-beta` is enabled, the analysis verifies that the function body
+holds the specified capabilities on return paths whose value is within
+`[low, high]` and does not hold them on return paths outside `[low, high]`; if
+capability arguments are omitted, the capability is assumed to be `this` and
+the function body is not checked.
 
 ```c++
 Mutex mu;
@@ -587,6 +601,24 @@ the same capability describe the union of their ranges. If a success value of
 an attribute is also a success value of an earlier attribute of the same
 declaration that acquires the same capability in the other access mode,
 `-Wthread-safety-attributes` warns about the attribute and it is ignored.
+
+When verifying `TRY_ACQUIRE` and `TRY_ACQUIRE_RANGE` function bodies under
+`-Wthread-safety-beta`:
+
+- `this` and addresses of non-weak objects and functions are treated as valid
+  addresses, i.e. as any non-zero address. Weak declarations are excluded
+  because their address may be null. Hence, if the success range of a function
+  that returns a pointer excludes some non-zero values, e.g. error codes encoded
+  as pointers, a return of such an address while holding the capability is
+  reported because the address might be one of these values.
+- A capability that is acquired through a local pointer whose value cannot be
+  resolved, e.g. because it has been loaded by inline assembly, is not assumed
+  to be the expected capability, even if it might refer to the same object.
+- The return value is checked after conversion to the return type of the
+  function. If a narrower return type truncates a success value of a trylock
+  call to a failure value, e.g. `char f() { return trylock(&mu); }` where
+  `trylock()` may return 256, the acquired capability is reported as leaked.
+- The bodies of functions that contain loops are not checked yet.
 
 ### ASSERT_CAPABILITY(...) and ASSERT_SHARED_CAPABILITY(...)
 
@@ -877,6 +909,7 @@ not `volatile`, and are neither modified nor escaped by the body, and whose
 body has at most two statements with either a single `return` statement or a
 single-level `if` with two `return` statements; the analysis evaluates their
 return value in terms of their arguments when checking the result of a
+try-acquire function or evaluating the `return` statement of a verified
 try-acquire function (and treats all other calls as opaque). As a result, code
 such as the following will not work:
 

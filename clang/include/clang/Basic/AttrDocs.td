@@ -1185,6 +1185,10 @@ earlier declaration, and two attributes of the same declaration for the same
 capability must not have the same access mode but different success values, or
 different access modes but the same success value. If they do,
 `-Wthread-safety-attributes` warns about the later attribute and it is ignored.
+When explicit capability arguments are provided and `-Wthread-safety-beta` is
+enabled, the analysis checks the function body to verify that the specified
+capabilities are held on return paths indicating success and are not held on
+return paths indicating failure.
   }];
 }
 
@@ -1200,7 +1204,10 @@ must be integer constant expressions that specify the inclusive range
 successfully acquired (pointer return values are compared as unsigned integers
 of type `uintptr_t`); any remaining arguments specify the capabilities acquired
 on success (defaulting to `this` when omitted on a non-static member function of
-a capability type).
+a capability type). When explicit capability arguments are provided and
+`-Wthread-safety-beta` is enabled, the analysis checks the function body to
+verify that the specified capabilities are held on return paths whose value is
+within `[low, high]` and are not held on return paths outside `[low, high]`.
 
 Several attributes for the same capability and access mode describe the union
 of their ranges. If `low > high`, an error is diagnosed. If the return type is

@@ -40,3 +40,9 @@ void caller() {
   if (try_lock_range() > 0)
     data = 3; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
 }
+
+int impl(int r) __attribute__((try_acquire_capability_range(0, 0, mu))) { // expected-note{{mutex acquired here}}
+  if (is_zero(r))
+    return 0; // expected-warning{{expecting mutex 'mu' to be held at the end of function}}
+  return 1;
+}

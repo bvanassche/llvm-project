@@ -129,7 +129,10 @@ ThreadSafetyAnalyzer::evaluateTrylockCmpConstSide(const Expr *ConstSide,
       ConstSide->getType()->isNullPtrType() ||
       ConstSide->getType()->isMemberPointerType()) {
     TrylockValueState EmptyState;
-    if (auto R = evaluatePureExprRange(ConstSide, EmptyState, RangeEvalCtx{})) {
+    const auto *BodyEscapedVars =
+        CurrentVerifier ? &CurrentVerifier->escapedVars() : nullptr;
+    if (auto R = evaluatePureExprRange(ConstSide, EmptyState,
+                                       RangeEvalCtx{BodyEscapedVars})) {
       llvm::APSInt K;
       if (R->isSingleValue(K) &&
           (!ConstSide->getType()->isMemberPointerType() ||

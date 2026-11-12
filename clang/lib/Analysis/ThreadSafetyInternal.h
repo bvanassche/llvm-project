@@ -30,6 +30,7 @@
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ImmutableMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -264,6 +265,7 @@ public:
 
 class BuildLockset;
 class ThreadSafetyAnalyzer;
+class TrylockBodyVerifier;
 
 /// The body of a trivial inline or constexpr function whose return value can
 /// be evaluated in terms of its parameters.
@@ -309,7 +311,8 @@ public:
 
   void checkBeforeAfter(const ValueDecl *Vd, const FactSet &FSet,
                         ThreadSafetyAnalyzer &Analyzer, SourceLocation Loc,
-                        StringRef CapKind);
+                        StringRef CapKind,
+                        ThreadSafetyHandler *DiagHandler = nullptr);
 
 private:
   BeforeMap BMap;
@@ -984,6 +987,8 @@ static constexpr unsigned MaxEvalSteps = 2048;
 /// Class which implements the core thread safety analysis routines.
 class LLVM_LIBRARY_VISIBILITY ThreadSafetyAnalyzer {
   friend class BuildLockset;
+  friend class TrylockBodyVerifier;
+  friend class ReturnValueForker;
   friend class BeforeSet;
 
   llvm::BumpPtrAllocator Bpa;
@@ -1008,7 +1013,8 @@ public:
 
   bool inCurrentScope(const CapabilityExpr &CapE);
 
-  void addLock(FactSet &FSet, const FactEntry *Entry, bool ReqAttr = false);
+  void addLock(FactSet &FSet, const FactEntry *Entry, bool ReqAttr = false,
+               ThreadSafetyHandler *DiagHandler = nullptr);
   void removeLock(FactSet &FSet, const CapabilityExpr &CapE,
                   SourceLocation UnlockLoc, bool FullyRemove, LockKind Kind);
 
@@ -1036,10 +1042,68 @@ public:
   using IntDomain = threadSafety::IntDomain;
   using IntRangeSet = threadSafety::IntRangeSet;
 
+  using AcquiredTrylockKey = std::pair<const CallExpr *, const Attr *>;
+
+  struct TrylockExitSpec {
+    CapabilityExpr Cap;
+    LockKind LK;
+    IntRangeSet SuccessSet;
+    SourceLocation Loc;
+  };
+
+  /// A trylock result that is no longer stored in any variable, e.g. because
+  /// the variable has been overwritten.
+  struct OverwrittenTrylockDef {
+    const Expr *DefE;
+    LocalVarContext Ctx;
+    QualType Ty;
+    // The values that the variable may have had when it was overwritten, or
+    // std::nullopt if unknown.
+    std::optional<IntRangeSet> Allowed;
+  };
+
   struct TrylockValueState {
     bool Infeasible = false;
     llvm::SmallDenseMap<const ValueDecl *, IntRangeSet, 4> VarRanges;
+    llvm::SmallDenseMap<const Expr *, IntRangeSet, 4> ExprRanges;
+    llvm::SmallDenseMap<const BinaryOperator *, bool, 2> ShortCircuitedOps;
+    llvm::SmallDenseSet<AcquiredTrylockKey, 4> AcquiredTrylockAttrs;
+    // Trylock calls whose capabilities have been acquired on a path and are
+    // no longer held, e.g. because these have been released. Branching again
+    // on the result of such a call must not acquire the capabilities again.
+    llvm::SmallDenseSet<AcquiredTrylockKey, 4> ConsumedTrylockAttrs;
+    // Trylock calls whose result has been discarded.
+    llvm::SmallSetVector<const CallExpr *, 2> DiscardedTrylockCalls;
+    // Trylock results that are no longer stored in any variable. The
+    // capabilities of these calls may still have been acquired.
+    SmallVector<OverwrittenTrylockDef, 1> OverwrittenTrylockDefs;
+    llvm::SmallDenseMap<const ValueDecl *,
+                        std::pair<const Expr *, LocalVarContext>, 2>
+        UnmaterializedVarDefs;
   };
+
+  struct TrylockEdgeBundle {
+    FactSet Lockset;
+    TrylockValueState ValState;
+  };
+
+  struct PendingTrylockAcquire {
+    CapabilityExpr Cap;
+    LockKind LK;
+    SourceLocation Loc;
+    // Whether the capability has only been acquired on some of the paths
+    // that have been merged into an outcome. Such a capability may be leaked
+    // but does not count as held for the capabilities that are expected.
+    bool MayOnly = false;
+  };
+
+  struct ReturnEvalOutcome {
+    IntRangeSet Values;
+    FactSet Lockset;
+    SmallVector<PendingTrylockAcquire, 2> PendingAcquires;
+  };
+
+  TrylockBodyVerifier *CurrentVerifier = nullptr;
 
   /// The values that select each case label of a switch statement and the
   /// values that select the default label (or skip the switch body).
@@ -1168,9 +1232,13 @@ public:
                                 const SwitchCaseTable *&Table,
                                 SmallVectorImpl<const CastExpr *> &SwitchCasts);
 
-  void getEdgeLockset(FactSet &Result, const FactSet &ExitSet,
-                      const CFGBlock *PredBlock, const CFGBlock *CurrBlock,
-                      PendingTrylockRanges *Pending = nullptr);
+  void getEdgeLockset(
+      FactSet &Result, const FactSet &ExitSet, const CFGBlock *PredBlock,
+      const CFGBlock *CurrBlock,
+      llvm::SmallDenseSet<AcquiredTrylockKey, 4> *AcquiredAttrs = nullptr,
+      const llvm::SmallDenseSet<AcquiredTrylockKey, 4> *ConsumedAttrs = nullptr,
+      SmallVectorImpl<OverwrittenTrylockDef> *MixedEdgeCalls = nullptr,
+      PendingTrylockRanges *Pending = nullptr);
   void getTrylockMutexIDs(CapExprSet &Mtxs, const Attr *A, const Expr *Exp,
                           const NamedDecl *D);
   bool collectTrylockCaps(const Attr *A, const Expr *CallExp,
@@ -1198,9 +1266,15 @@ public:
       const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
   /// The context in which the value of an expression is evaluated.
   struct RangeEvalCtx {
-    /// The escaped local variables of the inline helper whose body contains
-    /// the expression. Null outside inline helpers.
+    /// The escaped local variables of the function or inline helper whose
+    /// body contains the expression. Null outside trylock implementations.
     const llvm::SmallPtrSetImpl<const ValueDecl *> *EscapedVars = nullptr;
+    /// The expressions whose entries in TrylockValueState::ExprRanges record
+    /// the values that these evaluated to while evaluating the expression
+    /// that contains them, e.g. the trylock calls, conditions and variable
+    /// references that ReturnValueForker has forked on. Modifying a variable
+    /// in another operand does not change these values.
+    const llvm::SmallPtrSetImpl<const Expr *> *PinnedExprs = nullptr;
 
     RangeEvalCtx
     withEscaped(const llvm::SmallPtrSetImpl<const ValueDecl *> *E) const {
@@ -1359,6 +1433,18 @@ public:
               return Analyzer.LocalVarMap.lookupExpr(D, Ctx);
             });
     }
+    /// Look up local variables in the context that \p Ctx points to at the
+    /// time of each lookup.
+    LocalVarLookupScope(ThreadSafetyAnalyzer &Analyzer,
+                        const LocalVarContext *Ctx)
+        : Analyzer(Analyzer), Active(Analyzer.Handler.issueBetaWarnings()) {
+      if (Active)
+        Prev = Analyzer.SxBuilder.setLookupLocalVarExpr(
+            [&Analyzer, Ctx](const NamedDecl *D) -> const Expr * {
+              LocalVarContext LookupCtx = *Ctx;
+              return Analyzer.LocalVarMap.lookupExpr(D, LookupCtx);
+            });
+    }
     ~LocalVarLookupScope() {
       if (Active)
         Analyzer.SxBuilder.setLookupLocalVarExpr(std::move(Prev));
@@ -1392,19 +1478,24 @@ public:
   const Expr *getCachedPureStmtExpr(const StmtExpr *SE) const;
 
   bool join(const FactEntry &A, const FactEntry &B, SourceLocation JoinLoc,
-            LockErrorKind EntryLEK);
+            LockErrorKind EntryLEK, LockErrorKind ExitLEK,
+            bool ReportMissingAcquire, ThreadSafetyHandler &H);
 
   void intersectAndWarn(
       FactSet &EntrySet, const FactSet &ExitSet, SourceLocation JoinLoc,
       LockErrorKind EntryLEK, LockErrorKind ExitLEK,
-      llvm::function_ref<bool(const FactEntry &)> IsIgnored = nullptr);
+      llvm::function_ref<bool(const FactEntry &)> IsIgnored = nullptr,
+      bool RebranchIgnoresDepth = false, bool ReportMissingAcquires = false,
+      ThreadSafetyHandler *DiagHandler = nullptr);
 
   void intersectAndWarn(FactSet &EntrySet, const FactSet &ExitSet,
                         SourceLocation JoinLoc, LockErrorKind LEK) {
     intersectAndWarn(EntrySet, ExitSet, JoinLoc, LEK, LEK);
   }
 
-  void markEscapedLocalVars(AnalysisDeclContext &AC);
+  void
+  markEscapedLocalVars(AnalysisDeclContext &AC,
+                       llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars);
   void joinPendingTrylockRanges(ArrayRef<PendingTrylockRanges> PredEdgePendings,
                                 bool HasUnvisitedPred,
                                 PendingTrylockRanges &EntryPending);
@@ -1413,12 +1504,19 @@ public:
   void updatePendingTrylockRanges(PendingTrylockRanges &EntryPending,
                                   const CFGBlock *CurrBlock,
                                   const CFGBlockInfo *CurrBlockInfo);
-  bool computeEntryLockset(const NamedDecl *D, const CFG &CFGraph,
-                           const PostOrderCFGView &SortedGraph,
-                           CFGBlockInfo &Initial,
-                           CapExprSet &ExclusiveLocksAcquired,
-                           CapExprSet &SharedLocksAcquired,
-                           CapExprSet &LocksReleased);
+  bool hasUnsupportedTrylockBody(AnalysisDeclContext &AC,
+                                 const PostOrderCFGView *SortedGraph);
+  bool addTrylockExitSpecs(const Attr *Attr, const NamedDecl *D,
+                           SmallVectorImpl<TrylockExitSpec> &ExitSpecs,
+                           IntDomain &RetDom);
+  bool
+  computeEntryLockset(AnalysisDeclContext &AC, const NamedDecl *D,
+                      const CFG &CFGraph, const PostOrderCFGView &SortedGraph,
+                      CFGBlockInfo &Initial, CapExprSet &ExclusiveLocksAcquired,
+                      CapExprSet &SharedLocksAcquired,
+                      CapExprSet &LocksReleased,
+                      SmallVectorImpl<TrylockExitSpec> &TrylockExitSpecs,
+                      IntDomain &TrylockRetDom, bool &UnmodeledTryAcquireAttr);
   FactSet computeExpectedExitSet(const NamedDecl *D, const FactSet &EntrySet,
                                  const CapExprSet &ExclusiveLocksAcquired,
                                  const CapExprSet &SharedLocksAcquired,
@@ -1426,11 +1524,12 @@ public:
   void
   joinPredecessors(const CFGBlock *CurrBlock, CFGBlockInfo *CurrBlockInfo,
                    PostOrderCFGView::CFGBlockSet &VisitedBlocks,
+                   TrylockBodyVerifier *Verifier,
                    const std::vector<PendingTrylockRanges> &BlockExitPending,
                    PendingTrylockRanges &EntryPending);
   void visitBlockElements(const CFGBlock *CurrBlock,
-                          BuildLockset &LocksetBuilder,
-                          AnalysisDeclContext &AC);
+                          BuildLockset &LocksetBuilder, AnalysisDeclContext &AC,
+                          TrylockBodyVerifier *Verifier);
   void checkBackEdgeLocksets(const CFGBlock *CurrBlock,
                              PostOrderCFGView::CFGBlockSet &VisitedBlocks);
   void runAnalysis(AnalysisDeclContext &AC);
@@ -1505,17 +1604,32 @@ forEachDeclVLAExpr(const DeclStmt *DS, bool IncludeTopLevelVLA,
 /// in the type \p QT.
 LLVM_LIBRARY_VISIBILITY void
 forEachTypeVLAExpr(QualType QT, llvm::function_ref<void(const Expr *)> Fn);
+LLVM_LIBRARY_VISIBILITY void
+forEachEvaluatedDeclVLAStmt(const DeclStmt *DS, const ASTContext &Ctx,
+                            bool IncludeTopLevelVLA,
+                            llvm::function_ref<void(const Stmt *)> Fn);
 LLVM_LIBRARY_VISIBILITY bool isScopedLockable(const TagDecl *TD);
 LLVM_LIBRARY_VISIBILITY bool hasThreadSafetyCallEffects(const NamedDecl *Callee,
                                                         const Expr *CallOrCtor);
+LLVM_LIBRARY_VISIBILITY ThreadSafetyAnalyzer::IntRangeSet
+validObjectPtrRangeSet(const ThreadSafetyAnalyzer::IntDomain &Dom);
 LLVM_LIBRARY_VISIBILITY bool
 exprReferencesAnyVar(const Stmt *S,
                      const llvm::SmallPtrSetImpl<const ValueDecl *> &Vars);
-LLVM_LIBRARY_VISIBILITY void
-eraseModifiedVarsFromState(ThreadSafetyAnalyzer::TrylockValueState &State,
-                           llvm::ArrayRef<const ValueDecl *> ModVars);
+LLVM_LIBRARY_VISIBILITY void eraseModifiedVarsFromState(
+    ThreadSafetyAnalyzer::TrylockValueState &State,
+    llvm::ArrayRef<const ValueDecl *> ModVars,
+    const llvm::SmallPtrSetImpl<const Expr *> *PinnedExprs = nullptr);
 LLVM_LIBRARY_VISIBILITY bool stmtContainsExpr(const Stmt *Root,
                                               const Expr *Target);
+LLVM_LIBRARY_VISIBILITY void
+addOverwrittenTrylockDef(ThreadSafetyAnalyzer::TrylockValueState &State,
+                         ThreadSafetyAnalyzer::OverwrittenTrylockDef Def,
+                         bool CheckUnmaterialized = true);
+LLVM_LIBRARY_VISIBILITY ThreadSafetyAnalyzer::OverwrittenTrylockDef
+makeOverwrittenTrylockDef(
+    const ValueDecl *VD, const std::pair<const Expr *, LocalVarContext> &Def,
+    std::optional<ThreadSafetyAnalyzer::IntRangeSet> Allowed);
 LLVM_LIBRARY_VISIBILITY void
 unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
                     const ThreadSafetyAnalyzer::TrylockValueState &Src,
@@ -1533,10 +1647,266 @@ LLVM_LIBRARY_VISIBILITY ThreadSafetyAnalyzer::IntRangeSet
 getSwitchEdgeSet(const ThreadSafetyAnalyzer::SwitchCaseTable &Table,
                  const CFGBlock *Succ);
 
+// Defined in ThreadSafetyTrylockVerify.cpp.
+LLVM_LIBRARY_VISIBILITY bool
+isDiscardedValue(const Expr *E, const ParentMap &PM, const ASTContext &Ctx,
+                 llvm::function_ref<bool(const ValueDecl *)> IsTrackedVar,
+                 bool *ReachedBranchCond = nullptr);
+
 /// The trylock attributes of \p D in declaration order.
 inline auto trylockAttrs(const Decl *D) {
   return llvm::make_filter_range(D->attrs(), isTrylockAttr);
 }
+
+/// The maximum number of edge bundles, i.e. distinct lock and value states,
+/// that are tracked per block on paths that lead to a function exit.
+static constexpr unsigned MaxBundlesPerBlock = 64;
+
+/// Verifies the implementation of a function with a try_acquire attribute
+/// while ThreadSafetyAnalyzer::runAnalysis() traverses its CFG: tracks the
+/// values of the local variables and, for the blocks on paths to the exit
+/// that do not modify the lock state, the lock and value states per path, and
+/// checks at each exit of the function that the capabilities that are held
+/// match the return value. runAnalysis() calls begin() before and
+/// verifyExits() after the traversal, and the remaining public member
+/// functions while it visits each block.
+class LLVM_LIBRARY_VISIBILITY TrylockBodyVerifier {
+  friend class ReturnValueForker;
+
+public:
+  using IntDomain = ThreadSafetyAnalyzer::IntDomain;
+  using IntRangeSet = ThreadSafetyAnalyzer::IntRangeSet;
+  using AcquiredTrylockKey = ThreadSafetyAnalyzer::AcquiredTrylockKey;
+  using TrylockExitSpec = ThreadSafetyAnalyzer::TrylockExitSpec;
+  using TrylockValueState = ThreadSafetyAnalyzer::TrylockValueState;
+  using TrylockEdgeBundle = ThreadSafetyAnalyzer::TrylockEdgeBundle;
+  using OverwrittenTrylockDef = ThreadSafetyAnalyzer::OverwrittenTrylockDef;
+  using PendingTrylockAcquire = ThreadSafetyAnalyzer::PendingTrylockAcquire;
+  using ReturnEvalOutcome = ThreadSafetyAnalyzer::ReturnEvalOutcome;
+  using RangeEvalCtx = ThreadSafetyAnalyzer::RangeEvalCtx;
+  using LocalVarLookupScope = ThreadSafetyAnalyzer::LocalVarLookupScope;
+  using ScopeExitCall = ThreadSafetyAnalyzer::ScopeExitCall;
+  using SwitchCaseTable = ThreadSafetyAnalyzer::SwitchCaseTable;
+
+  TrylockBodyVerifier(
+      ThreadSafetyAnalyzer &Analyzer, CFG *CFGraph,
+      const PostOrderCFGView *SortedGraph,
+      PostOrderCFGView::CFGBlockSet &VisitedBlocks,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
+      SmallVector<TrylockExitSpec, 2> ExitSpecs, IntDomain RetDom)
+      : Analyzer(Analyzer), CFGraph(CFGraph), SortedGraph(SortedGraph),
+        VisitedBlocks(VisitedBlocks), EscapedVars(EscapedVars),
+        ExitBlock(&CFGraph->getExit()), NumBlocks(CFGraph->getNumBlockIDs()),
+        CurrentTrylockExitSpecs(std::move(ExitSpecs)),
+        CurrentTrylockRetDom(std::move(RetDom)), ValStmtCtx(nullptr) {
+    Analyzer.CurrentVerifier = this;
+  }
+  ~TrylockBodyVerifier() { Analyzer.CurrentVerifier = nullptr; }
+  TrylockBodyVerifier(const TrylockBodyVerifier &) = delete;
+  TrylockBodyVerifier &operator=(const TrylockBodyVerifier &) = delete;
+
+  /// Compute the information about the CFG that the verification needs.
+  void begin(AnalysisDeclContext &AC);
+
+  const llvm::SmallPtrSetImpl<const ValueDecl *> &escapedVars() const {
+    return EscapedVars;
+  }
+  void recordCallCtx(const CallExpr *Call, LocalVarContext Ctx) {
+    DiscardedCallCtx.try_emplace(Call, Ctx);
+  }
+
+  /// Whether \p B is reachable from the entry of the CFG.
+  bool inSortedGraph(const CFGBlock *B) const {
+    return RPOIdx[B->getBlockID()] != UINT_MAX;
+  }
+  /// The capabilities that the function is expected to acquire.
+  const CapExprSet &exitCaps() const { return CurrentTrylockExitCaps; }
+
+  /// Visit the exit block, whose info is \p CurrBlockInfo.
+  void visitExitBlock(CFGBlockInfo *CurrBlockInfo);
+  /// Start visiting block \p B. The following functions up to exitBlock()
+  /// refer to this block.
+  void beginBlock(const CFGBlock *B);
+  /// Whether the current block is on a path to the exit that does not modify
+  /// the lock state, i.e. whether its states are tracked per path.
+  bool isPureBlock() const { return IsPureBlock; }
+  /// Join the state on the edge from the visited block \p Pred into the
+  /// state of the current block and compute the lockset on the edge in
+  /// \p PrevLockset.
+  void joinPredecessor(const CFGBlock *Pred, FactSet &PrevLockset);
+  /// Record \p Lockset, the lockset on an edge into the current block,
+  /// which is a pure block.
+  void addPurePredLockset(FactSet Lockset) {
+    PurePredLocksets.push_back(std::move(Lockset));
+  }
+  void reportOverflowedJoin(const CFGBlockInfo *CurrBlockInfo);
+  /// Compute the state at the entry of the current block, which is
+  /// reachable, after all predecessors have been joined.
+  void enterBlock(CFGBlockInfo *CurrBlockInfo);
+  /// Update the state for statement \p S of the current block. \p FSet is
+  /// the lockset before \p S.
+  void handleStatement(const Stmt *S, const FactSet &FSet);
+  /// Add the capabilities that the trylock calls in the return value of
+  /// \p RS, a statement of the current block, acquire on success and that
+  /// \p Call, a destructor or cleanup function call after \p RS, releases to
+  /// \p FSet.
+  void addReturnedTrylockCaps(const ReturnStmt *RS,
+                              const ThreadSafetyAnalyzer::ScopeExitCall &Call,
+                              FactSet &FSet);
+  /// Finish visiting the current block.
+  void exitBlock(const CFGBlockInfo *CurrBlockInfo);
+  /// Verify the lock state at each exit of the function.
+  void verifyExits(const FactSet &ExpectedFunctionExitSet,
+                   const CFGBlockInfo &Final);
+
+private:
+  /// A predecessor of the exit block and what the verification of the lock
+  /// state at that exit needs.
+  struct ExitContext {
+    const CFGBlock *PredBlock;
+    const CFGBlockInfo &PredInfo;
+    const ReturnStmt *RS;
+    const Expr *RetVal;
+    SourceLocation DiagLoc;
+    LocalVarContext EvalCtx;
+    ThreadSafetyHandler &DedupHandler;
+    const FactSet &ExpectedFunctionExitSet;
+    bool ReturnsPointer;
+    llvm::MapVector<const ReturnStmt *,
+                    std::pair<std::optional<FactSet>, LocalVarContext>>
+        &PtReturnExpectedSets;
+  };
+
+  void getAcquiredTrylockCaps(const AcquiredTrylockKey &Key, CapExprSet &Caps);
+  bool isPureExitBlock(const CFGBlock *B, const CapExprSet &TargetCaps);
+  void addLockToExpectedSet(FactSet &Set, const CapabilityExpr &Lock,
+                            LockKind LK, SourceLocation Loc);
+  bool factSetsEquivalent(const FactSet &A, const FactSet &B) const;
+  void constrainValueStateOnEdge(TrylockValueState &State,
+                                 const CFGBlock *PredBlock,
+                                 const CFGBlock *CurrBlock);
+  void constrainValueStateOnEdgeImpl(TrylockValueState &State,
+                                     const CFGBlock *PredBlock,
+                                     const CFGBlock *CurrBlock);
+  void pruneOutOfScopeVars(TrylockValueState &State, const CFGBlock *B);
+  bool trylockDefMayAcquire(const TrylockValueState &State, const Expr *DefE,
+                            LocalVarContext DefCtx, QualType Ty,
+                            const IntRangeSet *Allowed);
+  void materializeNarrowedTrylocks(FactSet &Lockset, TrylockValueState &State);
+  void recordStmtMetadata(const Stmt *S, LocalVarContext StmtCtx);
+  void updateValueStateForStmt(TrylockValueState &State, const Stmt *S,
+                               LocalVarContext StmtCtx);
+  void updateValueStateForStmtImpl(TrylockValueState &State, const Stmt *S,
+                                   LocalVarContext StmtCtx);
+  void retireVarDef(TrylockValueState &State, const ValueDecl *VD,
+                    const Expr *NewRHS);
+  void updateVarFromExpr(TrylockValueState &State, const ValueDecl *VD,
+                         const Expr *RHS, LocalVarContext StmtCtx);
+  // If \p Calls is set, collect all trylock calls that evaluating \p E may
+  // execute into \p Calls instead of stopping at the first one.
+  bool exprHasUnmaterializedTrylock(
+      const Expr *E, LocalVarContext Ctx, const TrylockValueState &State,
+      bool UseStateDefs, bool IncludeMaterialized = false,
+      llvm::SmallPtrSetImpl<const CallExpr *> *Calls = nullptr);
+  void evaluateReturnWithPendingTrylocks(
+      const Expr *RetVal, const FactSet &InLockset,
+      const TrylockValueState &State, LocalVarContext Ctx,
+      SmallVectorImpl<ReturnEvalOutcome> &Out);
+  void collectTrylockAcquires(const Expr *E, LocalVarContext Ctx,
+                              const TrylockValueState &State, bool UseStateDefs,
+                              SmallVectorImpl<PendingTrylockAcquire> &Out,
+                              llvm::SmallPtrSetImpl<const Expr *> &Visited,
+                              unsigned Depth = 0);
+  void applyScopeExitCleanups(FactSet &StateSet, const CFGBlock *B,
+                              bool OnlyAfterReturn = false,
+                              const FactSet *PreReturnSet = nullptr,
+                              ThreadSafetyHandler *DiagHandler = nullptr);
+  void checkTrylockExitOutcome(
+      const FactSet &BaseExpectedExitSet, const ReturnEvalOutcome &Outcome,
+      SourceLocation DiagLoc, ThreadSafetyHandler &ExitHandler,
+      std::optional<FactSet> *NonNullExpectedSet = nullptr,
+      const FactSet *MaySet = nullptr);
+  void intersectExpectedSets(FactSet &Acc, const FactSet &Other);
+
+  static bool sameUnmaterializedDefs(const TrylockValueState &A,
+                                     const TrylockValueState &B);
+  static bool sameOverwrittenDefs(const TrylockValueState &A,
+                                  const TrylockValueState &B);
+  bool sameBundleState(const TrylockEdgeBundle &A, const TrylockEdgeBundle &B);
+  bool sameCollapsedBundleState(const TrylockEdgeBundle &A,
+                                const TrylockEdgeBundle &B);
+  void mergeOrAppendBundle(SmallVectorImpl<TrylockEdgeBundle> &Bundles,
+                           TrylockEdgeBundle Candidate);
+  void collapseAndMergeBundle(SmallVectorImpl<TrylockEdgeBundle> &Bundles,
+                              TrylockEdgeBundle Candidate);
+  void addOrMergeBundle(unsigned BlockID, TrylockEdgeBundle Candidate);
+  void intersectFactSetsQuietly(FactSet &Acc, const FactSet &Other);
+  TrylockValueState getEdgeState(const CFGBlock *Pred, const CFGBlock *Succ,
+                                 FactSet &Lockset);
+  void forEachEdgeBundle(const CFGBlock *Pred, const CFGBlock *Succ,
+                         llvm::function_ref<void(TrylockEdgeBundle)> F);
+
+  void verifyReturn(const ExitContext &Exit, const FactSet &Lockset,
+                    TrylockValueState State);
+  /// Verify the lock state at the exit \p Exit for the lockset \p Lockset
+  /// and the value state \p State on an edge into Exit.PredBlock.
+  void verifyEdgeState(const ExitContext &Exit, FactSet Lockset,
+                       TrylockValueState State);
+
+  ThreadSafetyAnalyzer &Analyzer;
+  CFG *CFGraph;
+  const PostOrderCFGView *SortedGraph;
+  PostOrderCFGView::CFGBlockSet &VisitedBlocks;
+  const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars;
+  const CFGBlock *ExitBlock;
+  const unsigned NumBlocks;
+
+  SmallVector<TrylockExitSpec, 2> CurrentTrylockExitSpecs;
+  IntDomain CurrentTrylockRetDom;
+  CapExprSet CurrentTrylockExitCaps;
+  // The parent map of the function whose trylock implementation is verified.
+  const ParentMap *CurrentParentMap = nullptr;
+  // Logical && / || operators whose boolean result is consumed as a value by a
+  // CFGStmt in the current function.
+  llvm::DenseSet<const BinaryOperator *> ValueLogicalOps;
+  // The statement that encloses the declaration of a local variable, i.e. the
+  // scope of the variable.
+  llvm::DenseMap<const ValueDecl *, const Stmt *> VarScopes;
+  // Trylock calls in the function being verified whose result is discarded.
+  llvm::SmallPtrSet<const CallExpr *, 4> DiscardedCalls;
+  // The local variable context of each executed call in DiscardedCalls.
+  llvm::DenseMap<const CallExpr *, LocalVarContext> DiscardedCallCtx;
+  // The number of evaluateReturnOutcomes() calls and unmaterialized-trylock
+  // scan steps that may still be performed for the return value that is being
+  // verified, and whether that budget or the number of outcomes has been
+  // exceeded.
+  unsigned ReturnEvalSteps = 0;
+  unsigned ReturnScanSteps = 0;
+  bool InReturnEval = false;
+  bool ReturnEvalExhausted = false;
+
+  std::vector<unsigned> RPOIdx;
+  std::vector<bool> PureExitPathBlocks;
+  std::vector<TrylockValueState> BlockExitValState;
+  std::vector<bool> KeepStateForExit;
+  std::vector<SmallVector<TrylockEdgeBundle, 2>> PureBlockBundles;
+  std::vector<bool> CollapsedBundles;
+  std::vector<bool> BundleOverflow;
+  std::vector<FactSet> PreReturnLocksets;
+  std::vector<TrylockValueState> PreReturnValStates;
+  std::vector<LocalVarContext> PreReturnVarCtx;
+
+  // The state of the block that is being visited.
+  const CFGBlock *CurrBlock = nullptr;
+  unsigned CurrBlockID = 0;
+  bool IsPureBlock = false;
+  TrylockValueState CurrValState;
+  // The locksets on the edges into a pure block.
+  SmallVector<FactSet, 2> PurePredLocksets;
+  // The local variable context of the next statement of the block.
+  unsigned ValCtxIdx = 0;
+  LocalVarContext ValStmtCtx;
+};
 
 } // namespace threadSafety
 } // namespace clang

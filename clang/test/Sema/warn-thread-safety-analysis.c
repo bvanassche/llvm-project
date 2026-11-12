@@ -707,6 +707,7 @@ void late_param_other(void (*release)(struct Mutex *) UNLOCK_FUNCTION(mu),
 
 // Test unusual trylock patterns
 void do_some_work(void);
+int do_some_work_cond(void);
 int work_data GUARDED_BY(mu1);
 
 void test_trylock_conditional(void) {
@@ -828,7 +829,228 @@ void test_trylock_range_c(void) {
   }
 }
 
-// Trivial inline helpers (IS_ERR, PTR_ERR, PTR_ERR_OR_ZERO).
+// Compile-time verification of trylock function implementations in C.
+int check_hw_ready(void);
+
+int c_trylock_goto_valid(int cond)
+    __attribute__((try_acquire_capability_range(0, 0, mu1, mu2))) {
+  int err;
+  if ((err = check_hw_ready()) < 0)
+    return err;
+  if (!mutex_exclusive_trylock(&mu1)) {
+    err = -16;
+    goto out;
+  }
+  if (!mutex_exclusive_trylock(&mu2)) {
+    err = -16;
+    goto unlock_mu1;
+  }
+  work_data = 10;
+  return 0;
+
+unlock_mu1:
+  mutex_unlock(&mu1);
+out:
+  return err;
+}
+
+// Incrementing a _Bool sets it to 1.
+int c_trylock_bool_increment_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  _Bool ok = 1;
+  ok++;
+  if (ok)
+    return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+  mutex_exclusive_lock(&mu1);
+  return 1;
+}
+
+// More paths than the per-path tracking limit must not cause false positives.
+#define C_TRYLOCK_CASE(n)                                                      \
+  case n:                                                                      \
+    r = mutex_exclusive_trylock(&mu1);                                         \
+    break;
+#define C_TRYLOCK_CASE8(b)                                                     \
+  C_TRYLOCK_CASE(8 * (b) + 0) \
+  C_TRYLOCK_CASE(8 * (b) + 1) \
+  C_TRYLOCK_CASE(8 * (b) + 2) \
+  C_TRYLOCK_CASE(8 * (b) + 3) \
+  C_TRYLOCK_CASE(8 * (b) + 4) \
+  C_TRYLOCK_CASE(8 * (b) + 5) \
+  C_TRYLOCK_CASE(8 * (b) + 6) \
+  C_TRYLOCK_CASE(8 * (b) + 7)
+
+int c_trylock_many_paths_valid(int x)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int r = 0;
+  switch (x) {
+    C_TRYLOCK_CASE8(0) C_TRYLOCK_CASE8(1) C_TRYLOCK_CASE8(2) C_TRYLOCK_CASE8(3)
+    C_TRYLOCK_CASE8(4) C_TRYLOCK_CASE8(5) C_TRYLOCK_CASE8(6) C_TRYLOCK_CASE8(7)
+  }
+  return r;
+}
+
+int c_trylock_goto_missing_unlock(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1, mu2))) {
+  int err = 0;
+  if (!mutex_exclusive_trylock(&mu1)) // expected-note{{mutex acquired here}}
+    return -16;
+  if (!mutex_exclusive_trylock(&mu2)) {
+    err = -16;
+    goto out;
+  }
+  return 0;
+
+out:
+  return err; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int c_shared_trylock_valid(int cond)
+    __attribute__((try_acquire_shared_capability(1, mu1))) {
+  if (!cond)
+    return 0;
+  mutex_shared_lock(&mu1);
+  return 1;
+}
+
+int c_shared_trylock_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_shared_capability(1, mu1))) {
+  return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_shared_trylock_range_bad(void)
+    __attribute__((try_acquire_shared_capability_range(0, 0, mu1))) {
+  mutex_shared_lock(&mu1); // expected-note{{mutex acquired here}}
+  return -1; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_ptr_trylock_valid(int cond)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  if (!cond)
+    return (void *)0;
+  mutex_exclusive_lock(&mu1);
+  return &work_data;
+}
+
+int *c_ptr_trylock_bad(int cond) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  if (!cond)
+    return (void *)0;
+  return &work_data; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+#ifdef __SIZEOF_INT128__
+// Range arithmetic on __int128 values uses wider integers than on other types.
+int c_int128_narrowing_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  __int128 big = (__int128)1 << 40;
+  int x = 0;
+  x += (__int128)1;
+  (void)x;
+  return (int)big; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+#endif
+
+int c_cleanup_outer_guard_valid(int cond)
+    __attribute__((try_acquire_capability_range(0, 0, mu2))) {
+  mutex_exclusive_lock(&mu1);
+  struct Mutex *const __attribute__((unused, cleanup(unlock_scope))) scope = &mu1;
+  if (!cond)
+    return -16;
+  mutex_exclusive_lock(&mu2);
+  return 0;
+}
+
+int c_cleanup_releases_target_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  struct Mutex *const __attribute__((unused, cleanup(unlock_scope))) scope = &mu1;
+  return 0; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+// Pointer values are tracked in the uintptr_t domain, also across
+// conversions between pointers and integers that preserve the value.
+void *c_find_obj(void);
+
+int c_trylock_open_coded_err_ptr_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret;
+  mutex_exclusive_lock(&mu1);
+  void *obj = c_find_obj();
+  if ((__UINTPTR_TYPE__)obj >= (__UINTPTR_TYPE__)-4095) {
+    ret = (int)(__INTPTR_TYPE__)obj;
+    goto fail_unlock;
+  }
+  return 0;
+
+fail_unlock:
+  mutex_unlock(&mu1);
+  return ret;
+}
+
+int c_trylock_open_coded_err_ptr_unchecked_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  void *obj = c_find_obj();
+  // obj may be NULL, so the return value may be 0.
+  return (int)(__INTPTR_TYPE__)obj; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_trylock_unsigned_roundtrip_valid(int err)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  if (err < 0) {
+    unsigned long u = (unsigned long)(long)err;
+    return (int)(long)u;
+  }
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
+// Multi-statement GNU statement expressions in trylock implementations.
+void trace_value(long val);
+#define TEST_TRACED_VALUE(x)                                                   \
+  ({                                                                           \
+    long __v = (x);                                                            \
+    trace_value(__v);                                                          \
+    __v;                                                                       \
+  })
+
+int c_stmtexpr_return_valid(int fail)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  if (fail)
+    return TEST_TRACED_VALUE(-11);
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
+int c_stmtexpr_condition_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  int ret = check_hw_ready();
+  mutex_exclusive_lock(&mu1);
+  if (TEST_TRACED_VALUE(ret)) {
+    mutex_unlock(&mu1);
+    return ret;
+  }
+  return ret;
+}
+
+int c_stmtexpr_init_assign_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  // The initializer of 'd' assigns 0 to 'r'.
+  return ({ int r = -11; int d = (r = 0); (void)d; r; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_stmtexpr_nested_assign_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return ({ int r = -11, d; d = (r = 0); r; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_stmtexpr_comma_init_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return ({ int r = -11; int d = (r = 0, r); d; }); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+// Trivial inline helpers (restart_syscall, IS_ERR, PTR_ERR, PTR_ERR_OR_ZERO)
+// and do { ... } while (0) macros in trylock implementations.
 void trace_branch_hit(int val);
 #define TEST_UNLIKELY_STMTEXPR(x)                                              \
   ({                                                                           \
@@ -836,6 +1058,15 @@ void trace_branch_hit(int val);
     trace_branch_hit((int)__r);                                                \
     __r;                                                                       \
   })
+#define TEST_UNLOCK_DOWHILE0(m)                                                \
+  do {                                                                         \
+    mutex_unlock(m);                                                           \
+  } while (0)
+
+static inline int c_restart_syscall_helper(void) {
+  do_some_work();
+  return -513;
+}
 
 static inline _Bool c_is_err_value(__UINTPTR_TYPE__ x) {
   return TEST_UNLIKELY_STMTEXPR(x >= (__UINTPTR_TYPE__)-4095);
@@ -843,6 +1074,21 @@ static inline _Bool c_is_err_value(__UINTPTR_TYPE__ x) {
 
 static inline _Bool c_is_err(const void *ptr) {
   return c_is_err_value((__UINTPTR_TYPE__)(void *)((__UINTPTR_TYPE__)ptr));
+}
+
+// Recursive inline helpers must not be expanded recursively.
+static inline int c_recursive_helper(int x) {
+  if (c_recursive_helper(x))
+    return c_recursive_helper(x);
+  return c_recursive_helper(x);
+}
+
+int c_recursive_inline_helper_valid(int x)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  if (c_recursive_helper(x))
+    return -1;
+  mutex_exclusive_lock(&mu1);
+  return 0;
 }
 
 static inline __INTPTR_TYPE__ c_ptr_err(const void *ptr) {
@@ -856,6 +1102,25 @@ static inline int c_ptr_err_or_zero(const void *ptr) {
     return 0;
 }
 
+void *c_lookup_obj(void);
+
+int c_trylock_restart_syscall_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  if (mutex_exclusive_trylock(&mu1))
+    return 0;
+  do_some_work();
+  return c_restart_syscall_helper();
+}
+
+int c_trylock_ptr_err_or_zero_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  void *obj = c_lookup_obj();
+  if (c_is_err(obj))
+    return c_ptr_err_or_zero(obj);
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
 // Branch conditions that call inline helpers with arguments that are
 // unrelated to the tracked values must not use up the inline expansion
 // budget of the analyzed function (MaxInlineExpansions).
@@ -866,6 +1131,69 @@ int c_unrelated_data;
 #define C_REP256(x) C_REP16(C_REP16(x))
 #define C_REP1024(x) C_REP4(C_REP256(x))
 
+int c_budget_unrelated_calls_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  C_REP1024(if (c_unrelated_helper(c_unrelated_data)) c_unrelated_data = 0;)
+  void *obj = c_lookup_obj();
+  if (c_is_err(obj))
+    return c_ptr_err_or_zero(obj);
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
+// Arguments with a constant range that is not the full range, e.g. the address
+// of a global variable, must not use up the budget either.
+static inline int c_unrelated_ptr_helper(int *p) { return *p != 0; }
+int c_budget_unrelated_addrof_valid(void)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  C_REP1024(if (c_unrelated_ptr_helper(&c_unrelated_data)) c_unrelated_data = 0;)
+  void *obj = c_lookup_obj();
+  if (c_is_err(obj))
+    return c_ptr_err_or_zero(obj);
+  mutex_exclusive_lock(&mu1);
+  return 0;
+}
+
+int c_trylock_ptr_err_unchecked_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  // Without c_is_err(obj), obj may be NULL, so c_ptr_err(obj) may return 0!
+  void *obj = c_lookup_obj();
+  return c_ptr_err(obj); // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+// Redeclared try_acquire attributes on a reentrant capability must not expect
+// reentrancy depth 2 when both prototype and definition carry the attribute.
+struct __attribute__((capability("mutex"), reentrant_capability)) CReentrantLock {
+  int unused;
+};
+struct CReentrantLock crmu;
+void c_reentrant_read_lock(struct CReentrantLock *m)
+    __attribute__((acquire_shared_capability(*m)));
+void c_reentrant_read_unlock(struct CReentrantLock *m)
+    __attribute__((release_shared_capability(*m)));
+
+int c_redecl_reentrant_trylock(int ok)
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu)));
+int c_redecl_reentrant_trylock(int ok)
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu))) {
+  if (!ok)
+    return -11;
+  c_reentrant_read_lock(&crmu);
+  return 0;
+}
+
+int c_redecl_reentrant_delegate(int ok)
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu))) {
+  return c_redecl_reentrant_trylock(ok);
+}
+
+int c_redecl_reentrant_trylock_bad(void)
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu)));
+int c_redecl_reentrant_trylock_bad(void) // expected-note@-1 {{mutex acquired here}}
+    __attribute__((try_acquire_shared_capability_range(0, 0, crmu))) {
+  return 0; // expected-warning{{expecting mutex 'crmu' to be held at the end of function}}
+}
+
 // Pointer return types on try_acquire_[shared_]capability_range.
 #define TEST_IS_ERR_VALUE_MACRO(x)                                             \
   __builtin_expect(                                                            \
@@ -874,9 +1202,26 @@ int c_unrelated_data;
 struct CGroupObj {
   int id;
 };
+struct CGroupObj g_cgrp_obj;
 
 struct CGroupObj *c_ptr_range_lock_live(int ok)
-    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1)));
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1))) {
+  if (!ok)
+    return (struct CGroupObj *)(__INTPTR_TYPE__)-2;
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return &g_cgrp_obj; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+struct CGroupObj *c_ptr_range_lock_live_leak_bad(void)
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return (struct CGroupObj *)(__INTPTR_TYPE__)-16; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+struct CGroupObj *c_ptr_range_lock_live_missing_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1))) {
+  return (struct CGroupObj *)0; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
 
 struct CGroupObj *c_ptr_range_shared_nonnull(int mode)
     __attribute__((try_acquire_shared_capability_range(1, (__UINTPTR_TYPE__)-4096, mu1)));
@@ -931,7 +1276,7 @@ void test_ptr_range_callers_c(int ok, int mode) {
 }
 
 // Inline helper expansion (IS_ERR, IS_ERR_OR_NULL, PTR_ERR, PTR_ERR_OR_ZERO,
-// ERR_CAST) in caller-side range trylock conditions.
+// ERR_CAST) in caller-side range trylock conditions and trylock bodies.
 static inline _Bool c_is_err_or_null(const void *ptr) {
   return TEST_UNLIKELY_STMTEXPR(!ptr) ||
          c_is_err_value((__UINTPTR_TYPE__)ptr);
@@ -952,6 +1297,7 @@ static inline _Bool c_recursive_ptr_helper(const void *ptr) {
 }
 
 _Bool c_opaque_is_err(const void *ptr);
+int c_opaque_err_or_zero(const void *ptr);
 
 void test_inline_helper_range_callers_c(int ok, int mode) {
   // Direct call passed to IS_ERR() (matches Linux debug_populate()).
@@ -1627,6 +1973,62 @@ void test_multi_param_inline_disconnected_failure_c(int mode) {
   mutex_unlock(&mu1);
 }
 
+
+int c_delegate_ptr_err_or_zero_direct_valid(int ok)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return c_ptr_err_or_zero(c_ptr_range_lock_live(ok));
+}
+
+int c_delegate_ptr_err_or_zero_vars_valid(int ok)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  struct CGroupObj *p = c_ptr_range_lock_live(ok);
+  int err = c_ptr_err_or_zero(p);
+  return err;
+}
+
+void *c_delegate_err_cast_valid(int ok)
+    __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096, mu1))) {
+  void *p = c_err_cast(c_ptr_range_lock_live(ok));
+  if (c_is_err(p))
+    return p;
+  work_data = 22;
+  return p;
+}
+
+static inline int c_inv_err(int x) { return !x; }
+
+int c_delegate_inverted_helper_bad(int ok) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return c_inv_err(c_ptr_err_or_zero(c_ptr_range_lock_live(ok))); // \
+    // expected-note{{mutex acquired here}} \
+    // expected-warning{{mutex 'mu1' is still held at the end of function}} \
+    // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+static inline int c_pick_first(int a, int b) {
+  (void)b;
+  return a;
+}
+
+int c_delegate_pick_first_bad(int ok) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return c_pick_first(0, c_ptr_err_or_zero(c_ptr_range_lock_live(ok))); // \
+    // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_delegate_pick_first_valid(int ok)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return c_pick_first(c_ptr_err_or_zero(c_ptr_range_lock_live(ok)), 0);
+}
+
+int c_delegate_opaque_helper_bad(int ok) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  return c_opaque_err_or_zero(c_ptr_range_lock_live(ok)); // \
+    // expected-note{{mutex acquired here}} \
+    // expected-warning{{mutex 'mu1' is still held at the end of function}} \
+    // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
 // Conditions that call helpers that are unrelated to range trylocks must not
 // use up the inline expansion budget of the analyzed function.
 void test_inline_budget_unrelated_calls_c(int ok) {
@@ -1637,6 +2039,12 @@ void test_inline_budget_unrelated_calls_c(int ok) {
     return;
   work_data = 30;
   mutex_unlock(&mu1);
+}
+
+int c_delegate_budget_unrelated_calls(int ok)
+    __attribute__((try_acquire_capability_range(0, 0, mu1))) {
+  C_REP1024(if (c_unrelated_helper(c_unrelated_data)) c_unrelated_data = 0;)
+  return c_ptr_err_or_zero(c_ptr_range_lock_live(ok));
 }
 
 // Multiple arguments of one helper that are derived from range trylocks.
@@ -1732,6 +2140,36 @@ void test_recursive_identity_helper_c(int ok) {
   }
 }
 
+// Address-of on a null dereferenced pointer or on a weak object may be null.
+extern int c_weak_obj __attribute__((weak));
+int c_nonweak_obj;
+
+int *c_addrof_deref_null(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *p = 0;
+  return &*p;
+}
+
+int c_addrof_deref_branch(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *p = 0;
+  if (&*p == 0)
+    return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+  return 0;
+}
+
+int *c_addrof_weak(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+  return &c_weak_obj; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int *c_addrof_nonweak(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  return &c_nonweak_obj;
+}
+
 // _Generic controlling and unselected expressions are unevaluated.
 void test_generic_unevaluated_c(int unk) {
   int r = unk;
@@ -1793,6 +2231,99 @@ void test_unevaluated_stmt_expr_decls_c(int unk) {
     work_data = 47;
     mutex_unlock(&mu1);
   }
+}
+
+// sizeof(VLA_type) evaluates its size expression, whereas __alignof__ and
+// sizeof(pointer_to_VLA) do not.
+int test_sizeof_vla_type_side_effect_c(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *q = 0;
+  int r = 0;
+  unsigned long sz = sizeof(int[*(q = &r) + 1]);
+  (void)sz;
+  r = mutex_exclusive_trylock(&mu1); // expected-note{{mutex acquired here}}
+  *q = 1;
+  if (r)
+    return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+  return 0; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+int test_alignof_and_sizeof_ptr_to_vla_ok_c(int n)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int r = mutex_exclusive_trylock(&mu1);
+  unsigned long a = __alignof__(r);
+  unsigned long s = sizeof(int (*)[n + (r = 0)]);
+  (void)a;
+  (void)s;
+  return r;
+}
+
+// Arithmetic on a bool converts the result back to bool, i.e. the result is
+// whether the value is non-zero.
+int c_bool_increment(void) __attribute__((try_acquire_capability(1, mu1))) {
+  int r = mutex_exclusive_trylock(&mu1);
+  _Bool b = 1;
+  b++; // b is still 1.
+  if (b) {
+    if (r)
+      mutex_unlock(&mu1);
+  }
+  return 0;
+}
+
+int c_bool_decrement(void) __attribute__((try_acquire_capability(1, mu1))) {
+  int r = mutex_exclusive_trylock(&mu1);
+  _Bool b = 0;
+  b--; // b becomes 1.
+  if (b) {
+    if (r)
+      mutex_unlock(&mu1);
+  }
+  return 0;
+}
+
+int c_bool_compound_assignment(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int r = mutex_exclusive_trylock(&mu1);
+  _Bool b = 1;
+  b += 2; // b is still 1.
+  if (b) {
+    if (r)
+      mutex_unlock(&mu1);
+  }
+  return 0;
+}
+
+// The leak on the true branch is unreachable because b is 0.
+int c_bool_decrement_to_false(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  _Bool b = 1;
+  b--; // b becomes 0.
+  if (b) {
+    mutex_exclusive_lock(&mu1);
+    return 0;
+  }
+  return 0;
+}
+
+// Constant builtin calls (such as __builtin_bswap32 in cpu_to_be32) and
+// constant shift/multiplicative expressions are folded in branch conditions.
+static unsigned int c_bswap_status(int st) {
+  unsigned int ret = __builtin_bswap32(0U);
+  if (st & 1)
+    ret = __builtin_bswap32(10073U);
+  else if (st & (1 << 1))
+    ret = __builtin_bswap32(2U * 5U);
+  return ret;
+}
+
+unsigned int c_trylock_bswap_cond(int st)
+    __attribute__((try_acquire_capability(0, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  unsigned int ret = c_bswap_status(st);
+  if (ret != __builtin_bswap32(0U))
+    mutex_unlock(&mu1);
+  return ret;
 }
 
 // Combining an unrelated condition with a trylock variable check in && or ||
@@ -1860,6 +2391,130 @@ void test_vla_escape_after_branch_c(void) {
   }
   void *p = (int (*)[clobber_int(&r)])0;
   (void)p;
+}
+
+// Releasing an unrelated capability in a shared pure exit block.
+struct Mutex c_outer_mu;
+void c_require_mu1(void) __attribute__((requires_capability(mu1)));
+
+int *c_exit_unlock_unrelated_valid(int ok)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *res = (void *)0;
+  mutex_shared_lock(&c_outer_mu);
+  if (ok) {
+    mutex_exclusive_lock(&mu1);
+    res = &work_data;
+  }
+  mutex_unlock(&c_outer_mu);
+  return res;
+}
+
+int *c_exit_unlock_unrelated_missing_on_path_bad(int ok)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int *res = (void *)0;
+  mutex_shared_lock(&c_outer_mu); // expected-note{{mutex acquired here}}
+  if (ok) {
+    mutex_exclusive_lock(&mu1);
+    res = &work_data;
+  } else {
+    mutex_unlock(&c_outer_mu);
+  }
+  mutex_unlock(&c_outer_mu); // expected-warning{{mutex 'c_outer_mu' is not held on every path through here}} \
+                             // expected-warning{{releasing mutex 'c_outer_mu' that was not held}}
+  return res;
+}
+
+int c_exit_unlock_unrelated_missing_target_bad(int ok) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int ret = 0;
+  mutex_shared_lock(&c_outer_mu);
+  if (ok)
+    ret = 1;
+  mutex_unlock(&c_outer_mu);
+  return ret; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_exit_unlock_target_direct_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  mutex_exclusive_lock(&mu1);
+  mutex_unlock(&mu1);
+  return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_exit_unlock_target_via_alias_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  struct Mutex *p = &mu1;
+  mutex_exclusive_lock(&mu1);
+  mutex_unlock(p);
+  return 1; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_exit_requires_target_bad(int ok) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int ret = 0;
+  if (ok) {
+    mutex_exclusive_lock(&mu1); // expected-note{{mutex acquired here}}
+    ret = 1;
+  }
+  c_require_mu1(); // expected-warning{{mutex 'mu1' is not held on every path through here}} \
+                   // expected-warning{{calling function 'c_require_mu1' requires holding mutex 'mu1' exclusively}}
+  return ret; // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+// Side effects in VLA size expressions inside pointer declarators invalidate
+// modified local variables.
+int c_vla_ptr_inc_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int r = mutex_exclusive_trylock(&mu1); // expected-note{{mutex acquired here}}
+  int (*q)[r++];
+  (void)q;
+  return r; // expected-warning{{mutex 'mu1' is still held at the end of function}} \
+            // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_vla_ptr_assign_nonzero_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int r = mutex_exclusive_trylock(&mu1); // expected-note{{mutex acquired here}}
+  int (*q)[r = 5];
+  (void)q;
+  return r; // expected-warning{{mutex 'mu1' is still held at the end of function}} \
+            // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_vla_ptr_assign_zero_bad(void) // expected-note@+1 {{mutex acquired here}}
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int r = mutex_exclusive_trylock(&mu1); // expected-note{{mutex acquired here}}
+  int (*q)[r = 0];
+  (void)q;
+  return r; // expected-warning{{mutex 'mu1' is still held at the end of function}} \
+            // expected-warning{{expecting mutex 'mu1' to be held at the end of function}}
+}
+
+int c_vla_ptr_trylock_leaks_bad(void)
+    __attribute__((try_acquire_capability(1, mu1))) {
+  int (*p)[mutex_exclusive_trylock(&mu1)] = 0; // expected-note{{mutex acquired here}}
+  (void)p;
+  return 0; // expected-warning{{mutex 'mu1' is still held at the end of function}}
+}
+
+// Call-site inline helper evaluation with non-weak address-of and array decay.
+int c_nonweak_arr[4];
+static inline int c_check_zero_if_valid_ptr(int err, const void *p) {
+  return p ? (err == 0) : 1;
+}
+
+void test_callsite_inline_addrof_and_decay_c(void) {
+  if (c_check_zero_if_valid_ptr(mutex_trylock_zero(&mu1), &c_nonweak_obj)) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+  }
+  if (c_check_zero_if_valid_ptr(mutex_trylock_zero(&mu1), c_nonweak_arr)) {
+    work_data = 2;
+    mutex_unlock(&mu1);
+  }
+  if (c_check_zero_if_valid_ptr(mutex_trylock_zero(&mu1), &c_weak_obj)) {
+    work_data = 3; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
 }
 
 // We had a problem where we'd skip all attributes that follow a late-parsed

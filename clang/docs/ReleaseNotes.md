@@ -579,6 +579,16 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   `try_acquire_capability`, `try_acquire_shared_capability`,
   `try_acquire_capability_range`, or `try_acquire_shared_capability_range`.
 
+- With `-Wthread-safety-beta`, the thread safety analysis now checks the bodies
+  of functions annotated with `try_acquire_capability`,
+  `try_acquire_shared_capability`, `try_acquire_capability_range`, or
+  `try_acquire_shared_capability_range` (when explicit capability arguments are
+  provided) to verify that the specified capabilities are held on return paths
+  indicating success and are not held on return paths indicating failure. Small
+  `inline` or `constexpr` helper functions called in `return` statements are
+  evaluated for this purpose. Without `-Wthread-safety-beta`, the bodies of
+  these functions are not checked, as before.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed a false-positive `-Wimplicit-fallthrough` warning when

@@ -13,6 +13,7 @@
 
 #include "ThreadSafetyInternal.h"
 #include "clang/AST/IgnoreExpr.h"
+#include "llvm/ADT/SetOperations.h"
 #include "llvm/Support/SaveAndRestore.h"
 
 using namespace clang;
@@ -251,6 +252,13 @@ static void visitEvaluatedStmts(const Stmt *Root, const ASTContext &Ctx,
                          [&](const Expr *Sz) { Worklist.push_back(Sz); });
     llvm::append_range(Worklist, S->children());
   }
+}
+
+void threadSafety::forEachEvaluatedDeclVLAStmt(
+    const DeclStmt *DS, const ASTContext &Ctx, bool IncludeTopLevelVLA,
+    llvm::function_ref<void(const Stmt *)> Fn) {
+  forEachDeclVLAExpr(DS, IncludeTopLevelVLA,
+                     [&](const Expr *Sz) { visitEvaluatedStmts(Sz, Ctx, Fn); });
 }
 
 namespace {
@@ -1178,6 +1186,13 @@ const ValueDecl *ThreadSafetyAnalyzer::extractTrackableVarExpr(
       }
       return nullptr;
     }
+    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+      if (BO->getOpcode() == BO_Assign) {
+        E = BO->getLHS();
+        continue;
+      }
+      return nullptr;
+    }
     if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
       const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
       return isTrackableLocalVar(VD, EscapedVars) ? VD : nullptr;
@@ -1185,6 +1200,55 @@ const ValueDecl *ThreadSafetyAnalyzer::extractTrackableVarExpr(
     return nullptr;
   }
   return nullptr;
+}
+
+/// Range of addresses that a valid object or function can have, i.e. all
+/// non-null addresses.
+ThreadSafetyAnalyzer::IntRangeSet threadSafety::validObjectPtrRangeSet(
+    const ThreadSafetyAnalyzer::IntDomain &Dom) {
+  return ThreadSafetyAnalyzer::IntRangeSet::truthSet(Dom, true);
+}
+
+/// Whether the address of lvalue \p E is guaranteed to be a valid non-null
+/// object or function address (excluding weak symbols and arbitrary pointer
+/// dereferences).
+static bool isKnownValidObjectOrFunctionLValue(const Expr *E) {
+  while (E) {
+    E = stripNoOpExprWrappers(E);
+    if (isa<StringLiteral, CompoundLiteralExpr, PredefinedExpr, ObjCEncodeExpr>(
+            E))
+      return true;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const ValueDecl *D = DRE->getDecl();
+      if (D->isWeak())
+        return false;
+      if (const auto *VD = dyn_cast<VarDecl>(D))
+        return !VD->getType()->isReferenceType();
+      if (isa<FieldDecl, IndirectFieldDecl>(D))
+        return !D->getType()->isReferenceType();
+      return isa<FunctionDecl>(D);
+    }
+    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+      const ValueDecl *MD = ME->getMemberDecl();
+      if (const auto *VD = dyn_cast<VarDecl>(MD))
+        return !VD->isWeak() && !VD->getType()->isReferenceType();
+      if (const auto *FD = dyn_cast<FunctionDecl>(MD))
+        return !FD->isWeak();
+      if (!isa<FieldDecl, IndirectFieldDecl>(MD))
+        return false;
+      // The address of a reference member is the address of the object that
+      // it is bound to and not an address inside the base object.
+      if (MD->getType()->isReferenceType())
+        return false;
+      if (ME->isArrow())
+        return isa_and_nonnull<CXXThisExpr>(
+            stripNoOpExprWrappers(ME->getBase()));
+      E = ME->getBase();
+      continue;
+    }
+    return false;
+  }
+  return false;
 }
 
 bool threadSafety::exprReferencesAnyVar(
@@ -1281,9 +1345,68 @@ bool ThreadSafetyAnalyzer::exprReferencesAnyVar(
 
 void threadSafety::eraseModifiedVarsFromState(
     ThreadSafetyAnalyzer::TrylockValueState &State,
-    llvm::ArrayRef<const ValueDecl *> ModVars) {
+    llvm::ArrayRef<const ValueDecl *> ModVars,
+    const llvm::SmallPtrSetImpl<const Expr *> *PinnedExprs) {
   for (const ValueDecl *VD : ModVars)
     State.VarRanges.erase(VD);
+  // The recorded value of a call is the value that the call returned, which
+  // modifying a variable afterwards does not change. Keep these such that the
+  // outcome of a trylock call is not forgotten, e.g. in the condition of
+  // 'trylock(&s.a) ? trylock(&s.b) : 0', whose arms modify 's'. The same
+  // holds for the pinned expressions, e.g. the condition 's.flag' that
+  // ReturnValueForker has split 's.flag && trylock(&s.b)' on, and for
+  // statement expressions that do not refer to a modified variable, e.g.
+  // '({ int v = 1; v; })'.
+  auto RefersToModVar = [&](const Stmt *Root) {
+    SmallVector<const Stmt *, 8> Worklist = {Root};
+    while (!Worklist.empty()) {
+      const Stmt *S = Worklist.pop_back_val();
+      if (!S)
+        continue;
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(S))
+        if (llvm::is_contained(
+                ModVars, cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl())))
+          return true;
+      llvm::append_range(Worklist, S->children());
+    }
+    return false;
+  };
+  SmallVector<const Expr *, 8> Stale;
+  for (const auto &[E, Values] : State.ExprRanges)
+    if (!isa<CallExpr>(E) && !(PinnedExprs && PinnedExprs->contains(E)) &&
+        (!isa<StmtExpr>(E) || RefersToModVar(E)))
+      Stale.push_back(E);
+  for (const Expr *E : Stale)
+    State.ExprRanges.erase(E);
+}
+
+static const Expr *getStmtExprLocalValue(const StmtExpr *SE,
+                                         const ASTContext &Ctx) {
+  const CompoundStmt *CS = SE->getSubStmt();
+  const auto *Last =
+      CS && !CS->body_empty() ? dyn_cast<Expr>(CS->body_back()) : nullptr;
+  if (!Last || Last->HasSideEffects(Ctx))
+    return nullptr;
+  llvm::SmallPtrSet<const Decl *, 4> LocalDecls;
+  for (const Stmt *S : CS->body())
+    if (const auto *DS = dyn_cast<DeclStmt>(S))
+      for (const Decl *D : DS->decls())
+        LocalDecls.insert(D->getCanonicalDecl());
+  if (LocalDecls.empty())
+    return nullptr;
+  for (SmallVector<const Stmt *, 8> W = {Last}; !W.empty();) {
+    const Stmt *S = W.pop_back_val();
+    if (!S)
+      continue;
+    if (isa<StmtExpr, LambdaExpr, BlockExpr>(S))
+      return nullptr;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(S);
+        DRE && isa<VarDecl>(DRE->getDecl()) &&
+        !LocalDecls.contains(DRE->getDecl()->getCanonicalDecl()))
+      return nullptr;
+    llvm::append_range(W, S->children());
+  }
+  return Last;
 }
 
 std::optional<ThreadSafetyAnalyzer::IntRangeSet>
@@ -1306,8 +1429,21 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
     return std::nullopt;
   const IntDomain &Dom = *DomOpt;
 
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->isLogicalOp()) {
+      if (auto It = State.ShortCircuitedOps.find(BO);
+          It != State.ShortCircuitedOps.end())
+        return IntRangeSet::single(Dom, llvm::APSInt::get(It->second ? 1 : 0));
+    }
+  }
+
+  if (auto It = State.ExprRanges.find(E); It != State.ExprRanges.end())
+    return reprojectRangeSet(It->second, Dom);
+
   if (isa<CXXNullPtrLiteralExpr, GNUNullExpr>(E))
     return IntRangeSet::single(Dom, llvm::APSInt::get(0));
+  if (isa<CXXThisExpr>(E))
+    return validObjectPtrRangeSet(Dom);
 
   if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
     return evaluatePureDeclRefRange(DRE, Dom, State, EC);
@@ -1330,6 +1466,14 @@ ThreadSafetyAnalyzer::evaluatePureExprRange(const Expr *E,
   if (const auto *SE = dyn_cast<StmtExpr>(E)) {
     if (const Expr *Inner = getCachedPureStmtExpr(SE))
       if (auto R = evaluatePureExprRange(Inner, State, EC, Depth + 1))
+        return reprojectRangeSet(*R, Dom);
+    // The statements before the last one have already been executed when the
+    // value of a statement expression is used. If the last expression only
+    // refers to variables that are declared by the statement expression,
+    // which cannot be modified after it, its value is the value of the last
+    // expression in State, e.g. for '({ bool r = trylock(&mu); r; })'.
+    if (const Expr *Last = getStmtExprLocalValue(SE, *ASTCtx))
+      if (auto R = evaluatePureExprRange(Last, State, EC, Depth + 1))
         return reprojectRangeSet(*R, Dom);
     if (EC.EscapedVars)
       return std::nullopt;
@@ -1378,6 +1522,20 @@ ThreadSafetyAnalyzer::evaluatePureCastRange(const CastExpr *CE,
   case CK_NullToPointer:
   case CK_NullToMemberPointer:
     return IntRangeSet::single(Dom, llvm::APSInt::get(0));
+  case CK_ArrayToPointerDecay:
+  case CK_FunctionToPointerDecay: {
+    // Like &*p, *p decays to the value of p.
+    const Expr *Sub = stripNoOpExprWrappers(CE->getSubExpr());
+    if (const auto *Deref = dyn_cast<UnaryOperator>(Sub);
+        Deref && Deref->getOpcode() == UO_Deref) {
+      auto SubR =
+          evaluatePureExprRange(Deref->getSubExpr(), State, EC, Depth + 1);
+      return SubR ? std::optional(reprojectRangeSet(*SubR, Dom)) : std::nullopt;
+    }
+    if (isKnownValidObjectOrFunctionLValue(Sub))
+      return validObjectPtrRangeSet(Dom);
+    return std::nullopt;
+  }
   default:
     break;
   }
@@ -1469,6 +1627,18 @@ ThreadSafetyAnalyzer::evaluatePureUnaryRange(const UnaryOperator *UO,
                                              const RangeEvalCtx &EC,
                                              unsigned Depth) {
   switch (UO->getOpcode()) {
+  case UO_AddrOf: {
+    const Expr *Sub = stripNoOpExprWrappers(UO->getSubExpr());
+    if (const auto *Deref = dyn_cast_or_null<UnaryOperator>(Sub);
+        Deref && Deref->getOpcode() == UO_Deref) {
+      auto SubR =
+          evaluatePureExprRange(Deref->getSubExpr(), State, EC, Depth + 1);
+      return SubR ? std::optional(reprojectRangeSet(*SubR, Dom)) : std::nullopt;
+    }
+    if (isKnownValidObjectOrFunctionLValue(Sub))
+      return validObjectPtrRangeSet(Dom);
+    return std::nullopt;
+  }
   case UO_Plus:
     return evaluatePureExprRange(UO->getSubExpr(), State, EC, Depth + 1);
   case UO_Minus: {
@@ -1511,7 +1681,7 @@ ThreadSafetyAnalyzer::evaluatePureBinaryRange(const BinaryOperator *BO,
           getSubtreeModifiedVars(BO->getLHS());
       if (exprReferencesAnyVar(BO->getRHS(), LHSMod)) {
         TrylockValueState RHSState = State;
-        eraseModifiedVarsFromState(RHSState, LHSMod);
+        eraseModifiedVarsFromState(RHSState, LHSMod, EC.PinnedExprs);
         return evaluatePureExprRange(BO->getRHS(), RHSState, EC, Depth + 1);
       }
     }
@@ -1533,6 +1703,9 @@ ThreadSafetyAnalyzer::evaluatePureBinaryRange(const BinaryOperator *BO,
   }
 
   if (BO->isLogicalOp()) {
+    if (auto It = State.ShortCircuitedOps.find(BO);
+        It != State.ShortCircuitedOps.end())
+      return IntRangeSet::single(Dom, llvm::APSInt::get(It->second ? 1 : 0));
     // Whether the value of Op may be false and whether it may be true.
     auto EvalBool = [&](const Expr *Op,
                         const TrylockValueState &S) -> std::pair<bool, bool> {
@@ -1553,7 +1726,7 @@ ThreadSafetyAnalyzer::evaluatePureBinaryRange(const BinaryOperator *BO,
     std::pair<bool, bool> LHSBool{true, true};
     if (LHSRefsRHSMod) {
       TrylockValueState LHSState = State;
-      eraseModifiedVarsFromState(LHSState, RHSMod);
+      eraseModifiedVarsFromState(LHSState, RHSMod, EC.PinnedExprs);
       LHSBool = EvalBool(BO->getLHS(), LHSState);
     } else {
       LHSBool = EvalBool(BO->getLHS(), State);
@@ -1565,7 +1738,7 @@ ThreadSafetyAnalyzer::evaluatePureBinaryRange(const BinaryOperator *BO,
     if (RHSRefsLHSMod || (Depth < 8 && EC.EscapedVars && !LHSRefsRHSMod)) {
       TrylockValueState RHSState = State;
       if (RHSRefsLHSMod)
-        eraseModifiedVarsFromState(RHSState, LHSMod);
+        eraseModifiedVarsFromState(RHSState, LHSMod, EC.PinnedExprs);
       if (Depth < 8 && EC.EscapedVars && !LHSRefsRHSMod) {
         constrainLeafCondition(RHSState, BO->getLHS(), /*WantTrue=*/IsAnd, EC,
                                Depth + 1);
@@ -1626,6 +1799,13 @@ ThreadSafetyAnalyzer::evaluatePureBinaryRange(const BinaryOperator *BO,
       if (auto ResV =
               foldIntBinOp(BO->getOpcode(), LV, RV, BO->getType(), *ASTCtx))
         return IntRangeSet::single(Dom, *ResV);
+    if (L && R && (BO->getOpcode() == BO_And || BO->getOpcode() == BO_Or) &&
+        EC.EscapedVars) {
+      if (const ValueDecl *LVD =
+              extractTrackableVarExpr(BO->getLHS(), *EC.EscapedVars))
+        if (LVD == extractTrackableVarExpr(BO->getRHS(), *EC.EscapedVars))
+          return reprojectRangeSet(L->intersect(*R), Dom);
+    }
     if (L && R && (BO->getOpcode() == BO_Add || BO->getOpcode() == BO_Sub)) {
       bool Sub = BO->getOpcode() == BO_Sub;
       if (R->isSingleValue(RV))
@@ -1655,7 +1835,7 @@ ThreadSafetyAnalyzer::evaluatePureConditionalRange(
     std::optional<IntRangeSet> CR;
     if (CommonRefsFalseMod) {
       TrylockValueState CommonState = State;
-      eraseModifiedVarsFromState(CommonState, FalseMod);
+      eraseModifiedVarsFromState(CommonState, FalseMod, EC.PinnedExprs);
       CR = evaluatePureExprRange(Common, CommonState, EC, Depth + 1);
     } else {
       CR = evaluatePureExprRange(Common, State, EC, Depth + 1);
@@ -1712,8 +1892,8 @@ ThreadSafetyAnalyzer::evaluatePureConditionalRange(
   std::optional<IntRangeSet> CR;
   if (CondRefsTrueMod || CondRefsFalseMod) {
     TrylockValueState CondState = State;
-    eraseModifiedVarsFromState(CondState, TrueMod);
-    eraseModifiedVarsFromState(CondState, FalseMod);
+    eraseModifiedVarsFromState(CondState, TrueMod, EC.PinnedExprs);
+    eraseModifiedVarsFromState(CondState, FalseMod, EC.PinnedExprs);
     CR = evaluatePureExprRange(COP->getCond(), CondState, EC, Depth + 1);
   } else {
     CR = evaluatePureExprRange(COP->getCond(), State, EC, Depth + 1);
@@ -1771,6 +1951,36 @@ bool threadSafety::stmtContainsExpr(const Stmt *Root, const Expr *Target) {
   return false;
 }
 
+/// Record in \p State that the trylock result \p Def is no longer stored in
+/// any variable.
+void threadSafety::addOverwrittenTrylockDef(
+    ThreadSafetyAnalyzer::TrylockValueState &State,
+    ThreadSafetyAnalyzer::OverwrittenTrylockDef Def, bool CheckUnmaterialized) {
+  if (CheckUnmaterialized)
+    for (const auto &[VD, DefPair] : State.UnmaterializedVarDefs)
+      if (stmtContainsExpr(DefPair.first, Def.DefE))
+        return;
+  for (auto &Existing : State.OverwrittenTrylockDefs) {
+    if (Existing.DefE != Def.DefE)
+      continue;
+    if (!Existing.Allowed || !Def.Allowed || Existing.Ty != Def.Ty)
+      Existing.Allowed = std::nullopt;
+    else
+      Existing.Allowed = Existing.Allowed->unionWith(*Def.Allowed);
+    return;
+  }
+  State.OverwrittenTrylockDefs.push_back(std::move(Def));
+}
+
+/// Return the trylock definition stored in \p VD as an OverwrittenTrylockDef.
+/// \p Allowed is the set of values that \p VD may have.
+ThreadSafetyAnalyzer::OverwrittenTrylockDef
+threadSafety::makeOverwrittenTrylockDef(
+    const ValueDecl *VD, const std::pair<const Expr *, LocalVarContext> &Def,
+    std::optional<ThreadSafetyAnalyzer::IntRangeSet> Allowed) {
+  return {Def.first, Def.second, VD->getType(), std::move(Allowed)};
+}
+
 void threadSafety::unionIntoValueState(
     ThreadSafetyAnalyzer::TrylockValueState &Dst,
     const ThreadSafetyAnalyzer::TrylockValueState &Src, const ASTContext &Ctx) {
@@ -1781,6 +1991,56 @@ void threadSafety::unionIntoValueState(
     return;
   }
 
+  // A variable that holds different trylock results on the two paths, or a
+  // trylock result on one path only, no longer holds a trylock result after
+  // the join. Remember these results such that the capabilities that the
+  // calls may have acquired are not forgotten.
+  {
+    using OverwrittenDef = ThreadSafetyAnalyzer::OverwrittenTrylockDef;
+    SmallVector<std::pair<const ValueDecl *, OverwrittenDef>, 2> Lost;
+    auto RangeOf = [](const ThreadSafetyAnalyzer::TrylockValueState &S,
+                      const ValueDecl *VD)
+        -> std::optional<ThreadSafetyAnalyzer::IntRangeSet> {
+      if (auto It = S.VarRanges.find(VD); It != S.VarRanges.end())
+        return It->second;
+      return std::nullopt;
+    };
+    SmallVector<const ValueDecl *, 2> DefsToErase;
+    for (const auto &[VD, DefPair] : Dst.UnmaterializedVarDefs) {
+      auto It = Src.UnmaterializedVarDefs.find(VD);
+      if (It == Src.UnmaterializedVarDefs.end() ||
+          It->second.first != DefPair.first) {
+        Lost.emplace_back(
+            VD, makeOverwrittenTrylockDef(VD, DefPair, RangeOf(Dst, VD)));
+        DefsToErase.push_back(VD);
+      }
+    }
+    for (const auto &[VD, DefPair] : Src.UnmaterializedVarDefs) {
+      auto It = Dst.UnmaterializedVarDefs.find(VD);
+      if (It == Dst.UnmaterializedVarDefs.end() ||
+          It->second.first != DefPair.first)
+        Lost.emplace_back(
+            VD, makeOverwrittenTrylockDef(VD, DefPair, RangeOf(Src, VD)));
+    }
+    // Sort the lost results by the source location of the variable that held
+    // them, and keep the result of Dst before that of Src for the same
+    // variable, such that the order in which these are remembered, and hence
+    // the order of diagnostics, does not depend on the iteration order of a
+    // map with pointer keys.
+    llvm::stable_sort(Lost, [](const auto &A, const auto &B) {
+      return A.first->getLocation().getRawEncoding() <
+             B.first->getLocation().getRawEncoding();
+    });
+    // Erase the definitions first such that addOverwrittenTrylockDef() only
+    // skips results that are still stored in a variable on both paths.
+    for (const ValueDecl *VD : DefsToErase)
+      Dst.UnmaterializedVarDefs.erase(VD);
+    for (auto &Entry : Lost)
+      addOverwrittenTrylockDef(Dst, std::move(Entry.second),
+                               /*CheckUnmaterialized=*/true);
+    for (const OverwrittenDef &Def : Src.OverwrittenTrylockDefs)
+      addOverwrittenTrylockDef(Dst, Def, /*CheckUnmaterialized=*/false);
+  }
   // A missing entry means that nothing is known about a value. Drop entries
   // that cover the whole domain of their type such that the state does not
   // keep growing with every branch condition, which would make the analysis
@@ -1795,19 +2055,51 @@ void threadSafety::unionIntoValueState(
            llvm::APSInt::compareValues(Hi, Dom->Hi) >= 0;
   };
 
-  SmallVector<const ValueDecl *, 4> ToErase;
-  for (auto &[Key, R] : Dst.VarRanges) {
-    if (auto It = Src.VarRanges.find(Key); It != Src.VarRanges.end()) {
-      R = R.unionWith(It->second);
-      R.widen(MaxStateRangeIntervals);
-      if (CoversDomain(R, Key->getType()))
+  // Join the ranges of the variables or expressions in DstMap and SrcMap.
+  auto JoinRanges = [&](auto &DstMap, const auto &SrcMap) {
+    using KeyT = typename std::remove_reference_t<decltype(DstMap)>::key_type;
+    SmallVector<KeyT, 4> ToErase;
+    for (auto &[Key, R] : DstMap) {
+      if (auto It = SrcMap.find(Key); It != SrcMap.end()) {
+        R = R.unionWith(It->second);
+        R.widen(MaxStateRangeIntervals);
+        if (CoversDomain(R, Key->getType()))
+          ToErase.push_back(Key);
+      } else {
         ToErase.push_back(Key);
-    } else {
-      ToErase.push_back(Key);
+      }
     }
+    for (auto Key : ToErase)
+      DstMap.erase(Key);
+  };
+  JoinRanges(Dst.VarRanges, Src.VarRanges);
+  JoinRanges(Dst.ExprRanges, Src.ExprRanges);
+
+  SmallVector<const BinaryOperator *, 2> OpsToErase;
+  for (const auto &[BO, Val] : Dst.ShortCircuitedOps) {
+    auto It = Src.ShortCircuitedOps.find(BO);
+    if (It == Src.ShortCircuitedOps.end() || It->second != Val)
+      OpsToErase.push_back(BO);
   }
-  for (const ValueDecl *Key : ToErase)
-    Dst.VarRanges.erase(Key);
+  for (const BinaryOperator *BO : OpsToErase)
+    Dst.ShortCircuitedOps.erase(BO);
+
+  llvm::set_union(Dst.ConsumedTrylockAttrs, Src.ConsumedTrylockAttrs);
+  // A trylock capability is only held in the joined lockset if it was
+  // acquired on both paths. Keep consumed entries so a capability that was
+  // acquired and released on one path is not re-materialized after the join.
+  SmallVector<ThreadSafetyAnalyzer::AcquiredTrylockKey, 2> AcquiredToErase;
+  for (const auto &K : Dst.AcquiredTrylockAttrs)
+    if (!Src.AcquiredTrylockAttrs.contains(K) &&
+        !Dst.ConsumedTrylockAttrs.contains(K))
+      AcquiredToErase.push_back(K);
+  for (const auto &K : AcquiredToErase)
+    Dst.AcquiredTrylockAttrs.erase(K);
+  for (const auto &K : Src.AcquiredTrylockAttrs)
+    if (Dst.ConsumedTrylockAttrs.contains(K))
+      Dst.AcquiredTrylockAttrs.insert(K);
+  Dst.DiscardedTrylockCalls.insert(Src.DiscardedTrylockCalls.begin(),
+                                   Src.DiscardedTrylockCalls.end());
 }
 
 /// If \p CallExp calls a trivial inline helper that returns its only argument
@@ -2133,9 +2425,12 @@ ThreadSafetyAnalyzer::evaluateInlineCallRangeCond(
       LocalVarContext ArgCtx = C;
       const Expr *ArgE = skipValuePreservingWrappers(
           InlineCall->getArg(I), &ArgCtx, /*IgnoreSideEffects=*/false);
-      if (auto ArgR =
-              ArgE ? evaluatePureExprRange(ArgE, EmptyState, RangeEvalCtx{})
-                   : std::nullopt)
+      const auto *BodyEscapedVars =
+          CurrentVerifier ? &CurrentVerifier->escapedVars() : nullptr;
+      if (auto ArgR = ArgE
+                          ? evaluatePureExprRange(ArgE, EmptyState,
+                                                  RangeEvalCtx{BodyEscapedVars})
+                          : std::nullopt)
         BaseCalleeState.VarRanges[PVD] = reprojectRangeSet(*ArgR, *PDom);
     }
   }
@@ -2301,6 +2596,7 @@ void ThreadSafetyAnalyzer::constrainLeafCondition(TrylockValueState &State,
         }
       }
     }
+    State.ExprRanges[Cond] = std::move(Allowed);
   }
 
   if (const auto *CE = dyn_cast<CastExpr>(Cond))
@@ -2458,6 +2754,8 @@ void ThreadSafetyAnalyzer::constrainStmtExprCondition(const StmtExpr *SE,
                                                       unsigned Depth) {
   if (const Expr *Inner = getCachedPureStmtExpr(SE))
     constrainLeafCondition(State, Inner, WantTrue, EC, Depth + 1);
+  else if (const Expr *Last = getStmtExprLocalValue(SE, *ASTCtx))
+    constrainLeafCondition(State, Last, WantTrue, EC, Depth + 1);
 }
 
 void ThreadSafetyAnalyzer::constrainBinaryCondition(const BinaryOperator *BO,
