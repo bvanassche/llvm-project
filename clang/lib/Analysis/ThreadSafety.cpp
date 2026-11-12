@@ -41,6 +41,7 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/Specifiers.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/ImmutableMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -50,7 +51,6 @@
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/TrailingObjects.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
@@ -203,10 +203,6 @@ void threadSafety::collectModifiedLValueDREs(
   }
 }
 
-/// If \p E takes the address of an lvalue, possibly through no-op and
-/// pointer casts, the right operand of a comma or the arms of a conditional
-/// operator, add the variables that the lvalue may designate to \p DREs.
-/// Return whether \p E takes the address of an lvalue.
 bool threadSafety::collectAddrOfDREs(const Expr *E,
                                      SmallVectorImpl<const DeclRefExpr *> &DREs,
                                      unsigned Depth) {
@@ -258,13 +254,38 @@ bool threadSafety::collectAddrOfDREs(const Expr *E,
   return true;
 }
 
-const DeclRefExpr *threadSafety::unwrapDirectModifiedDRE(const Stmt *S) {
-  if (const auto *BO = dyn_cast_or_null<BinaryOperator>(S);
-      BO && BO->isAssignmentOp())
-    return unwrapDirectLValueDRE(BO->getLHS());
-  if (const auto *UO = dyn_cast_or_null<UnaryOperator>(S);
-      UO && UO->isIncrementDecrementOp())
-    return unwrapDirectLValueDRE(UO->getSubExpr());
+const DeclRefExpr *threadSafety::unwrapUnconditionalLValueDRE(const Expr *E,
+                                                              unsigned Depth) {
+  if (!E || Depth > 32)
+    return nullptr;
+  E = IgnoreExprNodes(E, IgnoreParensOnlySingleStep, ignoreNoOpCastSingleStep);
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
+    return DRE;
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->getOpcode() == BO_Comma)
+      return unwrapUnconditionalLValueDRE(BO->getRHS(), Depth + 1);
+    if (BO->isAssignmentOp())
+      return unwrapUnconditionalLValueDRE(BO->getLHS(), Depth + 1);
+    return nullptr;
+  }
+  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+    if (UO->isPrefix() && UO->isIncrementDecrementOp())
+      return unwrapUnconditionalLValueDRE(UO->getSubExpr(), Depth + 1);
+    return nullptr;
+  }
+  if (const auto *CO = dyn_cast<AbstractConditionalOperator>(E)) {
+    const DeclRefExpr *TDRE =
+        unwrapUnconditionalLValueDRE(CO->getTrueExpr(), Depth + 1);
+    const DeclRefExpr *FDRE =
+        unwrapUnconditionalLValueDRE(CO->getFalseExpr(), Depth + 1);
+    if (TDRE && FDRE &&
+        TDRE->getDecl()->getCanonicalDecl() ==
+            FDRE->getDecl()->getCanonicalDecl())
+      return TDRE;
+    return nullptr;
+  }
+  if (const auto *OVE = dyn_cast<OpaqueValueExpr>(E))
+    return unwrapUnconditionalLValueDRE(OVE->getSourceExpr(), Depth + 1);
   return nullptr;
 }
 
@@ -458,107 +479,6 @@ void VarMapBuilder::VisitAsmStmt(const AsmStmt *AS) {
     Modified |= clearModifiedLocalVars(AS->getOutputExpr(I));
   if (Modified)
     VMap->saveContext(AS, Ctx);
-}
-
-static void visitDeclTypeVLAExprs(QualType QT, bool IncludeTopLevelVLA,
-                                  llvm::function_ref<void(const Expr *)> Fn) {
-  while (!QT.isNull() && QT->isVariablyModifiedType()) {
-    const Type *T = QT.getTypePtr();
-    if (isa<TypedefType>(T))
-      return;
-    if (const auto *AT = dyn_cast<ArrayType>(T)) {
-      if (IncludeTopLevelVLA)
-        if (const auto *VAT = dyn_cast<VariableArrayType>(AT))
-          if (const Expr *Sz = VAT->getSizeExpr())
-            Fn(Sz);
-      QT = AT->getElementType();
-      continue;
-    }
-    IncludeTopLevelVLA = true;
-    if (const auto *PT = dyn_cast<ParenType>(T)) {
-      QT = PT->getInnerType();
-      continue;
-    }
-    if (const auto *AT = dyn_cast<AttributedType>(T)) {
-      QT = AT->getModifiedType();
-      continue;
-    }
-    if (const auto *MQT = dyn_cast<MacroQualifiedType>(T)) {
-      QT = MQT->getUnderlyingType();
-      continue;
-    }
-    if (const auto *AdjT = dyn_cast<AdjustedType>(T)) {
-      QT = AdjT->getOriginalType();
-      continue;
-    }
-    if (const auto *PtrT = dyn_cast<PointerType>(T)) {
-      QT = PtrT->getPointeeType();
-      continue;
-    }
-    if (const auto *RefT = dyn_cast<ReferenceType>(T)) {
-      QT = RefT->getPointeeType();
-      continue;
-    }
-    if (const auto *BPtrT = dyn_cast<BlockPointerType>(T)) {
-      QT = BPtrT->getPointeeType();
-      continue;
-    }
-    if (const auto *MPtrT = dyn_cast<MemberPointerType>(T)) {
-      QT = MPtrT->getPointeeType();
-      continue;
-    }
-    if (const auto *AtomT = dyn_cast<AtomicType>(T)) {
-      QT = AtomT->getValueType();
-      continue;
-    }
-    if (const auto *FPT = dyn_cast<FunctionProtoType>(T)) {
-      visitDeclTypeVLAExprs(FPT->getReturnType(), /*IncludeTopLevelVLA=*/true,
-                            Fn);
-      for (QualType ParamTy : FPT->getParamTypes())
-        visitDeclTypeVLAExprs(ParamTy, /*IncludeTopLevelVLA=*/true, Fn);
-      return;
-    }
-    if (const auto *FT = dyn_cast<FunctionType>(T)) {
-      QT = FT->getReturnType();
-      continue;
-    }
-    if (const auto *TOET = dyn_cast<TypeOfExprType>(T)) {
-      if (const Expr *E = TOET->getUnderlyingExpr()) {
-        Fn(E);
-        visitDeclTypeVLAExprs(E->getType(), /*IncludeTopLevelVLA=*/true, Fn);
-      }
-      return;
-    }
-    if (const auto *TOT = dyn_cast<TypeOfType>(T)) {
-      QT = TOT->getUnmodifiedType();
-      continue;
-    }
-    break;
-  }
-}
-
-/// Call \p Fn for the size expressions of the variable length array types
-/// in the declarations of \p DS. If \p IncludeTopLevelVLA is false, skip the
-/// size expression of the outermost array type of a declared variable or
-/// typedef.
-void threadSafety::forEachDeclVLAExpr(
-    const DeclStmt *DS, bool IncludeTopLevelVLA,
-    llvm::function_ref<void(const Expr *)> Fn) {
-  if (!DS)
-    return;
-  for (const Decl *D : DS->decls()) {
-    if (const auto *VD = dyn_cast<VarDecl>(D))
-      visitDeclTypeVLAExprs(VD->getType(), IncludeTopLevelVLA, Fn);
-    else if (const auto *TND = dyn_cast<TypedefNameDecl>(D))
-      visitDeclTypeVLAExprs(TND->getUnderlyingType(), IncludeTopLevelVLA, Fn);
-  }
-}
-
-/// Call \p Fn for the size expressions of the variable length array types
-/// in the type \p QT.
-void threadSafety::forEachTypeVLAExpr(
-    QualType QT, llvm::function_ref<void(const Expr *)> Fn) {
-  visitDeclTypeVLAExprs(QT, /*IncludeTopLevelVLA=*/true, Fn);
 }
 
 // The CFG does not contain the size expressions of variable length array
@@ -1088,8 +1008,8 @@ void ThreadSafetyAnalyzer::addLock(FactSet &FSet, const FactEntry *Entry,
 
   // Check before/after constraints
   if (!Entry->asserted() && !Entry->declared()) {
-    GlobalBeforeSet->checkBeforeAfter(Entry->valueDecl(), FSet, *this,
-                                      Entry->loc(), Entry->getKind());
+    GlobalCache->BSet.checkBeforeAfter(Entry->valueDecl(), FSet, *this,
+                                       Entry->loc(), Entry->getKind());
   }
 
   if (const FactEntry *Cp = FSet.findLock(FactMan, *Entry)) {
@@ -1138,7 +1058,7 @@ void ThreadSafetyAnalyzer::getMutexIDs(CapExprSet &Mtxs, AttrType *Attr,
     // A constructor of a scoped_lockable class does not acquire the object
     // that it constructs.
     if (const auto *CD = dyn_cast_or_null<CXXConstructorDecl>(D))
-      if (CD->getParent()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>())
+      if (isScopedLockable(CD->getParent()))
         return;
     // The mutex held is the "this" object.
     CapabilityExpr Cp = SxBuilder.translateAttrExpr(nullptr, D, Exp, Self);
@@ -1272,9 +1192,9 @@ bool threadSafety::isTrylockAttr(const Attr *A) {
   return isa<TryAcquireCapabilityAttr, TryAcquireCapabilityRangeAttr>(A);
 }
 
-/// The trylock attributes of \p D in declaration order.
-static auto trylockAttrs(const Decl *D) {
-  return llvm::make_filter_range(D->attrs(), isTrylockAttr);
+bool threadSafety::hasTrylockAttr(const Decl *D) {
+  return D->hasAttr<TryAcquireCapabilityAttr>() ||
+         D->hasAttr<TryAcquireCapabilityRangeAttr>();
 }
 
 /// Call \p F with trylock attribute \p A cast to its attribute class.
@@ -2102,7 +2022,7 @@ void BuildLockset::handleCall(const Expr *Exp, const NamedDecl *D,
       assert(inserted.second && "Are we visiting the same expression again?");
       if (isa<CXXConstructExpr>(Exp))
         Self = Placeholder;
-      if (TagT->getDecl()->getMostRecentDecl()->hasAttr<ScopedLockableAttr>())
+      if (isScopedLockable(TagT->getDecl()))
         Scp = CapabilityExpr(Placeholder, Exp->getType(), /*Neg=*/false);
     }
 
@@ -2717,6 +2637,105 @@ bool threadSafety::neverReturns(const CFGBlock *B) {
   return false;
 }
 
+static void visitDeclTypeVLAExprs(QualType QT, bool IncludeTopLevelVLA,
+                                  llvm::function_ref<void(const Expr *)> Fn) {
+  while (!QT.isNull() && QT->isVariablyModifiedType()) {
+    const Type *T = QT.getTypePtr();
+    if (isa<TypedefType>(T))
+      return;
+    if (const auto *AT = dyn_cast<ArrayType>(T)) {
+      if (IncludeTopLevelVLA)
+        if (const auto *VAT = dyn_cast<VariableArrayType>(AT))
+          if (const Expr *Sz = VAT->getSizeExpr())
+            Fn(Sz);
+      QT = AT->getElementType();
+      continue;
+    }
+    IncludeTopLevelVLA = true;
+    if (const auto *PT = dyn_cast<ParenType>(T)) {
+      QT = PT->getInnerType();
+      continue;
+    }
+    if (const auto *AT = dyn_cast<AttributedType>(T)) {
+      QT = AT->getModifiedType();
+      continue;
+    }
+    if (const auto *MQT = dyn_cast<MacroQualifiedType>(T)) {
+      QT = MQT->getUnderlyingType();
+      continue;
+    }
+    if (const auto *AdjT = dyn_cast<AdjustedType>(T)) {
+      QT = AdjT->getOriginalType();
+      continue;
+    }
+    if (const auto *PtrT = dyn_cast<PointerType>(T)) {
+      QT = PtrT->getPointeeType();
+      continue;
+    }
+    if (const auto *RefT = dyn_cast<ReferenceType>(T)) {
+      QT = RefT->getPointeeType();
+      continue;
+    }
+    if (const auto *BPtrT = dyn_cast<BlockPointerType>(T)) {
+      QT = BPtrT->getPointeeType();
+      continue;
+    }
+    if (const auto *MPtrT = dyn_cast<MemberPointerType>(T)) {
+      QT = MPtrT->getPointeeType();
+      continue;
+    }
+    if (const auto *AtomT = dyn_cast<AtomicType>(T)) {
+      QT = AtomT->getValueType();
+      continue;
+    }
+    if (const auto *FPT = dyn_cast<FunctionProtoType>(T)) {
+      visitDeclTypeVLAExprs(FPT->getReturnType(), /*IncludeTopLevelVLA=*/true,
+                            Fn);
+      for (QualType ParamTy : FPT->getParamTypes())
+        visitDeclTypeVLAExprs(ParamTy, /*IncludeTopLevelVLA=*/true, Fn);
+      return;
+    }
+    if (const auto *FT = dyn_cast<FunctionType>(T)) {
+      QT = FT->getReturnType();
+      continue;
+    }
+    if (const auto *TOET = dyn_cast<TypeOfExprType>(T)) {
+      if (const Expr *E = TOET->getUnderlyingExpr()) {
+        Fn(E);
+        visitDeclTypeVLAExprs(E->getType(), /*IncludeTopLevelVLA=*/true, Fn);
+      }
+      return;
+    }
+    if (const auto *TOT = dyn_cast<TypeOfType>(T)) {
+      QT = TOT->getUnmodifiedType();
+      continue;
+    }
+    break;
+  }
+}
+
+/// Call \p Fn for the size expressions of the variable length array types
+/// in the declarations of \p DS. If \p IncludeTopLevelVLA is false, skip the
+/// size expression of the outermost array type of a declared variable or
+/// typedef.
+void threadSafety::forEachDeclVLAExpr(
+    const DeclStmt *DS, bool IncludeTopLevelVLA,
+    llvm::function_ref<void(const Expr *)> Fn) {
+  if (!DS)
+    return;
+  for (const Decl *D : DS->decls()) {
+    if (const auto *VD = dyn_cast<VarDecl>(D))
+      visitDeclTypeVLAExprs(VD->getType(), IncludeTopLevelVLA, Fn);
+    else if (const auto *TND = dyn_cast<TypedefNameDecl>(D))
+      visitDeclTypeVLAExprs(TND->getUnderlyingType(), IncludeTopLevelVLA, Fn);
+  }
+}
+
+void threadSafety::forEachTypeVLAExpr(
+    QualType QT, llvm::function_ref<void(const Expr *)> Fn) {
+  visitDeclTypeVLAExprs(QT, /*IncludeTopLevelVLA=*/true, Fn);
+}
+
 /// Collect the subtrees of unevaluated expressions of \p CFGraph in
 /// UnevaluatedStmts and set HasTrylockCall.
 void ThreadSafetyAnalyzer::collectUnevaluatedStmts(CFG *CFGraph) {
@@ -2792,8 +2811,8 @@ void ThreadSafetyAnalyzer::collectUnevaluatedStmts(CFG *CFGraph) {
 /// Record the local variables that may be modified through an alias in
 /// LocalVarMap.
 void ThreadSafetyAnalyzer::markEscapedLocalVars(AnalysisDeclContext &AC) {
-  llvm::SmallPtrSet<const ValueDecl *, 16> EscapedVars;
-  llvm::SmallPtrSet<const ValueDecl *, 16> ModifiedVars;
+  llvm::SmallPtrSet<const ValueDecl *, 8> EscapedVars;
+  llvm::SmallPtrSet<const ValueDecl *, 8> ModifiedVars;
   scanTrylockVars(AC.getBody(), *ASTCtx, EscapedVars, ModifiedVars);
   for (const ValueDecl *VD : EscapedVars)
     LocalVarMap.addEscapedVar(VD);
@@ -3119,6 +3138,7 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 
   if (HasTrylockCall) {
     for (const CFGBlock *B : *SortedGraph) {
+      InlineExpansionCount = 0;
       TrylockRangeCondResult Cond;
       const SwitchCaseTable *Table;
       SmallVector<const CastExpr *, 2> SwitchCasts;
@@ -3134,6 +3154,11 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
     unsigned CurrBlockID = CurrBlock->getBlockID();
     CFGBlockInfo *CurrBlockInfo = &BlockInfo[CurrBlockID];
     PendingTrylockRanges EntryPending;
+
+    // Give each block its own inline expansion budget. A budget per function
+    // would run out in functions with many conditions and then silently stop
+    // recognizing the trylock checks in the remaining blocks.
+    InlineExpansionCount = 0;
 
     // Use the default initial lockset in case there are no predecessors.
     VisitedBlocks.insert(CurrBlock);
@@ -3333,14 +3358,16 @@ void ThreadSafetyAnalyzer::runAnalysis(AnalysisDeclContext &AC) {
 /// Each block in the CFG is traversed exactly once.
 void threadSafety::runThreadSafetyAnalysis(AnalysisDeclContext &AC,
                                            ThreadSafetyHandler &Handler,
-                                           BeforeSet **BSet) {
-  if (!*BSet)
-    *BSet = new BeforeSet;
-  ThreadSafetyAnalyzer Analyzer(Handler, *BSet);
+                                           ThreadSafetyCache **Cache) {
+  if (!*Cache)
+    *Cache = new ThreadSafetyCache;
+  ThreadSafetyAnalyzer Analyzer(Handler, *Cache);
   Analyzer.runAnalysis(AC);
 }
 
-void threadSafety::threadSafetyCleanup(BeforeSet *Cache) { delete Cache; }
+void threadSafety::threadSafetyCleanup(ThreadSafetyCache *Cache) {
+  delete Cache;
+}
 
 /// Helper function that returns a LockKind required for the given level
 /// of access.

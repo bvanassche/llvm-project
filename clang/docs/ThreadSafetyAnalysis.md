@@ -572,7 +572,8 @@ does not acquire the capability. When a
 return value is stored in a local variable before branching, the analysis only
 looks through ordinary local variables that are not `static`, `volatile`, or
 `__block`, and that do not escape (e.g. by having their address taken or being
-captured by reference).
+captured by reference). The conditions may also call small `inline` or
+`constexpr` helper functions, e.g. `if (is_null_or_err(p)) return;`.
 
 If the return type is not a non-boolean integer, unscoped enumeration, or
 pointer type, if the range does not contain any value of the return type, or if
@@ -869,8 +870,15 @@ determine what data is owned by the enclosing object.
 
 Thread safety analysis is strictly intra-procedural, just like ordinary type
 checking. It relies only on the declared attributes of a function, and will
-not attempt to inline any method calls. As a result, code such as the
-following will not work:
+not attempt to inline any method calls. The only exceptions are non-weak,
+non-variadic `inline` or `constexpr` non-member or `static` member functions
+without thread safety attributes whose parameters are passed by value, are
+not `volatile`, and are neither modified nor escaped by the body, and whose
+body has at most two statements with either a single `return` statement or a
+single-level `if` with two `return` statements; the analysis evaluates their
+return value in terms of their arguments when checking the result of a
+try-acquire function (and treats all other calls as opaque). As a result, code
+such as the following will not work:
 
 ```c++
 template<class T>

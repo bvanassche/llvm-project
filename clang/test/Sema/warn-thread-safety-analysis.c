@@ -828,6 +828,44 @@ void test_trylock_range_c(void) {
   }
 }
 
+// Trivial inline helpers (IS_ERR, PTR_ERR, PTR_ERR_OR_ZERO).
+void trace_branch_hit(int val);
+#define TEST_UNLIKELY_STMTEXPR(x)                                              \
+  ({                                                                           \
+    long __r = __builtin_expect(!!(x), 0);                                     \
+    trace_branch_hit((int)__r);                                                \
+    __r;                                                                       \
+  })
+
+static inline _Bool c_is_err_value(__UINTPTR_TYPE__ x) {
+  return TEST_UNLIKELY_STMTEXPR(x >= (__UINTPTR_TYPE__)-4095);
+}
+
+static inline _Bool c_is_err(const void *ptr) {
+  return c_is_err_value((__UINTPTR_TYPE__)(void *)((__UINTPTR_TYPE__)ptr));
+}
+
+static inline __INTPTR_TYPE__ c_ptr_err(const void *ptr) {
+  return (__INTPTR_TYPE__)ptr;
+}
+
+static inline int c_ptr_err_or_zero(const void *ptr) {
+  if (c_is_err(ptr))
+    return c_ptr_err(ptr);
+  else
+    return 0;
+}
+
+// Branch conditions that call inline helpers with arguments that are
+// unrelated to the tracked values must not use up the inline expansion
+// budget of the analyzed function (MaxInlineExpansions).
+static inline int c_unrelated_helper(int v) { return v + 1; }
+int c_unrelated_data;
+#define C_REP4(x) x x x x
+#define C_REP16(x) C_REP4(C_REP4(x))
+#define C_REP256(x) C_REP16(C_REP16(x))
+#define C_REP1024(x) C_REP4(C_REP256(x))
+
 // Pointer return types on try_acquire_[shared_]capability_range.
 #define TEST_IS_ERR_VALUE_MACRO(x)                                             \
   __builtin_expect(                                                            \
@@ -892,13 +930,122 @@ void test_ptr_range_callers_c(int ok, int mode) {
   }
 }
 
+// Inline helper expansion (IS_ERR, IS_ERR_OR_NULL, PTR_ERR, PTR_ERR_OR_ZERO,
+// ERR_CAST) in caller-side range trylock conditions.
+static inline _Bool c_is_err_or_null(const void *ptr) {
+  return TEST_UNLIKELY_STMTEXPR(!ptr) ||
+         c_is_err_value((__UINTPTR_TYPE__)ptr);
+}
+
+static inline void *c_err_cast(const void *ptr) {
+  return (void *)ptr;
+}
+
+static inline int c_is_err_int(const void *ptr) {
+  return (__UINTPTR_TYPE__)ptr >= (__UINTPTR_TYPE__)-4095;
+}
+
+static inline _Bool c_recursive_ptr_helper(const void *ptr) {
+  if (c_recursive_ptr_helper(ptr))
+    return 1;
+  return c_recursive_ptr_helper(ptr);
+}
+
+_Bool c_opaque_is_err(const void *ptr);
+
+void test_inline_helper_range_callers_c(int ok, int mode) {
+  // Direct call passed to IS_ERR() (matches Linux debug_populate()).
+  if (c_is_err(c_ptr_range_lock_live(ok)))
+    return;
+  work_data = 10;
+  mutex_unlock(&mu1);
+
+  // Local variable passed to IS_ERR() (matches Linux cgroup_masks_read()).
+  struct CGroupObj *cgrp = c_ptr_range_lock_live(ok);
+  if (!c_is_err(cgrp)) {
+    work_data = 11;
+    mutex_unlock(&mu1);
+  }
+
+  // Wrong branch of IS_ERR() must warn.
+  struct CGroupObj *cgrp_bad = c_ptr_range_lock_live(ok);
+  if (c_is_err(cgrp_bad)) {
+    work_data = 12; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  } else {
+    mutex_unlock(&mu1);
+  }
+
+  // IS_ERR_OR_NULL() on [1, -4096].
+  struct CGroupObj *sc = c_ptr_range_shared_nonnull(mode);
+  if (!c_is_err_or_null(sc)) {
+    int v = work_data;
+    (void)v;
+    mutex_unlock(&mu1);
+  }
+
+  // IS_ERR() alone is insufficient when NULL (0) is outside [1, -4096].
+  struct CGroupObj *sc_bad = c_ptr_range_shared_nonnull(mode);
+  if (!c_is_err(sc_bad)) {
+    int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
+    (void)v;
+  }
+
+  // ERR_CAST() identity wrapper in both direct and local-variable forms.
+  if (!c_is_err(c_err_cast(c_ptr_range_lock_live(ok)))) {
+    work_data = 13;
+    mutex_unlock(&mu1);
+  }
+  void *ec = c_err_cast(c_ptr_range_lock_live(ok));
+  if (!c_is_err(ec)) {
+    work_data = 14;
+    mutex_unlock(&mu1);
+  }
+
+  // PTR_ERR_OR_ZERO() in boolean and comparison contexts, including SSA
+  // tracking when the pointer variable is reassigned before the branch.
+  if (!c_ptr_err_or_zero(c_ptr_range_lock_live(ok))) {
+    work_data = 15;
+    mutex_unlock(&mu1);
+  }
+  struct CGroupObj *reassigned = c_ptr_range_lock_live(ok);
+  int err = c_ptr_err_or_zero(reassigned);
+  reassigned = 0;
+  if (err == 0) {
+    work_data = 16;
+    mutex_unlock(&mu1);
+  }
+  if (c_ptr_err_or_zero(c_ptr_range_lock_live(ok)) >= 0) {
+    work_data = 17;
+    mutex_unlock(&mu1);
+  }
+
+  // PTR_ERR() signed intptr_t comparison and int-returning predicate == 0.
+  __INTPTR_TYPE__ pe = c_ptr_err(c_ptr_range_lock_live(ok));
+  if (!(pe >= -4095 && pe < 0)) {
+    work_data = 18;
+    mutex_unlock(&mu1);
+  }
+  if (c_is_err_int(c_ptr_range_lock_live(ok)) == 0) {
+    work_data = 19;
+    mutex_unlock(&mu1);
+  }
+
+  // Opaque and recursive helpers must not falsely acquire the capability.
+  if (!c_opaque_is_err(c_ptr_range_lock_live(ok))) {
+    work_data = 20; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+  if (!c_recursive_ptr_helper(c_ptr_range_lock_live(ok))) {
+    work_data = 21; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+}
+
 // A null check followed by a separate IS_ERR() check decides the result of a
 // call that returns NULL or an error pointer on failure.
 void test_split_null_and_err_checks_c(int mode) {
   struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
   if (!p)
     return;
-  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+  if (c_is_err(p))
     return;
   int v = work_data;
   (void)v;
@@ -907,7 +1054,7 @@ void test_split_null_and_err_checks_c(int mode) {
 
 void test_split_err_and_null_checks_c(int mode) {
   struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
-  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+  if (c_is_err(p))
     return;
   if (!p)
     return;
@@ -931,7 +1078,7 @@ void test_split_checks_in_loop_c(int mode, int n) {
     struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
     if (!p)
       continue;
-    if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+    if (c_is_err(p))
       continue;
     int v = work_data;
     (void)v;
@@ -948,7 +1095,7 @@ void test_split_checks_irreducible_bypass_c(int mode, int check_null) {
       return;
   }
 Y:
-  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+  if (c_is_err(p)) {
 Z:
     if (mode)
       goto Y;
@@ -963,9 +1110,9 @@ void test_split_checks_diamond_rebranch_c(int mode) {
   struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
   if (!p)
     return;
-  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+  if (!c_is_err(p))
     do_some_work();
-  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+  if (!c_is_err(p)) {
     int v = work_data;
     (void)v;
     mutex_unlock(&mu1);
@@ -976,9 +1123,9 @@ void test_split_checks_unlock_then_rebranch_bad_c(int mode) {
   struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
   if (!p)
     return;
-  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+  if (!c_is_err(p))
     mutex_unlock(&mu1);
-  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+  if (!c_is_err(p))
     mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
 }
 
@@ -1044,7 +1191,7 @@ void test_split_checks_contradictory_rebranch_c(int mode) {
     int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
     (void)v;
   }
-  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+  if (!c_is_err(p)) {
     int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
     (void)v;
   }
@@ -1054,7 +1201,7 @@ void test_split_checks_unrelated_lhs_and_trylock_rhs_c(int ok, int mode) {
   struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
   if (!p)
     return;
-  if (ok && TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+  if (ok && c_is_err(p))
     return;
   int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
   (void)v;
@@ -1087,7 +1234,7 @@ void test_short_circuit_or_unrelated_operand_c(int ok, int mode) {
 void test_split_checks_short_circuit_or_c(int cond, int mode) {
   struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
   if (cond || p) {
-    if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+    if (!c_is_err(p)) {
       int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
       (void)v;
     }
@@ -1100,7 +1247,7 @@ void test_split_checks_else_join_c(int cond, int mode) {
     if (cond)
       return;
   }
-  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p))
+  if (c_is_err(p))
     return;
   int v = work_data; // expected-warning{{reading variable 'work_data' requires holding mutex 'mu1'}}
   (void)v;
@@ -1120,7 +1267,7 @@ void test_split_checks_partial_acquire_join_c(int cond, int mode) {
   if (cond) {
     mutex_unlock(&mu1);
   }
-  if (TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) { // expected-warning{{mutex 'mu1' is not held on every path through here}}
+  if (c_is_err(p)) { // expected-warning{{mutex 'mu1' is not held on every path through here}}
     return;
   }
   work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
@@ -1134,7 +1281,7 @@ void test_split_checks_consumed_in_loop_c(int n, int mode) {
   if (!p)
     return;
   for (int i = 0; i < n; ++i) {
-    if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+    if (!c_is_err(p)) {
       mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
     }
   }
@@ -1145,12 +1292,12 @@ void test_three_preds_partial_entry_pending_c(int mode, int bypass_null_check) {
   if (!bypass_null_check) {
     if (!p)
       return;
-    if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) {
+    if (!c_is_err(p)) {
       int v = work_data;
       (void)v;
     }
   }
-  if (!TEST_IS_ERR_VALUE_MACRO((__UINTPTR_TYPE__)p)) { // expected-warning{{mutex 'mu1' is not held on every path through here}}
+  if (!c_is_err(p)) { // expected-warning{{mutex 'mu1' is not held on every path through here}}
   }
 }
 
@@ -1464,6 +1611,73 @@ void test_many_sequential_trylocks_c(void) {
 #undef TRYLOCK_STEP
 }
 
+// Multi-parameter inline helper partitioning splits disconnected failure
+// intervals ({0} and [MAX-4094, MAX]).
+static inline int c_both_null(const void *a, const void *b) {
+  return !a && !b;
+}
+void test_multi_param_inline_disconnected_failure_c(int mode) {
+  struct CGroupObj *p = c_ptr_range_shared_nonnull(mode);
+  if (c_both_null(p, p))
+    return;
+  if (c_is_err(p))
+    return;
+  int v = work_data;
+  (void)v;
+  mutex_unlock(&mu1);
+}
+
+// Conditions that call helpers that are unrelated to range trylocks must not
+// use up the inline expansion budget of the analyzed function.
+void test_inline_budget_unrelated_calls_c(int ok) {
+  C_REP1024(if (c_unrelated_helper(c_unrelated_data)) c_unrelated_data = 0;)
+  C_REP1024(if (c_unrelated_helper(c_unrelated_data) == 0) c_unrelated_data = 1;)
+  struct CGroupObj *cgrp = c_ptr_range_lock_live(ok);
+  if (c_is_err(cgrp))
+    return;
+  work_data = 30;
+  mutex_unlock(&mu1);
+}
+
+// Multiple arguments of one helper that are derived from range trylocks.
+static inline _Bool c_both_err(const void *a, const void *b) {
+  return c_is_err(a) && c_is_err(b);
+}
+
+static inline _Bool c_err_and_not_err(const void *a, const void *b) {
+  return c_is_err(a) && !c_is_err(b);
+}
+
+static inline _Bool c_both_err_mixed(const void *a, __UINTPTR_TYPE__ b) {
+  return c_is_err(a) && c_is_err_value(b);
+}
+
+void test_inline_helper_multi_trylock_args_c(int ok) {
+  // The results of two different trylock calls are not tracked.
+  if (!c_both_err(c_ptr_range_lock_live(ok), c_ptr_range_lock_live(ok))) {
+    work_data = 31; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+  // The same trylock result passed twice: the false branch of a && b only
+  // implies that a or b is not an error pointer, and since a == b, that the
+  // capability is held.
+  struct CGroupObj *p = c_ptr_range_lock_live(ok);
+  if (!c_both_err(p, p)) {
+    work_data = 32;
+    mutex_unlock(&mu1);
+  }
+  // Also for parameters of different types.
+  struct CGroupObj *q = c_ptr_range_lock_live(ok);
+  if (!c_both_err_mixed(q, (__UINTPTR_TYPE__)q)) {
+    work_data = 33;
+    mutex_unlock(&mu1);
+  }
+  // c_err_and_not_err(r, r) is always false, which says nothing about r.
+  struct CGroupObj *r = c_ptr_range_lock_live(ok);
+  if (!c_err_and_not_err(r, r)) {
+    work_data = 34; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+}
+
 // Signed pointer comparisons, e.g. (long)ptr < 0, in callers.
 void test_signed_ptr_cmp_callers_c(int ok) {
   if ((__INTPTR_TYPE__)c_ptr_range_lock_live(ok) < 0)
@@ -1489,6 +1703,34 @@ void test_signed_ptr_cmp_callers_c(int ok) {
 // Value-changing argument conversions must not be looked through.
 long long c_llong_range_lock(void)
     __attribute__((try_acquire_capability_range(0, 0, mu1)));
+static inline int c_is_zero_int(int v) { return v == 0; }
+static inline int c_is_zero_llong(long long v) { return v == 0; }
+
+void test_narrowing_helper_arg_c(void) {
+  // Truncation to int may map a nonzero value to zero.
+  if (c_is_zero_int(c_llong_range_lock())) {
+    work_data = 37; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+  long long r = c_llong_range_lock();
+  if (c_is_zero_int(r)) {
+    work_data = 38; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+  if (c_is_zero_llong(c_llong_range_lock())) {
+    work_data = 39;
+    mutex_unlock(&mu1);
+  }
+}
+
+// A recursive helper does not return its argument unchanged.
+static inline void *c_recursive_identity(const void *p) {
+  return c_recursive_identity(p);
+}
+
+void test_recursive_identity_helper_c(int ok) {
+  if (!c_is_err(c_recursive_identity(c_ptr_range_lock_live(ok)))) {
+    work_data = 40; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+  }
+}
 
 // _Generic controlling and unselected expressions are unevaluated.
 void test_generic_unevaluated_c(int unk) {
@@ -1561,6 +1803,63 @@ void test_unrelated_lhs_and_trylock_rhs_c(int ok) {
   if (ok && !r)
     return;
   work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+}
+
+// The size expressions of variable length array types in pointer
+// declarations and casts are evaluated at run time but are not part of the
+// CFG. A variable whose address escapes in them may be modified by any later
+// call.
+int *escaped_int_ptr;
+static inline int keep_int_ptr(int *p) {
+  escaped_int_ptr = p;
+  return 4;
+}
+static inline void poke_escaped_int(void) { *escaped_int_ptr = 1; }
+static inline int clobber_int(int *p) {
+  *p = 1;
+  return 4;
+}
+
+void test_vla_ptr_decl_escape_c(void) {
+  int r = 1;
+  int (*p)[keep_int_ptr(&r)] = 0;
+  (void)p;
+  r = mutex_trylock_zero(&mu1);
+  poke_escaped_int();
+  if (r == 0) {
+    work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+  }
+}
+
+void test_vla_cast_escape_c(void) {
+  int r = mutex_trylock_zero(&mu1);
+  void *p = (int (*)[clobber_int(&r)])0;
+  (void)p;
+  if (r == 0) {
+    work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+  }
+}
+
+void test_vla_cast_assign_c(void) {
+  int r = mutex_trylock_zero(&mu1);
+  void *p = (int (*)[r = 1])0;
+  (void)p;
+  if (r == 0) {
+    work_data = 1; // expected-warning{{writing variable 'work_data' requires holding mutex 'mu1' exclusively}}
+    mutex_unlock(&mu1); // expected-warning{{releasing mutex 'mu1' that was not held}}
+  }
+}
+
+void test_vla_escape_after_branch_c(void) {
+  int r = mutex_trylock_zero(&mu1);
+  if (r == 0) {
+    work_data = 1;
+    mutex_unlock(&mu1);
+  }
+  void *p = (int (*)[clobber_int(&r)])0;
+  (void)p;
 }
 
 // We had a problem where we'd skip all attributes that follow a late-parsed

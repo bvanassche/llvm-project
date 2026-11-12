@@ -79,8 +79,8 @@ void escape_through_variadic_argument(void) {
 }
 
 // Passing the address of or a reference to a variable to a function allows the
-// function to retain an alias and modify the variable during a later call, but
-// not before a later call.
+// function to retain an alias and modify the variable during a later call,
+// but not before a later call.
 int *global_r_alias;
 void keep(int *p) { global_r_alias = p; }
 void keep_ref(int &r) { global_r_alias = &r; }
@@ -155,6 +155,31 @@ void captured_by_reference() {
   if (r == 0) {
     data = 1; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
     unlock(&mu); // expected-warning{{releasing mutex 'mu' that was not held}}
+  }
+}
+
+int trylock_shared(struct Mutex *m)
+    __attribute__((try_acquire_shared_capability(1, m)));
+void unlock_shared(struct Mutex *m)
+    __attribute__((release_shared_capability(m)));
+static inline bool is_trylock_failure(int r) { return !r; }
+
+void inline_helper_try_acquire_capability() {
+  if (!is_trylock_failure(trylock(&mu))) {
+    data = 1;
+    unlock(&mu);
+  }
+  int r = trylock(&mu);
+  if (is_trylock_failure(r)) {
+    data = 2; // expected-warning{{writing variable 'data' requires holding mutex 'mu' exclusively}}
+  } else {
+    data = 3;
+    unlock(&mu);
+  }
+  if (!is_trylock_failure(trylock_shared(&mu))) {
+    int v = data;
+    (void)v;
+    unlock_shared(&mu);
   }
 }
 

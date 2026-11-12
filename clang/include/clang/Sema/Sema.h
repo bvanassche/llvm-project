@@ -229,8 +229,8 @@ enum class AssignmentAction {
 using AllocationArgumentSet = SmallVector<ImplicitAllocationArguments, 3>;
 
 namespace threadSafety {
-class BeforeSet;
-void threadSafetyCleanup(BeforeSet *Cache);
+class ThreadSafetyCache;
+void threadSafetyCleanup(ThreadSafetyCache *Cache);
 } // namespace threadSafety
 
 // FIXME: No way to easily map from TemplateTypeParmTypes to
@@ -1369,7 +1369,7 @@ public:
 
   /// Worker object for performing CFG-based warnings.
   sema::AnalysisBasedWarnings AnalysisWarnings;
-  threadSafety::BeforeSet *ThreadSafetyDeclCache;
+  threadSafety::ThreadSafetyCache *ThreadSafetyDeclCache;
 
   /// Check the thread safety attributes of the redeclarations of \p D whose
   /// checks depend on its type after that type has been deduced.

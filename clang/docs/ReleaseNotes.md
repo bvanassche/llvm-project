@@ -574,6 +574,11 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
   it is captured by reference. Such a variable may be modified without the
   analysis noticing.
 
+- The thread safety analysis now evaluates small `inline` or `constexpr` helper
+  functions when checking the return value of a function annotated with
+  `try_acquire_capability`, `try_acquire_shared_capability`,
+  `try_acquire_capability_range`, or `try_acquire_shared_capability_range`.
+
 ### Improvements to Clang's diagnostics
 
 - Fixed a false-positive `-Wimplicit-fallthrough` warning when

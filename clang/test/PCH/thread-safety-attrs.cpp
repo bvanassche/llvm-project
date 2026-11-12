@@ -39,8 +39,14 @@ class  __attribute__((lockable)) Mutex {
   bool ReaderTryLock() __attribute__((shared_trylock_function(true)));
   int TryLockRange() __attribute__((try_acquire_capability_range(0, 1)));
   int ReaderTryLockRange() __attribute__((try_acquire_shared_capability_range(0, 1)));
+  void *TryLockPtrOrErr()
+      __attribute__((try_acquire_capability_range(0, (__UINTPTR_TYPE__)-4096)));
   void LockWhen(const int &cond) __attribute__((exclusive_lock_function));
 };
+
+inline bool pchIsErr(const void *p) {
+  return reinterpret_cast<__UINTPTR_TYPE__>(p) >= (__UINTPTR_TYPE__)-4095;
+}
 
 class __attribute__((scoped_lockable)) MutexLock {
  public:
@@ -111,6 +117,11 @@ public:
    int x __attribute__((guarded_by(mu)));
    void MyLock() __attribute__((exclusive_lock_function(mu)));
 };
+
+// Trivial inline helpers are expanded when checking trylock results, also if
+// their body is deserialized from a PCH file.
+static inline bool sls_is_zero(int r) { return r == 0; }
+int sls_range_try() __attribute__((try_acquire_capability_range(0, 0, sls_mu)));
 
 #else
 
@@ -338,6 +349,24 @@ void sls_trylock_range_bad() {
   if (sls_mu.TryLockRange() >= 0) {
     pch_protected = 1; // expected-warning{{writing variable 'pch_protected' requires holding mutex 'sls_mu' exclusively}}
   }
+  if (pchIsErr(sls_mu.TryLockPtrOrErr())) {
+    pch_protected = 2; // expected-warning{{writing variable 'pch_protected' requires holding mutex 'sls_mu' exclusively}}
+  } else {
+    pch_protected = 3;
+    sls_mu.Unlock();
+  }
+}
+
+void sls_inline_helper_from_pch() {
+  if (sls_is_zero(sls_range_try())) {
+    sls_guardby_var = 1;
+    sls_mu.Unlock();
+  }
+  if (!sls_is_zero(sls_range_try())) {
+    sls_guardby_var = 2; // expected-warning{{writing variable 'sls_guardby_var' requires holding mutex 'sls_mu' exclusively}}
+    return;
+  }
+  sls_mu.Unlock();
 }
 
 #endif

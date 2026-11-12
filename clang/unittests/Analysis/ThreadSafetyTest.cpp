@@ -41,7 +41,7 @@ TEST(ThreadSafetyTest, LeaveFunctionOnEarlyExit) {
   } Handler;
 
   AnalysisDeclContextManager ADCM(C);
-  BeforeSet *Cache = nullptr;
+  ThreadSafetyCache *Cache = nullptr;
   for (const Decl *D : C.getTranslationUnitDecl()->decls()) {
     if (const auto *RD = dyn_cast<CXXRecordDecl>(D);
         RD && RD->getName() == "Mu") {

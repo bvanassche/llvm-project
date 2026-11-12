@@ -37,7 +37,7 @@ class TryAcquireCapabilityRangeAttr;
 
 namespace threadSafety {
 
-class BeforeSet;
+class ThreadSafetyCache;
 
 /// This enum distinguishes between different kinds of operations that may
 /// need to be protected by locks. We use this enum in error handling.
@@ -318,9 +318,9 @@ private:
 /// Each block in the CFG is traversed exactly once.
 void runThreadSafetyAnalysis(AnalysisDeclContext &AC,
                              ThreadSafetyHandler &Handler,
-                             BeforeSet **Bset);
+                             ThreadSafetyCache **Cache);
 
-void threadSafetyCleanup(BeforeSet *Cache);
+void threadSafetyCleanup(ThreadSafetyCache *Cache);
 
 /// Helper function that returns a LockKind required for the given level
 /// of access.

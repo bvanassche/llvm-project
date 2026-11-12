@@ -381,6 +381,21 @@ threadSafety::reprojectRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
 }
 
 static ThreadSafetyAnalyzer::IntRangeSet
+castDerivedToBaseRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                          const ThreadSafetyAnalyzer::IntDomain &Dom) {
+  using IntRangeSet = ThreadSafetyAnalyzer::IntRangeSet;
+  // Adjusting a non-null pointer by a base-class offset yields a non-null
+  // pointer. A null pointer stays null.
+  IntRangeSet Mapped = reprojectRangeSet(Src, Dom);
+  IntRangeSet Res;
+  if (Mapped.mayBeZero())
+    Res = IntRangeSet::truthSet(Dom, false);
+  if (Mapped.mayBeNonZero())
+    Res = Res.unionWith(IntRangeSet::truthSet(Dom, true));
+  return Res;
+}
+
+static ThreadSafetyAnalyzer::IntRangeSet
 booleanizeRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
                    const ThreadSafetyAnalyzer::IntDomain &DstDom) {
   return ThreadSafetyAnalyzer::IntRangeSet::boolSet(DstDom, Src.mayBeZero(),
@@ -400,51 +415,294 @@ llvm::APSInt threadSafety::truncToType(const llvm::APSInt &V, QualType Ty,
   return Res;
 }
 
+/// The value of \p LV \p Opc \p RV converted to \p ResTy if \p Opc is an
+/// arithmetic, shift or bitwise operator.
+std::optional<llvm::APSInt>
+threadSafety::foldIntBinOp(BinaryOperator::Opcode Opc, llvm::APSInt LV,
+                           llvm::APSInt RV, QualType ResTy,
+                           const ASTContext &Ctx) {
+  if (Opc == BO_Shl || Opc == BO_Shr) {
+    LV = truncToType(LV, ResTy, Ctx);
+    if (RV.isNegative() || RV.ugt(LV.getBitWidth() - 1))
+      return std::nullopt;
+    unsigned Shift = static_cast<unsigned>(RV.getZExtValue());
+    return truncToType(Opc == BO_Shl ? (LV << Shift) : (LV >> Shift), ResTy,
+                       Ctx);
+  }
+  if (Opc == BO_Div || Opc == BO_Rem) {
+    LV = truncToType(LV, ResTy, Ctx);
+    RV = truncToType(RV, ResTy, Ctx);
+    if (RV.isZero() ||
+        (LV.isSigned() && LV.isMinSignedValue() && RV.isAllOnes()))
+      return std::nullopt;
+    return truncToType(Opc == BO_Div ? (LV / RV) : (LV % RV), ResTy, Ctx);
+  }
+  // The operands of compound assignments may have different widths and
+  // signedness.
+  unsigned W =
+      std::max({LV.getBitWidth(), RV.getBitWidth(), Ctx.getIntWidth(ResTy)}) +
+      2;
+  LV = LV.extend(W);
+  RV = RV.extend(W);
+  LV.setIsSigned(true);
+  RV.setIsSigned(true);
+  switch (Opc) {
+  case BO_Add:
+    return truncToType(LV + RV, ResTy, Ctx);
+  case BO_Sub:
+    return truncToType(LV - RV, ResTy, Ctx);
+  case BO_Mul:
+    return truncToType(LV * RV, ResTy, Ctx);
+  case BO_And:
+    return truncToType(LV & RV, ResTy, Ctx);
+  case BO_Or:
+    return truncToType(LV | RV, ResTy, Ctx);
+  case BO_Xor:
+    return truncToType(LV ^ RV, ResTy, Ctx);
+  default:
+    return std::nullopt;
+  }
+}
+
+/// Truncate the range \p Src to a bit-field of width \p BitWidth and type
+/// \p FieldTy, projected into \p DstDom.
 ThreadSafetyAnalyzer::IntRangeSet
-threadSafety::castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
-                                   QualType DstTy, const ASTContext &Ctx) {
-  if (Src.empty())
+threadSafety::truncateToBitField(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                                 unsigned BitWidth, QualType FieldTy,
+                                 const ThreadSafetyAnalyzer::IntDomain &DstDom,
+                                 const ASTContext &Ctx) {
+  using IntRangeSet = ThreadSafetyAnalyzer::IntRangeSet;
+  if (Src.empty() || BitWidth == 0)
     return {};
-  auto DstDom = ThreadSafetyAnalyzer::IntDomain::forType(DstTy, Ctx);
-  // Boolean conversion is != 0.
-  if (DstTy->isBooleanType())
+  if (FieldTy->isBooleanType())
     return booleanizeRangeSet(Src, DstDom);
-
-  unsigned DstBits = Ctx.getIntWidth(DstTy);
-
-  // The intervals of Src may be wider than the destination domain, e.g. for
-  // __int128 sources. Use a width that can represent all values involved.
-  unsigned WideW = std::max(DstDom.BitWidth + 2, DstBits + 3);
+  BitWidth = std::min(BitWidth, Ctx.getIntWidth(FieldTy));
+  bool IsUnsigned = FieldTy->isUnsignedIntegerOrEnumerationType();
+  unsigned W = std::max({DstDom.BitWidth + 2, BitWidth + 3, 64u});
   for (const ClosedRange &CR : Src.ranges())
-    WideW = std::max(WideW, CR.getBitWidth() + 2);
-  llvm::APSInt TwoPowW(llvm::APInt::getOneBitSet(WideW, DstBits),
+    W = std::max(W, CR.getBitWidth() + 2);
+  llvm::APSInt BFMin(
+      IsUnsigned ? llvm::APInt::getZero(DstDom.BitWidth)
+                 : llvm::APInt::getSignMask(BitWidth).sext(DstDom.BitWidth),
+      /*isUnsigned=*/false);
+  llvm::APSInt BFMax(
+      IsUnsigned
+          ? llvm::APInt::getLowBitsSet(DstDom.BitWidth, BitWidth)
+          : llvm::APInt::getSignedMaxValue(BitWidth).sext(DstDom.BitWidth),
+      /*isUnsigned=*/false);
+  llvm::APSInt TwoPowW(llvm::APInt::getOneBitSet(W, BitWidth),
                        /*isUnsigned=*/false);
-
-  ThreadSafetyAnalyzer::IntRangeSet Res;
+  auto TruncPoint = [&](const llvm::APSInt &V) {
+    llvm::APInt Trunc = V.extOrTrunc(BitWidth);
+    return llvm::APSInt(IsUnsigned ? Trunc.zext(DstDom.BitWidth)
+                                   : Trunc.sext(DstDom.BitWidth),
+                        /*isUnsigned=*/false);
+  };
+  IntRangeSet Res;
   for (const auto &[Lo, Hi] : Src.ranges()) {
-    if (llvm::APSInt::compareValues(Lo, DstDom.Lo) >= 0 &&
-        llvm::APSInt::compareValues(Hi, DstDom.Hi) <= 0) {
-      Res = Res.unionWith(
-          ThreadSafetyAnalyzer::IntRangeSet::closedRange(DstDom, Lo, Hi));
+    if (llvm::APSInt::compareValues(Lo, BFMin) >= 0 &&
+        llvm::APSInt::compareValues(Hi, BFMax) <= 0) {
+      Res = Res.unionWith(IntRangeSet::closedRange(DstDom, Lo, Hi));
       continue;
     }
-    llvm::APSInt LoW = Lo.extend(WideW);
-    llvm::APSInt HiW = Hi.extend(WideW);
+    llvm::APSInt LoW = Lo.extend(W), HiW = Hi.extend(W);
     LoW.setIsUnsigned(false);
     HiW.setIsUnsigned(false);
     if (HiW - LoW >= TwoPowW)
-      return ThreadSafetyAnalyzer::IntRangeSet::full(DstDom);
-    llvm::APSInt MappedLo = truncToType(Lo, DstTy, Ctx);
-    llvm::APSInt MappedHi = truncToType(Hi, DstTy, Ctx);
+      return IntRangeSet::closedRange(DstDom, BFMin, BFMax);
+    llvm::APSInt MappedLo = TruncPoint(Lo), MappedHi = TruncPoint(Hi);
     if (llvm::APSInt::compareValues(MappedLo, MappedHi) <= 0) {
-      Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::closedRange(
-          DstDom, MappedLo, MappedHi));
+      Res = Res.unionWith(IntRangeSet::closedRange(DstDom, MappedLo, MappedHi));
     } else {
-      Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::closedRange(
-          DstDom, DstDom.Lo, MappedHi));
-      Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::closedRange(
-          DstDom, MappedLo, DstDom.Hi));
+      Res = Res.unionWith(IntRangeSet::closedRange(DstDom, BFMin, MappedHi));
+      Res = Res.unionWith(IntRangeSet::closedRange(DstDom, MappedLo, BFMax));
     }
   }
   return Res;
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+threadSafety::castIntegralRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                                   QualType DstTy, const ASTContext &Ctx) {
+  return truncateToBitField(Src, Ctx.getIntWidth(DstTy), DstTy,
+                            IntDomain::forType(DstTy, Ctx), Ctx);
+}
+
+static IntRangeSet affineTransformRangeSet(const IntRangeSet &Src,
+                                           bool NegateSrc, llvm::APSInt K,
+                                           bool SubtractK, QualType ResTy,
+                                           const ASTContext &Ctx) {
+  if (Src.empty())
+    return {};
+  K = truncToType(K, ResTy, Ctx);
+  unsigned W = std::max({Ctx.getIntWidth(ResTy),
+                         Src.ranges().front().getBitWidth(), 62u}) +
+               3;
+  llvm::APSInt KW = K.extend(W);
+  KW.setIsUnsigned(false);
+  if (SubtractK)
+    KW = -KW;
+  IntDomain WideDom{W,
+                    llvm::APSInt(llvm::APInt::getSignedMinValue(W - 1).sext(W),
+                                 /*isUnsigned=*/false),
+                    llvm::APSInt(llvm::APInt::getSignedMaxValue(W - 1).sext(W),
+                                 /*isUnsigned=*/false)};
+  IntRangeSet Shifted;
+  for (const auto &[Lo, Hi] : Src.ranges()) {
+    llvm::APSInt LoW = Lo.extend(W), HiW = Hi.extend(W);
+    LoW.setIsUnsigned(false);
+    HiW.setIsUnsigned(false);
+    llvm::APSInt NewLo = (NegateSrc ? -HiW : LoW) + KW;
+    llvm::APSInt NewHi = (NegateSrc ? -LoW : HiW) + KW;
+    Shifted =
+        Shifted.unionWith(IntRangeSet::closedRange(WideDom, NewLo, NewHi));
+  }
+  return castIntegralRangeSet(Shifted, ResTy, Ctx);
+}
+
+ThreadSafetyAnalyzer::IntRangeSet
+threadSafety::negateRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                             QualType ResTy, const ASTContext &Ctx) {
+  return affineTransformRangeSet(Src, /*NegateSrc=*/true, llvm::APSInt::get(0),
+                                 /*SubtractK=*/false, ResTy, Ctx);
+}
+
+/// The values of \p Src + \p K (or \p Src - \p K if \p Subtract is true) in
+/// the integral type \p ResTy.
+ThreadSafetyAnalyzer::IntRangeSet
+threadSafety::addConstToRangeSet(const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                                 llvm::APSInt K, bool Subtract, QualType ResTy,
+                                 const ASTContext &Ctx) {
+  return affineTransformRangeSet(Src, /*NegateSrc=*/false, std::move(K),
+                                 Subtract, ResTy, Ctx);
+}
+
+/// The values of \p K - \p Src in the integral type \p ResTy.
+ThreadSafetyAnalyzer::IntRangeSet
+threadSafety::subRangeSetFromConst(llvm::APSInt K,
+                                   const ThreadSafetyAnalyzer::IntRangeSet &Src,
+                                   QualType ResTy, const ASTContext &Ctx) {
+  return affineTransformRangeSet(Src, /*NegateSrc=*/true, std::move(K),
+                                 /*SubtractK=*/false, ResTy, Ctx);
+}
+
+/// Whether applyCast() can compute the values of the cast \p CE from the
+/// values of its operand.
+bool threadSafety::isRangeMappableCast(const CastExpr *CE) {
+  QualType SubTy = CE->getSubExpr()->getType();
+  QualType DstTy = CE->getType();
+  switch (CE->getCastKind()) {
+  case CK_LValueToRValue:
+  case CK_NoOp:
+  case CK_IntegralToBoolean:
+  case CK_PointerToBoolean:
+  case CK_MemberPointerToBoolean:
+  case CK_BooleanToSignedIntegral:
+    return true;
+  case CK_UserDefinedConversion:
+    return isConversionFunctionCast(CE);
+  case CK_BitCast:
+  case CK_DerivedToBase:
+  case CK_UncheckedDerivedToBase:
+    return DstTy->isAnyPointerType() && SubTy->isAnyPointerType();
+  case CK_PointerToIntegral:
+    return SubTy->isAnyPointerType() && DstTy->isIntegralOrEnumerationType();
+  case CK_IntegralToPointer:
+    return DstTy->isAnyPointerType() && SubTy->isIntegralOrEnumerationType();
+  case CK_IntegralCast:
+    return SubTy->isIntegralOrEnumerationType() &&
+           DstTy->isIntegralOrEnumerationType();
+  default:
+    return false;
+  }
+}
+
+/// The values in \p Dom, the domain of the type of the cast \p CE, that \p CE
+/// may have if its operand has the values \p Sub. \p CE must satisfy
+/// isRangeMappableCast().
+ThreadSafetyAnalyzer::IntRangeSet threadSafety::applyCast(
+    const CastExpr *CE, const ThreadSafetyAnalyzer::IntRangeSet &Sub,
+    const ThreadSafetyAnalyzer::IntDomain &Dom, const ASTContext &Ctx) {
+  switch (CE->getCastKind()) {
+  case CK_DerivedToBase:
+  case CK_UncheckedDerivedToBase:
+    return castDerivedToBaseRangeSet(Sub, Dom);
+  case CK_PointerToIntegral:
+  case CK_IntegralCast:
+    return castIntegralRangeSet(Sub, CE->getType(), Ctx);
+  case CK_IntegralToPointer:
+    return castIntegralRangeSet(Sub, Ctx.getUIntPtrType(), Ctx);
+  case CK_IntegralToBoolean:
+  case CK_PointerToBoolean:
+  case CK_MemberPointerToBoolean:
+    return booleanizeRangeSet(Sub, Dom);
+  case CK_BooleanToSignedIntegral: {
+    ThreadSafetyAnalyzer::IntRangeSet Res;
+    if (Sub.mayBeZero())
+      Res =
+          ThreadSafetyAnalyzer::IntRangeSet::single(Dom, llvm::APSInt::get(0));
+    if (Sub.mayBeNonZero())
+      Res = Res.unionWith(ThreadSafetyAnalyzer::IntRangeSet::single(
+          Dom, llvm::APSInt::get(-1)));
+    return Res;
+  }
+  default:
+    return reprojectRangeSet(Sub, Dom);
+  }
+}
+
+/// Whether \p L \p Opc \p R holds for some values of the non-empty sets \p L
+/// and \p R.
+static bool mayHold(BinaryOperator::Opcode Opc,
+                    const ThreadSafetyAnalyzer::IntRangeSet &L,
+                    const ThreadSafetyAnalyzer::IntRangeSet &R) {
+  switch (Opc) {
+  case BO_EQ:
+    return L.intersectsSet(R);
+  case BO_NE: {
+    llvm::APSInt LV, RV;
+    return !(L.isSingleValue(LV) && R.isSingleValue(RV) &&
+             llvm::APSInt::compareValues(LV, RV) == 0);
+  }
+  case BO_LT:
+    return llvm::APSInt::compareValues(L.ranges().front().Lo,
+                                       R.ranges().back().Hi) < 0;
+  case BO_LE:
+    return llvm::APSInt::compareValues(L.ranges().front().Lo,
+                                       R.ranges().back().Hi) <= 0;
+  case BO_GT:
+  case BO_GE:
+    return mayHold(BinaryOperator::reverseComparisonOp(Opc), R, L);
+  default:
+    llvm_unreachable("Unexpected comparison opcode");
+  }
+}
+
+std::optional<ThreadSafetyAnalyzer::IntRangeSet> threadSafety::compareRangeSets(
+    BinaryOperator::Opcode Opc, const ThreadSafetyAnalyzer::IntRangeSet &L,
+    const ThreadSafetyAnalyzer::IntRangeSet &R,
+    const ThreadSafetyAnalyzer::IntDomain &ResDom, bool IsMemberPtrComparison) {
+  using IntRangeSet = ThreadSafetyAnalyzer::IntRangeSet;
+  if (L.empty() || R.empty())
+    return IntRangeSet{};
+
+  if (IsMemberPtrComparison) {
+    if (!BinaryOperator::isEqualityOp(Opc))
+      return std::nullopt;
+    // Only null-ness is tracked for member pointers. Two non-null member
+    // pointers may or may not be equal.
+    bool LNull = L.mayBeZero(), LNonNull = L.mayBeNonZero();
+    bool RNull = R.mayBeZero(), RNonNull = R.mayBeNonZero();
+    bool CanEq = (LNull && RNull) || (LNonNull && RNonNull);
+    bool CanNe =
+        (LNull && RNonNull) || (LNonNull && RNull) || (LNonNull && RNonNull);
+    return Opc == BO_EQ ? IntRangeSet::boolSet(ResDom, CanNe, CanEq)
+                        : IntRangeSet::boolSet(ResDom, CanEq, CanNe);
+  }
+  if (!BinaryOperator::isRelationalOp(Opc) &&
+      !BinaryOperator::isEqualityOp(Opc))
+    return std::nullopt;
+  return IntRangeSet::boolSet(
+      ResDom, mayHold(BinaryOperator::negateComparisonOp(Opc), L, R),
+      mayHold(Opc, L, R));
 }

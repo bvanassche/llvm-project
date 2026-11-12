@@ -9473,6 +9473,28 @@ struct PtrRangeTryAcquireHolder {
   int *tryLockNonNullOrErr(int mode)
       TRY_ACQUIRE_RANGE(1, (__UINTPTR_TYPE__)-4096, mu);
 
+  static inline bool isErr(const void *p) {
+    return reinterpret_cast<__UINTPTR_TYPE__>(p) >= (__UINTPTR_TYPE__)-4095;
+  }
+
+  static inline bool isErrOrNull(const void *p) {
+    return p == nullptr || isErr(p);
+  }
+
+  template <typename T>
+  static constexpr void *errCast(const T *p) {
+    return const_cast<void *>(static_cast<const void *>(p));
+  }
+
+  static inline int ptrErrOrZero(const void *p) {
+    if (isErr(p))
+      return static_cast<int>(reinterpret_cast<__INTPTR_TYPE__>(p));
+    return 0;
+  }
+
+  int *tryLockOrErr(int mode)
+      TRY_ACQUIRE_RANGE(0, (__UINTPTR_TYPE__)-4096, mu);
+
   void testCaller(int mode) {
     int *p = tryLockNonNullOrErr(mode);
     if (p != nullptr &&
@@ -9484,6 +9506,21 @@ struct PtrRangeTryAcquireHolder {
     if (p2 != nullptr) {
       guarded = 9; // expected-warning {{writing variable 'guarded' requires holding mutex 'mu' exclusively}}
     }
+    if (!isErrOrNull(tryLockNonNullOrErr(mode))) {
+      guarded = 10;
+      mu.Unlock();
+    }
+    if (!isErr(errCast(tryLockOrErr(mode)))) {
+      guarded = 11;
+      mu.Unlock();
+    }
+    if (ptrErrOrZero(tryLockOrErr(mode)) == 0) {
+      guarded = 12;
+      mu.Unlock();
+    }
+    if (!isErr(tryLockNonNullOrErr(mode))) {
+      guarded = 13; // expected-warning {{writing variable 'guarded' requires holding mutex 'mu' exclusively}}
+    }
   }
 
   static void testSplitChecksReassignedTarget(PtrRangeTryAcquireHolder *h1,
@@ -9494,7 +9531,7 @@ struct PtrRangeTryAcquireHolder {
     p = h2;
     if (!res)
       return;
-    if (reinterpret_cast<__UINTPTR_TYPE__>(res) >= (__UINTPTR_TYPE__)-4095)
+    if (isErr(res))
       return;
     h1->guarded = 14;
     p->guarded = 15; // expected-warning {{writing variable 'guarded' requires holding mutex 'h2->mu' exclusively}} \

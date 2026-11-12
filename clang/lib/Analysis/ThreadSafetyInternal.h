@@ -27,6 +27,7 @@
 #include "clang/Analysis/CFG.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Basic/SourceLocation.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ImmutableMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -262,6 +263,23 @@ public:
 
 class ThreadSafetyAnalyzer;
 
+/// The body of a trivial inline or constexpr function whose return value can
+/// be evaluated in terms of its parameters.
+struct TrivialInlineBody {
+  const FunctionDecl *DefFD = nullptr;
+  const Expr *SingleRet = nullptr;
+  const Expr *CondExpr = nullptr;
+  const Expr *ThenRet = nullptr;
+  const Expr *ElseRet = nullptr;
+  llvm::SmallPtrSet<const ValueDecl *, 8> CalleeEscaped;
+  mutable std::optional<std::optional<unsigned>> IdentityParam;
+
+  /// The canonical declaration of parameter \p I.
+  const ValueDecl *param(unsigned I) const {
+    return cast<ValueDecl>(DefFD->getParamDecl(I)->getCanonicalDecl());
+  }
+};
+
 class BeforeSet {
 private:
   using BeforeVect = SmallVector<const ValueDecl *, 4>;
@@ -294,6 +312,16 @@ public:
 private:
   BeforeMap BMap;
   CycleMap CycMap;
+};
+
+/// Translation-unit-wide cache shared across thread-safety analyses of
+/// functions in the same translation unit.
+class ThreadSafetyCache {
+public:
+  BeforeSet BSet;
+  llvm::DenseMap<const FunctionDecl *, std::unique_ptr<TrivialInlineBody>>
+      InlineBodyCache;
+  llvm::DenseMap<const StmtExpr *, const Expr *> PureStmtExprCache;
 };
 
 class LocalVariableMap;
@@ -346,8 +374,6 @@ private:
 public:
   static CFGBlockInfo getEmptyBlockInfo(LocalVariableMap &M);
 };
-
-LLVM_LIBRARY_VISIBILITY const Expr *stripNoOpExprWrappers(const Expr *E);
 
 // A LocalVariableMap maintains a map from local variables to their currently
 // valid definitions.  It provides SSA-like functionality when traversing the
@@ -449,7 +475,7 @@ public:
   }
 
   /// Look up a definition, within the given context.
-  const VarDefinition *lookup(const NamedDecl *D, Context Ctx) const {
+  const VarDefinition *lookup(const NamedDecl *D, Context Ctx) {
     const unsigned *i = Ctx.lookup(D);
     if (!i)
       return nullptr;
@@ -476,7 +502,7 @@ public:
     return nullptr;
   }
 
-  /// Look up the definition of \p D if the value of \p D is known to equal
+  /// Like lookupExpr(), but return null if the value of \p D may differ from
   /// its last definition. Use this when evaluating the value of a variable,
   /// e.g. a trylock result.
   const Expr *lookupValueExpr(const NamedDecl *D, Context &Ctx) const {
@@ -488,10 +514,10 @@ public:
 
   Context getEmptyContext() { return ContextFactory.getEmptyMap(); }
 
-  /// If \p D has a definition in \p Ctx, return a context in which that
-  /// definition is cleared; otherwise return \p Ctx.
   Context clearDefinitionIfSet(const NamedDecl *D, Context Ctx) {
-    return clearDefinition(D, Ctx);
+    if (const unsigned *DefID = Ctx.lookup(D); DefID && *DefID != 0)
+      return clearDefinition(D, Ctx);
+    return Ctx;
   }
 
   /// Return the next context after processing S.  This function is used by
@@ -932,12 +958,26 @@ private:
   }
 };
 
-/// The maximum number of intervals of a range tracked for a trylock
-/// condition. Wider ranges are over-approximated so that range operations
-/// do not grow with the number of conditions.
+/// The maximum number of inline helper expansions per CFG block of the
+/// analyzed function. This is the only budget of inline helper expansion:
+/// it bounds the cost of analyzing helpers that call other helpers many
+/// times without making the analysis of a block depend on the number of
+/// conditions in the blocks before it. The nesting depth of expansions is
+/// bounded by MaxConstrainExprDepth since each expansion increases the
+/// recursion depth of the expression evaluation.
+static constexpr unsigned MaxInlineExpansions = 512;
+
+/// The maximum number of intervals of a range that is stored in a value
+/// state. Wider ranges are over-approximated such that the cost of copying
+/// and joining value states does not grow with the number of conditions.
 static constexpr unsigned MaxStateRangeIntervals = 16;
+/// The maximum recursion depth of constrainExprComparison().
+static constexpr unsigned MaxConstrainExprDepth = 24;
 /// The maximum recursion depth of evaluateTrylockRangeCond().
 static constexpr unsigned MaxRangeCondDepth = 256;
+/// The maximum number of recursive evaluation steps per top-level expression
+/// range or condition evaluation.
+static constexpr unsigned MaxEvalSteps = 2048;
 
 /// Class which implements the core thread safety analysis routines.
 class LLVM_LIBRARY_VISIBILITY ThreadSafetyAnalyzer {
@@ -957,12 +997,12 @@ class LLVM_LIBRARY_VISIBILITY ThreadSafetyAnalyzer {
   FactManager FactMan;
   std::vector<CFGBlockInfo> BlockInfo;
 
-  BeforeSet *GlobalBeforeSet;
+  ThreadSafetyCache *GlobalCache;
 
 public:
-  ThreadSafetyAnalyzer(ThreadSafetyHandler &H, BeforeSet *Bset)
+  ThreadSafetyAnalyzer(ThreadSafetyHandler &H, ThreadSafetyCache *Cache)
       : Arena(&Bpa), SxBuilder(Arena), Handler(H), FactMan(Bpa),
-        GlobalBeforeSet(Bset) {}
+        GlobalCache(Cache) {}
 
   bool inCurrentScope(const CapabilityExpr &CapE);
 
@@ -976,6 +1016,11 @@ public:
 
   using IntDomain = threadSafety::IntDomain;
   using IntRangeSet = threadSafety::IntRangeSet;
+
+  struct TrylockValueState {
+    bool Infeasible = false;
+    llvm::SmallDenseMap<const ValueDecl *, IntRangeSet, 4> VarRanges;
+  };
 
   /// The values that select each case label of a switch statement and the
   /// values that select the default label (or skip the switch body).
@@ -1034,11 +1079,17 @@ public:
     IntRangeSet ShortCircuitSet = {};
   };
 
-  const Expr *skipValuePreservingWrappers(const Expr *E, LocalVarContext *C);
+  std::optional<unsigned> getIdentityInlineParamIndex(const CallExpr *CallExp);
+  const Expr *skipValuePreservingWrappers(const Expr *E, LocalVarContext *C,
+                                          bool IgnoreSideEffects = true);
   const CallExpr *unwrapValuePreservingToCallExpr(const Expr *E,
                                                   LocalVarContext &C);
   const CallExpr *unwrapTrylockValueExpr(const Expr *E, LocalVarContext &C);
   bool isGuaranteedZeroOrOneExpr(const Expr *E, LocalVarContext C);
+  TrylockRangeCondResult evaluateInlineCallRangeCond(
+      const CallExpr *InlineCall, LocalVarContext C,
+      std::optional<std::pair<BinaryOperator::Opcode, llvm::APSInt>> OuterCmp =
+          std::nullopt);
   TrylockRangeCondResult evaluateTrylockRangeCond(const Stmt *Cond,
                                                   LocalVarContext C,
                                                   unsigned Depth = 0);
@@ -1069,12 +1120,13 @@ public:
                                                LocalVarContext C,
                                                const BinaryOperator *BOP,
                                                unsigned Depth);
-  // Results of evaluateTrylockRangeCond(), keyed by the condition and the
-  // root of the local variable context. Each entry retains its
+  // Results of evaluateTrylockRangeCond(), keyed by the condition, the root of
+  // the local variable context, and whether the inline expansion budget had
+  // already been exhausted on entry. Each entry retains its
   // LocalVarContext so the root pointer remains valid for the lifetime of the
   // cache. Memoization keeps the evaluation of chains of logical operators on
   // variables linear instead of exponential.
-  llvm::DenseMap<std::pair<const Stmt *, const void *>,
+  llvm::DenseMap<std::tuple<const Stmt *, const void *, unsigned>,
                  std::pair<LocalVarContext, TrylockRangeCondResult>>
       RangeCondCache;
   llvm::DenseMap<std::pair<const CFGBlock *, const void *>,
@@ -1119,6 +1171,91 @@ public:
 
   std::optional<IntDomain> getScalarDomain(QualType Ty) const;
   IntDomain getTrylockCallDomain(const CallExpr *CallExp) const;
+  bool isTrackableLocalVar(
+      const ValueDecl *VD,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
+  const ValueDecl *extractTrackableVarExpr(
+      const Expr *E,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars) const;
+  /// The context in which the value of an expression is evaluated.
+  struct RangeEvalCtx {
+    /// The escaped local variables of the inline helper whose body contains
+    /// the expression. Null outside inline helpers.
+    const llvm::SmallPtrSetImpl<const ValueDecl *> *EscapedVars = nullptr;
+
+    RangeEvalCtx
+    withEscaped(const llvm::SmallPtrSetImpl<const ValueDecl *> *E) const {
+      RangeEvalCtx C = *this;
+      C.EscapedVars = E;
+      return C;
+    }
+  };
+  std::optional<IntRangeSet>
+  evaluatePureExprRange(const Expr *E, const TrylockValueState &State,
+                        const RangeEvalCtx &EC, unsigned Depth = 0);
+  std::optional<IntRangeSet>
+  evaluatePureDeclRefRange(const DeclRefExpr *DRE, const IntDomain &Dom,
+                           const TrylockValueState &State,
+                           const RangeEvalCtx &EC);
+  std::optional<IntRangeSet>
+  evaluatePureCastRange(const CastExpr *CE, const IntDomain &Dom,
+                        const TrylockValueState &State, const RangeEvalCtx &EC,
+                        unsigned Depth);
+  std::optional<IntRangeSet>
+  evaluatePureCallRange(const CallExpr *CallExp, const IntDomain &Dom,
+                        const TrylockValueState &State, const RangeEvalCtx &EC,
+                        unsigned Depth);
+  std::optional<IntRangeSet>
+  evaluatePureUnaryRange(const UnaryOperator *UO, const IntDomain &Dom,
+                         const TrylockValueState &State, const RangeEvalCtx &EC,
+                         unsigned Depth);
+  std::optional<IntRangeSet>
+  evaluatePureBinaryRange(const BinaryOperator *BO, const IntDomain &Dom,
+                          const TrylockValueState &State,
+                          const RangeEvalCtx &EC, unsigned Depth);
+  std::optional<IntRangeSet> evaluatePureConditionalRange(
+      const AbstractConditionalOperator *COP, const IntDomain &Dom,
+      const TrylockValueState &State, const RangeEvalCtx &EC, unsigned Depth);
+  bool constrainExprComparison(TrylockValueState &State, const Expr *VarSide,
+                               BinaryOperator::Opcode EffectiveOp,
+                               const llvm::APSInt &KVal, const RangeEvalCtx &EC,
+                               unsigned Depth = 0);
+  void constrainLeafCondition(TrylockValueState &State, const Expr *Cond,
+                              bool WantTrue, const RangeEvalCtx &EC,
+                              unsigned Depth = 0);
+  void constrainCastCondition(const CastExpr *CE, TrylockValueState &State,
+                              bool WantTrue, const RangeEvalCtx &EC,
+                              unsigned Depth);
+  void constrainCallCondition(const CallExpr *CallExp, TrylockValueState &State,
+                              bool WantTrue, const RangeEvalCtx &EC,
+                              unsigned Depth);
+  void constrainStmtExprCondition(const StmtExpr *SE, TrylockValueState &State,
+                                  bool WantTrue, const RangeEvalCtx &EC,
+                                  unsigned Depth);
+  void constrainBinaryCondition(const BinaryOperator *BO,
+                                TrylockValueState &State, bool WantTrue,
+                                const RangeEvalCtx &EC, unsigned Depth);
+  void constrainBinaryConditionalCondition(const BinaryConditionalOperator *BCO,
+                                           TrylockValueState &State,
+                                           bool WantTrue,
+                                           const RangeEvalCtx &EC,
+                                           unsigned Depth);
+  void constrainConditionalCondition(const ConditionalOperator *CO,
+                                     TrylockValueState &State, bool WantTrue,
+                                     const RangeEvalCtx &EC, unsigned Depth);
+  void constrainInlineRetExpr(
+      TrylockValueState &S, const Expr *RetE, bool WantTrue,
+      const std::optional<std::pair<BinaryOperator::Opcode, llvm::APSInt>>
+          &OuterCmp,
+      const IntDomain &RetDom, const RangeEvalCtx &CalleeEC,
+      unsigned Depth = 0);
+  llvm::ArrayRef<const ValueDecl *> getSubtreeModifiedVars(const Stmt *S);
+  llvm::ArrayRef<const ValueDecl *> getSubtreeReferencedVars(const Stmt *S);
+  bool exprReferencesAnyVar(const Stmt *S,
+                            llvm::ArrayRef<const ValueDecl *> Vars);
+  bool exprReferencesModifiedVars(const Stmt *RefRoot, const Stmt *ModRoot) {
+    return exprReferencesAnyVar(RefRoot, getSubtreeModifiedVars(ModRoot));
+  }
   // Subtrees of unevaluated operands, e.g. of noexcept or of the arguments of
   // __builtin_constant_p(). These may be CFG elements but are not executed.
   llvm::SmallPtrSet<const Stmt *, 8> UnevaluatedStmts;
@@ -1126,6 +1263,65 @@ public:
   // Their destructors and cleanup functions do not run either.
   llvm::SmallPtrSet<const VarDecl *, 4> UnevaluatedVarDecls;
   void collectUnevaluatedStmts(CFG *CFGraph);
+
+  // Functions that are being expanded inline and the expansion depth. Used to
+  // prevent recursive inline expansion and to only cache the results of
+  // expansions that are not nested in other expansions.
+  llvm::SmallPtrSet<const FunctionDecl *, 4> ActiveInlineCallees;
+  unsigned InlineDepth = 0;
+  // The number of inline expansions performed for the current CFG block.
+  unsigned InlineExpansionCount = 0;
+  // The number of recursive steps performed in the current top-level
+  // expression or condition evaluation.
+  unsigned EvalStepCount = 0;
+  // Whether the current inline/condition evaluation hit a depth or expansion
+  // budget cutoff and therefore must not be cached.
+  mutable bool InlineEvalHitCutoff = false;
+  // Results of evaluatePureExprRange() for calls of inline helpers, keyed by
+  // profileInlineCallCacheKey(). The result of expanding a helper only depends
+  // on the callee and on the ranges of its arguments. Caching it keeps calls
+  // that are repeated many times, e.g. in conditions unrelated to the tracked
+  // values, from exhausting MaxInlineExpansions.
+  llvm::DenseMap<llvm::FoldingSetNodeIDRef, std::optional<IntRangeSet>>
+      InlineCallRangeCache;
+  // The effect of constrainLeafCondition() on the parameters of an inline
+  // helper whose call is used as a condition.
+  struct InlineCondResult {
+    bool Infeasible = false;
+    SmallVector<std::optional<IntRangeSet>, 4> ParamRanges;
+  };
+  // Results of constrainLeafCondition() for calls of inline helpers, keyed by
+  // profileInlineCallCacheKey().
+  llvm::DenseMap<llvm::FoldingSetNodeIDRef, InlineCondResult> InlineCondCache;
+  // Per-function caches of the variables modified or referenced within a
+  // statement subtree, backed by Bpa.
+  llvm::DenseMap<llvm::PointerIntPair<const Stmt *, 1, bool>,
+                 llvm::ArrayRef<const ValueDecl *>>
+      SubtreeModifiedVarsCache;
+  llvm::DenseMap<const Stmt *, llvm::ArrayRef<const ValueDecl *>>
+      SubtreeReferencedVarsCache;
+
+  /// Marks a function as being expanded inline for the lifetime of this
+  /// object, preventing recursive expansion.
+  class InlineExpansionScope {
+    ThreadSafetyAnalyzer &Analyzer;
+    const FunctionDecl *FD;
+
+  public:
+    InlineExpansionScope(ThreadSafetyAnalyzer &Analyzer,
+                         const TrivialInlineBody &Info)
+        : Analyzer(Analyzer), FD(Info.DefFD) {
+      Analyzer.ActiveInlineCallees.insert(FD);
+      ++Analyzer.InlineDepth;
+      ++Analyzer.InlineExpansionCount;
+    }
+    ~InlineExpansionScope() {
+      --Analyzer.InlineDepth;
+      Analyzer.ActiveInlineCallees.erase(FD);
+    }
+    InlineExpansionScope(const InlineExpansionScope &) = delete;
+    InlineExpansionScope &operator=(const InlineExpansionScope &) = delete;
+  };
 
   /// If beta warnings are enabled, makes the SExpr builder look up local
   /// variables in a local variable context for the lifetime of this object.
@@ -1151,6 +1347,30 @@ public:
     LocalVarLookupScope(const LocalVarLookupScope &) = delete;
     LocalVarLookupScope &operator=(const LocalVarLookupScope &) = delete;
   };
+
+  const TrivialInlineBody *
+  lookupTrivialInlineBody(const CallExpr *CallExp) const;
+  SmallVector<std::optional<IntRangeSet>, 4>
+  evaluateInlineArgRanges(const CallExpr *CallExp,
+                          const TrylockValueState &State,
+                          const RangeEvalCtx &EC, unsigned Depth);
+  bool profileInlineCallCacheKey(
+      llvm::FoldingSetNodeID &ID, const FunctionDecl *DefFD, unsigned Kind,
+      ArrayRef<std::optional<IntRangeSet>> ArgRanges) const;
+  TrylockValueState
+  makeCalleeState(const TrivialInlineBody &Info,
+                  ArrayRef<std::optional<IntRangeSet>> ArgRanges) const;
+  void forEachInlineReturn(
+      const TrivialInlineBody &Info, const TrylockValueState &Init,
+      const RangeEvalCtx &EC, unsigned Depth,
+      llvm::function_ref<void(const Expr *, const TrylockValueState &)> F);
+  void constrainInlineReturns(
+      TrylockValueState &State, const TrivialInlineBody &Info,
+      const RangeEvalCtx &EC, unsigned Depth,
+      llvm::function_ref<void(TrylockValueState &, const Expr *)> F);
+  const TrivialInlineBody *
+  getCachedTrivialInlineBody(const CallExpr *CallExp) const;
+  const Expr *getCachedPureStmtExpr(const StmtExpr *SE) const;
 
   bool join(const FactEntry &A, const FactEntry &B, SourceLocation JoinLoc,
             LockErrorKind EntryLEK);
@@ -1198,11 +1418,15 @@ public:
 LLVM_LIBRARY_VISIBILITY Expr *ignoreNoOpCastSingleStep(Expr *E);
 LLVM_LIBRARY_VISIBILITY const DeclRefExpr *unwrapDirectLValueDRE(const Expr *E);
 LLVM_LIBRARY_VISIBILITY const DeclRefExpr *
-unwrapDirectModifiedDRE(const Stmt *S);
+unwrapUnconditionalLValueDRE(const Expr *E, unsigned Depth = 0);
 LLVM_LIBRARY_VISIBILITY void
 collectModifiedLValueDREs(const Expr *E,
                           SmallVectorImpl<const DeclRefExpr *> &DREs,
                           unsigned Depth = 0);
+/// If \p E takes the address of an lvalue, possibly through no-op and
+/// pointer casts, the right operand of a comma or the arms of a conditional
+/// operator, add the variables that the lvalue may designate to \p DREs.
+/// Return whether \p E takes the address of an lvalue.
 LLVM_LIBRARY_VISIBILITY bool
 collectAddrOfDREs(const Expr *E, SmallVectorImpl<const DeclRefExpr *> &DREs,
                   unsigned Depth = 0);
@@ -1219,6 +1443,7 @@ getStaticBooleanValue(const Expr *E, const ASTContext &Ctx, bool &TCond);
 LLVM_LIBRARY_VISIBILITY std::optional<llvm::APSInt>
 evaluateRuntimeIntConstant(const Expr *E, const ASTContext &Ctx);
 LLVM_LIBRARY_VISIBILITY bool isTrylockAttr(const Attr *A);
+LLVM_LIBRARY_VISIBILITY bool hasTrylockAttr(const Decl *D);
 LLVM_LIBRARY_VISIBILITY bool isSharedTrylockAttr(const Attr *A);
 LLVM_LIBRARY_VISIBILITY bool trylockAttrAppliesTo(const Attr *A,
                                                   QualType RetTy);
@@ -1237,10 +1462,30 @@ LLVM_LIBRARY_VISIBILITY bool isBuiltinExpectCall(const CallExpr *CallExp);
 LLVM_LIBRARY_VISIBILITY void
 forEachDeclVLAExpr(const DeclStmt *DS, bool IncludeTopLevelVLA,
                    llvm::function_ref<void(const Expr *)> Fn);
+/// Call \p Fn for the size expressions of the variable length array types
+/// in the type \p QT.
 LLVM_LIBRARY_VISIBILITY void
 forEachTypeVLAExpr(QualType QT, llvm::function_ref<void(const Expr *)> Fn);
+LLVM_LIBRARY_VISIBILITY bool isScopedLockable(const TagDecl *TD);
+LLVM_LIBRARY_VISIBILITY bool hasThreadSafetyCallEffects(const NamedDecl *Callee,
+                                                        const Expr *CallOrCtor);
+LLVM_LIBRARY_VISIBILITY bool
+exprReferencesAnyVar(const Stmt *S,
+                     const llvm::SmallPtrSetImpl<const ValueDecl *> &Vars);
+LLVM_LIBRARY_VISIBILITY void
+eraseModifiedVarsFromState(ThreadSafetyAnalyzer::TrylockValueState &State,
+                           llvm::ArrayRef<const ValueDecl *> ModVars);
 LLVM_LIBRARY_VISIBILITY bool stmtContainsExpr(const Stmt *Root,
                                               const Expr *Target);
+LLVM_LIBRARY_VISIBILITY void
+unionIntoValueState(ThreadSafetyAnalyzer::TrylockValueState &Dst,
+                    const ThreadSafetyAnalyzer::TrylockValueState &Src,
+                    const ASTContext &Ctx);
+LLVM_LIBRARY_VISIBILITY void
+restrictVarRange(ThreadSafetyAnalyzer::TrylockValueState &State,
+                 const ValueDecl *VD,
+                 const ThreadSafetyAnalyzer::IntDomain &Dom,
+                 const ThreadSafetyAnalyzer::IntRangeSet &Constraint);
 
 // Defined in ThreadSafetyTrylockCond.cpp.
 LLVM_LIBRARY_VISIBILITY std::pair<bool, bool>
@@ -1248,6 +1493,11 @@ getBranchEdgeKinds(const CFGBlock *Pred, const CFGBlock *Succ);
 LLVM_LIBRARY_VISIBILITY ThreadSafetyAnalyzer::IntRangeSet
 getSwitchEdgeSet(const ThreadSafetyAnalyzer::SwitchCaseTable &Table,
                  const CFGBlock *Succ);
+
+/// The trylock attributes of \p D in declaration order.
+inline auto trylockAttrs(const Decl *D) {
+  return llvm::make_filter_range(D->attrs(), isTrylockAttr);
+}
 
 } // namespace threadSafety
 } // namespace clang

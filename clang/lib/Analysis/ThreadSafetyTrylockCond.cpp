@@ -58,7 +58,7 @@ ThreadSafetyAnalyzer::getLogicalOpLHSContext(const BinaryOperator *BOP,
                                              LocalVarContext C) {
   if (!BOP || C.isEmpty())
     return C;
-  if (CurrentSortedGraph) {
+  if (InlineDepth == 0 && CurrentSortedGraph) {
     if (!BuiltLogicalOpTermBlock) {
       BuiltLogicalOpTermBlock = true;
       for (const CFGBlock *B : *CurrentSortedGraph) {
@@ -76,9 +76,7 @@ ThreadSafetyAnalyzer::getLogicalOpLHSContext(const BinaryOperator *BOP,
         It != LogicalOpTermBlock.end() && It->second < BlockInfo.size())
       return BlockInfo[It->second].ExitContext;
   }
-  llvm::SmallPtrSet<const ValueDecl *, 4> Mod;
-  scanModifiedVars(BOP->getRHS(), *ASTCtx, Mod);
-  for (const ValueDecl *VD : Mod)
+  for (const ValueDecl *VD : getSubtreeModifiedVars(BOP->getRHS()))
     if (const auto *ND = dyn_cast<NamedDecl>(VD))
       C = LocalVarMap.clearDefinitionIfSet(ND, C);
   return C;
@@ -88,17 +86,36 @@ ThreadSafetyAnalyzer::TrylockRangeCondResult
 ThreadSafetyAnalyzer::evaluateTrylockRangeCond(const Stmt *Cond,
                                                LocalVarContext C,
                                                unsigned Depth) {
-  if (!Cond || Depth > MaxRangeCondDepth)
+  if (!Cond || Depth > MaxRangeCondDepth) {
+    if (Cond)
+      InlineEvalHitCutoff = true;
     return {};
-  std::pair<const Stmt *, const void *> Key(Cond, C.getRootWithoutRetain());
-  if (auto It = RangeCondCache.find(Key); It != RangeCondCache.end())
+  }
+  std::tuple<const Stmt *, const void *, unsigned> ExactKey(
+      Cond, C.getRootWithoutRetain(), 0);
+  if (auto It = RangeCondCache.find(ExactKey); It != RangeCondCache.end())
     return It->second.second;
+  bool AtMaxExpansions = InlineExpansionCount >= MaxInlineExpansions;
+  std::tuple<const Stmt *, const void *, unsigned> CutoffKey(
+      Cond, C.getRootWithoutRetain(), 1);
+  if (AtMaxExpansions)
+    if (auto It = RangeCondCache.find(CutoffKey); It != RangeCondCache.end()) {
+      InlineEvalHitCutoff = true;
+      return It->second.second;
+    }
+  bool PrevHitCutoff = InlineEvalHitCutoff;
+  InlineEvalHitCutoff = false;
   TrylockRangeCondResult Res = evaluateTrylockRangeCondImpl(Cond, C, Depth);
+  bool HitCutoff = InlineEvalHitCutoff;
+  InlineEvalHitCutoff = PrevHitCutoff || HitCutoff;
   if (Res.Call) {
     Res.TrueSet.widen(MaxStateRangeIntervals);
     Res.FalseSet.widen(MaxStateRangeIntervals);
   }
-  RangeCondCache.try_emplace(Key, C, Res);
+  if (!HitCutoff)
+    RangeCondCache.try_emplace(ExactKey, C, Res);
+  else if (AtMaxExpansions)
+    RangeCondCache.try_emplace(CutoffKey, C, Res);
   return Res;
 }
 
@@ -108,30 +125,17 @@ ThreadSafetyAnalyzer::evaluateTrylockCmpConstSide(const Expr *ConstSide,
   QualType Ty = ConstSide->getType();
   if (Ty->isIntegralOrEnumerationType())
     return evaluateRuntimeIntConstant(ConstSide, *ASTCtx);
-  if (Ty->isMemberPointerType()) {
-    if (!BOP->isEqualityOp())
-      return std::nullopt;
-    const Expr *E = skipValuePreservingWrappers(ConstSide, nullptr);
-    if (isa_and_nonnull<CXXNullPtrLiteralExpr, GNUNullExpr>(E))
-      return llvm::APSInt::get(0);
-    if (const auto *CE = dyn_cast_or_null<CastExpr>(E);
-        CE && CE->getCastKind() == CK_NullToMemberPointer)
-      return llvm::APSInt::get(0);
-    return std::nullopt;
-  }
-  if (Ty->isAnyPointerType() || Ty->isNullPtrType()) {
-    const Expr *E = skipValuePreservingWrappers(ConstSide, nullptr);
-    if (isa_and_nonnull<CXXNullPtrLiteralExpr, GNUNullExpr>(E))
-      return llvm::APSInt::get(0);
-    if (const auto *CE = dyn_cast_or_null<CastExpr>(E)) {
-      if (CE->getCastKind() == CK_NullToPointer)
-        return llvm::APSInt::get(0);
-      if (CE->getCastKind() == CK_IntegralToPointer)
-        E = CE->getSubExpr();
+  if (ConstSide->getType()->isAnyPointerType() ||
+      ConstSide->getType()->isNullPtrType() ||
+      ConstSide->getType()->isMemberPointerType()) {
+    TrylockValueState EmptyState;
+    if (auto R = evaluatePureExprRange(ConstSide, EmptyState, RangeEvalCtx{})) {
+      llvm::APSInt K;
+      if (R->isSingleValue(K) &&
+          (!ConstSide->getType()->isMemberPointerType() ||
+           (K == 0 && BOP->isEqualityOp())))
+        return K;
     }
-    if (E && E->getType()->isIntegralOrEnumerationType())
-      if (auto ICE = evaluateRuntimeIntConstant(E, *ASTCtx))
-        return truncToType(*ICE, ASTCtx->getUIntPtrType(), *ASTCtx);
     return std::nullopt;
   }
   return std::nullopt;
@@ -186,6 +190,8 @@ ThreadSafetyAnalyzer::evaluateTrylockBoolEq(const Expr *BoolSide,
   auto K = evaluateTrylockCmpConstSide(ConstSide, BOP);
   if (!K)
     return {};
+  // Evaluate the trylock condition first such that conditions that
+  // are unrelated to range trylocks do not expand inline helpers.
   auto Res = evaluateTrylockRangeCond(BoolSide, C, Depth + 1);
   if (!Res.Call || (*K != 0 && !isGuaranteedZeroOrOneExpr(BoolSide, C)))
     return {};
@@ -270,7 +276,9 @@ ThreadSafetyAnalyzer::evaluateTrylockRangeCondImpl(const Stmt *Cond,
               std::move(TrueSet),
               std::move(FalseSet)};
     }
-    return {};
+    if (auto ParamIdx = getIdentityInlineParamIndex(CallExp))
+      return evaluateTrylockRangeCond(CallExp->getArg(*ParamIdx), C, Depth + 1);
+    return evaluateInlineCallRangeCond(CallExp, C);
   }
 
   if (const auto *UOP = dyn_cast<UnaryOperator>(Cond)) {
@@ -377,6 +385,9 @@ ThreadSafetyAnalyzer::evaluateTrylockCmpCond(const BinaryOperator *BOP,
               std::move(TrueSet),
               std::move(FalseSet)};
     }
+    if (Casts.empty())
+      return evaluateInlineCallRangeCond(CallExp, CallCtx,
+                                         std::make_pair(CmpOp, *ConstVal));
     return {};
   };
 
@@ -455,8 +466,11 @@ ThreadSafetyAnalyzer::TrylockRangeCondResult
 ThreadSafetyAnalyzer::evaluateTerminatorTrylockCond(const Stmt *Cond,
                                                     LocalVarContext C,
                                                     unsigned Depth) {
-  if (Depth > MaxRangeCondDepth)
+  if (Depth > MaxRangeCondDepth) {
+    if (Cond)
+      InlineEvalHitCutoff = true;
     return {};
+  }
   const auto *BOP = dyn_cast_or_null<BinaryOperator>(
       stripNoOpExprWrappers(dyn_cast_or_null<Expr>(Cond)));
   if (!BOP || !BOP->isLogicalOp())
@@ -577,7 +591,12 @@ bool ThreadSafetyAnalyzer::getTerminatorTrylockCond(
     Res = It->second.second;
     return Res.Call;
   }
+  bool PrevHitCutoff = InlineEvalHitCutoff;
+  InlineEvalHitCutoff = false;
   Res = evaluateTerminatorTrylockCond(Cond, LVarCtx);
-  TerminatorCondCache.try_emplace(CacheKey, LVarCtx, Res);
+  bool HitCutoff = InlineEvalHitCutoff;
+  InlineEvalHitCutoff = PrevHitCutoff || HitCutoff;
+  if (!HitCutoff)
+    TerminatorCondCache.try_emplace(CacheKey, LVarCtx, Res);
   return Res.Call;
 }

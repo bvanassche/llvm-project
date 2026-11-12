@@ -138,11 +138,33 @@ std::optional<IntDomain> getScalarDomainForType(QualType Ty,
 IntRangeSet reprojectRangeSet(const IntRangeSet &Src, const IntDomain &Dom);
 llvm::APSInt truncToType(const llvm::APSInt &V, QualType Ty,
                          const ASTContext &Ctx);
+std::optional<llvm::APSInt> foldIntBinOp(BinaryOperatorKind Opc,
+                                         llvm::APSInt LV, llvm::APSInt RV,
+                                         QualType ResTy, const ASTContext &Ctx);
 IntRangeSet castIntegralRangeSet(const IntRangeSet &Src, QualType DstTy,
                                  const ASTContext &Ctx);
+IntRangeSet negateRangeSet(const IntRangeSet &Src, QualType ResTy,
+                           const ASTContext &Ctx);
+IntRangeSet addConstToRangeSet(const IntRangeSet &Src, llvm::APSInt K,
+                               bool Subtract, QualType ResTy,
+                               const ASTContext &Ctx);
+IntRangeSet subRangeSetFromConst(llvm::APSInt K, const IntRangeSet &Src,
+                                 QualType ResTy, const ASTContext &Ctx);
+IntRangeSet truncateToBitField(const IntRangeSet &Src, unsigned BitWidth,
+                               QualType FieldTy, const IntDomain &DstDom,
+                               const ASTContext &Ctx);
+bool isRangeMappableCast(const CastExpr *CE);
+IntRangeSet applyCast(const CastExpr *CE, const IntRangeSet &Sub,
+                      const IntDomain &Dom, const ASTContext &Ctx);
+std::optional<IntRangeSet> compareRangeSets(BinaryOperatorKind Opc,
+                                            const IntRangeSet &L,
+                                            const IntRangeSet &R,
+                                            const IntDomain &ResDom,
+                                            bool IsMemberPtrComparison);
 
 // Defined in ThreadSafetyValueEval.cpp.
 const Expr *stripNoOpExprWrappers(const Expr *E);
+const Expr *extractPureStmtExpr(const StmtExpr *SE, const ASTContext &Ctx);
 void scanTrylockVars(const Stmt *Root, const ASTContext &Ctx,
                      llvm::SmallPtrSetImpl<const ValueDecl *> &EscapedVars,
                      llvm::SmallPtrSetImpl<const ValueDecl *> &ModifiedVars);
